@@ -57,6 +57,25 @@ pub mod scratch;
 pub mod verifier;
 pub mod zerocheck;
 
+/// Lane cr1 kill switches: `FLOCK_NO_CR_<NAME>=1` restores the record path of
+/// one piece. Each flag is read once per phase/task entry, never in a hot loop.
+pub mod cr_flags {
+    macro_rules! cr_flag {
+        ($fn:ident, $var:literal) => {
+            #[inline]
+            pub fn $fn() -> bool {
+                static S: std::sync::LazyLock<bool> =
+                    std::sync::LazyLock::new(|| std::env::var_os($var).is_some_and(|v| v == "1"));
+                *S
+            }
+        };
+    }
+    cr_flag!(no_pub2, "FLOCK_NO_CR_PUB2");
+    cr_flag!(no_lz, "FLOCK_NO_CR_LZ");
+    cr_flag!(no_epi, "FLOCK_NO_CR_EPI");
+    cr_flag!(no_ch, "FLOCK_NO_CR_CH");
+}
+
 /// Configure rayon's global thread pool to use only performance cores on
 /// Apple silicon (excluding efficiency cores).
 ///
@@ -730,6 +749,7 @@ pub mod r1_owner_awake {
         let t0 = Instant::now();
         while HOLD_EPOCH.load(Ordering::Relaxed) == epoch {
             side_poll();
+            help_poll();
             if yielding {
                 std::thread::yield_now();
             }
@@ -839,6 +859,62 @@ pub mod r1_owner_awake {
         }
     }
 
+    // ---- Lane cr1 CH: AB holders join the C arm's root fold ----
+    //
+    // `help_post` publishes one helper body while round one's C arm runs its
+    // dynamic-claim root fold; the AB pool's core-warm holders and the
+    // waiting caller (`hold_for`, `run_both`) enter it through `help_poll`,
+    // each claiming its own plane slot. `help_close` stops new entries and
+    // waits for the helpers inside to leave before the planes are reduced.
+    // `FLOCK_NO_CR_CH=1` never arms it.
+    pub const HELP_SLOTS: usize = 8;
+    const HELP_OPEN: u32 = 1 << 31;
+    static HELP_ARMED: AtomicBool = AtomicBool::new(false);
+    static HELP_BODY: AtomicU64 = AtomicU64::new(0);
+    static HELP_STATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    /// Set by round one's C closure around its fold (only on the `run_both` route).
+    pub fn help_arm(on: bool) {
+        HELP_ARMED.store(on && !crate::cr_flags::no_ch(), Ordering::Release);
+    }
+    pub fn help_armed() -> bool {
+        HELP_ARMED.load(Ordering::Acquire)
+    }
+    /// Publish `body` for helpers. Returns false (nothing posted) if a body is live.
+    /// `body` (the fat reference itself) must stay alive until `help_close` returns.
+    pub fn help_post(body: &&(dyn Fn() + Sync)) -> bool {
+        if HELP_STATE.load(Ordering::Acquire) != 0 {
+            return false;
+        }
+        let slot: *const &(dyn Fn() + Sync) = body;
+        HELP_BODY.store(slot as usize as u64, Ordering::Release);
+        HELP_STATE.store(HELP_OPEN, Ordering::Release);
+        true
+    }
+    /// Close the posted body and wait until every helper that entered has left.
+    pub fn help_close() {
+        HELP_STATE.fetch_and(!HELP_OPEN, Ordering::AcqRel);
+        while HELP_STATE.load(Ordering::Acquire) != 0 {
+            core::hint::spin_loop();
+        }
+    }
+    #[inline]
+    fn help_poll() {
+        let s = HELP_STATE.load(Ordering::Acquire);
+        if s & HELP_OPEN == 0 {
+            return;
+        }
+        if HELP_STATE
+            .compare_exchange(s, s + 1, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            // SAFETY: the state was open when this helper entered, so the
+            // poster is still inside `help_post`..`help_close` and keeps the
+            // body (and the fat reference HELP_BODY points to) alive.
+            let body = unsafe { &**(HELP_BODY.load(Ordering::Acquire) as usize as *const &(dyn Fn() + Sync)) };
+            body();
+            HELP_STATE.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
     /// Run `main` here and `a`, `b` on whichever waiting round-one thread
     /// claims them first (or here, if none does). Single poster at a time.
     pub fn side_run<M, A, B, RM, RA, RB>(main: M, a: A, b: B) -> (RM, RA, RB)
@@ -1008,6 +1084,7 @@ pub mod r1_owner_awake {
                 let t0 = Instant::now();
                 while !c_done_ref.load(Ordering::Acquire) {
                     side_poll();
+                    help_poll();
                     std::thread::yield_now();
                     for _ in 0..32 {
                         core::hint::spin_loop();

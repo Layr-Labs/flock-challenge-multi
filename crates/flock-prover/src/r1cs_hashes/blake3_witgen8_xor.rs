@@ -990,7 +990,7 @@ const fn residual_row_live(blk: usize, k: usize) -> bool {
     (blk != 2 || k >= 2) && (blk != 29 || k <= 3)
 }
 #[inline(always)]
-unsafe fn project_const<const BLK: usize, const CROSS_QUARTER: bool,const COMPACT_COLS:usize, const PRUNE: bool, const DEFER: bool, const ALIGN: bool, const TC: bool>(
+unsafe fn project_const<const BLK: usize, const CROSS_QUARTER: bool,const COMPACT_COLS:usize, const PRUNE: bool, const DEFER: bool, const ALIGN: bool, const TC: bool, const EPI: bool>(
     proj: &StreamProj<'_>,
     rows: RankedRows<COMPACT_COLS>,
     a: [__m512i; 8],
@@ -999,7 +999,7 @@ unsafe fn project_const<const BLK: usize, const CROSS_QUARTER: bool,const COMPAC
     br: *const V8,
     rw: usize,
     m: *const u64,
-) {
+) -> [__m512i; 8] {
     unsafe {
         let bp_aligned;
         let bp_plain;
@@ -1013,7 +1013,9 @@ unsafe fn project_const<const BLK: usize, const CROSS_QUARTER: bool,const COMPAC
         // a4aa6fa2: start uninitialised unless FLOCK_NO_WITGEN_UNINIT=1 asks for
         // the zero fill; the first live row is a FIRST product either way.
         let mut acc_slot = core::mem::MaybeUninit::<[__m512i; 8]>::uninit();
-        if !*WITGEN_UNINIT {
+        // cr1 EPI: the deduplicated path (`EPI = false`) is selected per octa
+        // only when FLOCK_NO_WITGEN_UNINIT is unset, so it skips this check.
+        if EPI && !*WITGEN_UNINIT {
             acc_slot.write([_mm512_setzero_si512(); 8]);
         }
         let acc = &mut *acc_slot.as_mut_ptr();
@@ -1256,6 +1258,24 @@ _ => unreachable!(),
         // forcing accumulator vectors through asm register operands.
         core::arch::asm!("/* Horner NT publication boundary */", options(readonly, nostack, preserves_flags));
 
+        if EPI {
+            project_epilogue::<CROSS_QUARTER, DEFER, TC>(proj, BLK, acc);
+        }
+        *acc
+    }
+}
+/// The projection epilogue (layout transpose, then deferred or streamed
+/// publication), shared by every window: `blk` is the window's block. With
+/// `EPI` it runs inside each `project_const` instance (record codegen); the cr1
+/// EPI path runs it once after the window `match` (`FLOCK_NO_CR_EPI=1` keeps
+/// the per-instance copies).
+#[inline(always)]
+unsafe fn project_epilogue<const CROSS_QUARTER: bool, const DEFER: bool, const TC: bool>(
+    proj: &StreamProj<'_>,
+    blk: usize,
+    acc: &[__m512i; 8],
+) {
+    unsafe {
         let out = if TC {
             // tc layout: byte tc_byte(c) of every accumulator qword holds lane
             // c, so dword 2y+h of acc[j] is lanes 2k+h (k = 0..3) at Horner
@@ -1287,65 +1307,108 @@ _ => unreachable!(),
             _mm512_permutexvar_epi8(ix, acc[7]),
         ])
         };
-        if DEFER && BLK < 29 {
+        if DEFER && blk < 29 {
             let p = proj.ab_pend;
             for c in 0..8 { _mm512_store_si512((*p).v.as_mut_ptr().add(c).cast(), out[c]); }
-            (*p).base = proj.out.add(BLK * 64 - proj.out_bias);
+            (*p).base = proj.out.add(blk * 64 - proj.out_bias);
             (*p).stride = proj.out_stride;
             (*p).cq = CROSS_QUARTER;
             (*p).live = true;
         } else {
         _mm512_stream_si512(
             proj.out
-                .add(super::compression_lane_offset(0, CROSS_QUARTER) * proj.out_stride + BLK * 64 - proj.out_bias)
+                .add(super::compression_lane_offset(0, CROSS_QUARTER) * proj.out_stride + blk * 64 - proj.out_bias)
                 .cast(),
             out[0],
         );
         _mm512_stream_si512(
             proj.out
-                .add(super::compression_lane_offset(1, CROSS_QUARTER) * proj.out_stride + BLK * 64 - proj.out_bias)
+                .add(super::compression_lane_offset(1, CROSS_QUARTER) * proj.out_stride + blk * 64 - proj.out_bias)
                 .cast(),
             out[1],
         );
         _mm512_stream_si512(
             proj.out
-                .add(super::compression_lane_offset(2, CROSS_QUARTER) * proj.out_stride + BLK * 64 - proj.out_bias)
+                .add(super::compression_lane_offset(2, CROSS_QUARTER) * proj.out_stride + blk * 64 - proj.out_bias)
                 .cast(),
             out[2],
         );
         _mm512_stream_si512(
             proj.out
-                .add(super::compression_lane_offset(3, CROSS_QUARTER) * proj.out_stride + BLK * 64 - proj.out_bias)
+                .add(super::compression_lane_offset(3, CROSS_QUARTER) * proj.out_stride + blk * 64 - proj.out_bias)
                 .cast(),
             out[3],
         );
         _mm512_stream_si512(
             proj.out
-                .add(super::compression_lane_offset(4, CROSS_QUARTER) * proj.out_stride + BLK * 64 - proj.out_bias)
+                .add(super::compression_lane_offset(4, CROSS_QUARTER) * proj.out_stride + blk * 64 - proj.out_bias)
                 .cast(),
             out[4],
         );
         _mm512_stream_si512(
             proj.out
-                .add(super::compression_lane_offset(5, CROSS_QUARTER) * proj.out_stride + BLK * 64 - proj.out_bias)
+                .add(super::compression_lane_offset(5, CROSS_QUARTER) * proj.out_stride + blk * 64 - proj.out_bias)
                 .cast(),
             out[5],
         );
         _mm512_stream_si512(
             proj.out
-                .add(super::compression_lane_offset(6, CROSS_QUARTER) * proj.out_stride + BLK * 64 - proj.out_bias)
+                .add(super::compression_lane_offset(6, CROSS_QUARTER) * proj.out_stride + blk * 64 - proj.out_bias)
                 .cast(),
             out[6],
         );
         _mm512_stream_si512(
             proj.out
-                .add(super::compression_lane_offset(7, CROSS_QUARTER) * proj.out_stride + BLK * 64 - proj.out_bias)
+                .add(super::compression_lane_offset(7, CROSS_QUARTER) * proj.out_stride + blk * 64 - proj.out_bias)
                 .cast(),
             out[7],
         );
         }
     }
 }
+/// Lane cr1 LZ: the production projection policy's three env switches
+/// (`RPPRUNE_ON`, `PROJ_PIPE_ON`, `TC_ON`), resolved once per octa by the
+/// witness drain instead of three `LazyLock` checks per projected window.
+/// `FLOCK_NO_CR_LZ=1` keeps the per-window checks of [`project`].
+pub(super) fn prod_policy_hoisted() -> u8 {
+    if flock_core::cr_flags::no_lz() || !(*RPPRUNE_ON && *PROJ_PIPE_ON && *TC_ON) {
+        return 0;
+    }
+    // cr1 EPI (`FLOCK_NO_CR_EPI=1` keeps the per-window epilogue copies).
+    if !flock_core::cr_flags::no_epi() && *WITGEN_UNINIT { 2 } else { 1 }
+}
+
+/// [`project`] with the env switches already resolved by the caller (`prod`
+/// = [`prod_policy_hoisted`]). Selects exactly the instantiation [`project`]
+/// selects for the same inputs.
+#[inline(always)]
+pub(super) unsafe fn project_hoisted<const COMPACT_COLS:usize>(
+    prod: u8,
+    proj: &StreamProj<'_>,
+    blk: usize,
+    rows: RankedRows<COMPACT_COLS>,
+    ar: *const V8,
+    br: *const V8,
+    rw: usize,
+    t: &Tables,
+) {
+    unsafe {
+        if prod == 2 && !proj.ab_pend.is_null() && rows.cross_quarter {
+            if rows.cached_z {
+                return project_policy_epi::<true, true, COMPACT_COLS, true, true, true, true>(proj, blk, rows, ar, br, rw, t);
+            }
+            return project_policy_epi::<false, true, COMPACT_COLS, true, true, true, true>(proj, blk, rows, ar, br, rw, t);
+        }
+        if prod != 0 && !proj.ab_pend.is_null() && rows.cross_quarter {
+            if rows.cached_z {
+                return project_policy::<true, true, COMPACT_COLS, true, true, true, true>(proj, blk, rows, ar, br, rw, t);
+            }
+            return project_policy::<false, true, COMPACT_COLS, true, true, true, true>(proj, blk, rows, ar, br, rw, t);
+        }
+        project(proj, blk, rows, ar, br, rw, t)
+    }
+}
+
 /// Select the existing z store policy once before projecting this window.
 /// AB streams in both versions; the caller retains its final publication fence.
 #[inline(always)]
@@ -1411,6 +1474,8 @@ unsafe fn project_policy<const CACHED_Z: bool, const CROSS_QUARTER: bool,const C
     rw: usize,
     t: &Tables,
 ) {
+    flock_core::realign_frame64!(); // e2x
+
     let rows = rows.with_cached_z(CACHED_Z).with_cross_quarter(CROSS_QUARTER);
     unsafe {
         let ap_aligned;
@@ -1425,36 +1490,95 @@ unsafe fn project_policy<const CACHED_Z: bool, const CROSS_QUARTER: bool,const C
         let a = tr8x16_zmm(ar, rw);
         let b = tr8x16_zmm(br, rw);
         match blk {
-            2 => project_const::<2, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            3 => project_const::<3, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            4 => project_const::<4, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            5 => project_const::<5, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            6 => project_const::<6, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            7 => project_const::<7, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            8 => project_const::<8, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            9 => project_const::<9, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            10 => project_const::<10, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            11 => project_const::<11, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            12 => project_const::<12, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            13 => project_const::<13, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            14 => project_const::<14, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            15 => project_const::<15, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            16 => project_const::<16, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            17 => project_const::<17, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            18 => project_const::<18, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            19 => project_const::<19, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            20 => project_const::<20, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            21 => project_const::<21, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            22 => project_const::<22, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            23 => project_const::<23, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            24 => project_const::<24, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            25 => project_const::<25, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            26 => project_const::<26, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            27 => project_const::<27, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            28 => project_const::<28, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            29 => project_const::<29, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            2 => { project_const::<2, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            3 => { project_const::<3, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            4 => { project_const::<4, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            5 => { project_const::<5, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            6 => { project_const::<6, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            7 => { project_const::<7, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            8 => { project_const::<8, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            9 => { project_const::<9, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            10 => { project_const::<10, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            11 => { project_const::<11, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            12 => { project_const::<12, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            13 => { project_const::<13, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            14 => { project_const::<14, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            15 => { project_const::<15, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            16 => { project_const::<16, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            17 => { project_const::<17, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            18 => { project_const::<18, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            19 => { project_const::<19, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            20 => { project_const::<20, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            21 => { project_const::<21, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            22 => { project_const::<22, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            23 => { project_const::<23, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            24 => { project_const::<24, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            25 => { project_const::<25, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            26 => { project_const::<26, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            27 => { project_const::<27, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            28 => { project_const::<28, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
+            29 => { project_const::<29, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, true>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()); }
             _ => unreachable!("only ranked mixed windows 2 through 29 reach XOR projection"),
         }
+    }
+}
+
+/// cr1 EPI: [`project_policy`] with one shared epilogue after the window match.
+#[inline(never)]
+unsafe fn project_policy_epi<const CACHED_Z: bool, const CROSS_QUARTER: bool,const COMPACT_COLS:usize, const PRUNE: bool, const DEFER: bool, const ALIGN: bool, const TC: bool>(
+    proj: &StreamProj<'_>,
+    blk: usize,
+    rows: RankedRows<COMPACT_COLS>,
+    ar: *const V8,
+    br: *const V8,
+    rw: usize,
+    t: &Tables,
+) {
+    let rows = rows.with_cached_z(CACHED_Z).with_cross_quarter(CROSS_QUARTER);
+    unsafe {
+        let ap_aligned;
+        let ap_plain;
+        let ap: &[u64; 64] = if ALIGN {
+            ap_aligned = pretranspose_ring_aligned::<0, true, TC>(ar, rw);
+            &ap_aligned.0
+        } else {
+            ap_plain = pretranspose_ring::<0, true, TC>(ar, rw);
+            &ap_plain
+        };
+        let a = tr8x16_zmm(ar, rw);
+        let b = tr8x16_zmm(br, rw);
+        let acc = match blk {
+            2 => project_const::<2, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            3 => project_const::<3, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            4 => project_const::<4, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            5 => project_const::<5, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            6 => project_const::<6, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            7 => project_const::<7, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            8 => project_const::<8, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            9 => project_const::<9, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            10 => project_const::<10, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            11 => project_const::<11, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            12 => project_const::<12, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            13 => project_const::<13, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            14 => project_const::<14, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            15 => project_const::<15, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            16 => project_const::<16, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            17 => project_const::<17, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            18 => project_const::<18, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            19 => project_const::<19, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            20 => project_const::<20, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            21 => project_const::<21, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            22 => project_const::<22, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            23 => project_const::<23, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            24 => project_const::<24, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            25 => project_const::<25, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            26 => project_const::<26, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            27 => project_const::<27, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            28 => project_const::<28, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            29 => project_const::<29, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC, false>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            _ => unreachable!("only ranked mixed windows 2 through 29 reach XOR projection"),
+        };
+        project_epilogue::<CROSS_QUARTER, DEFER, TC>(proj, blk, &acc);
     }
 }
 

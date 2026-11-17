@@ -576,7 +576,7 @@ fn x7_prefetchw_enabled() -> bool {
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
-#[inline(never)]
+#[inline]
 pub(crate) unsafe fn gfni_fold_word_tiles4(
     source: *const u8,
     mats: *const u64,
@@ -587,6 +587,52 @@ pub(crate) unsafe fn gfni_fold_word_tiles4(
     permutation: *const u8,
     prefetch_next_block: bool,
 ) {
+    unsafe {
+        gfni_fold_word_tiles4_mode(
+            source,
+            mats,
+            planes,
+            tile_stride,
+            count,
+            seed_zero,
+            permutation,
+            usize::from(prefetch_next_block) << x7_prefetch_shift(),
+        )
+    }
+}
+
+/// Lane cr1 LZ: the `FLOCK_NO_X7_PREFETCHW` shift of [`gfni_fold_word_tiles4`]'s
+/// hint mode, for callers that resolve it once outside their block loop.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(crate) fn x7_prefetch_shift() -> usize {
+    usize::from(x7_prefetchw_enabled())
+}
+
+/// [`gfni_fold_word_tiles4`] with the hint mode already resolved:
+/// `pf_mode` = 0 (no hints), 1 (`prefetcht0`) or 2 (`prefetchw`).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn gfni_fold_word_tiles4_mode(
+    source: *const u8,
+    mats: *const u64,
+    planes: *mut u8,
+    tile_stride: usize,
+    count: usize,
+    seed_zero: bool,
+    permutation: *const u8,
+    pf_mode: usize,
+) {
+    crate::realign_frame64!(); // e2x
+
     debug_assert!((1..=4).contains(&count));
     debug_assert!(tile_stride >= 512);
     // SAFETY: the caller upholds the exact byte ranges above. Every modified
@@ -933,7 +979,7 @@ pub(crate) unsafe fn gfni_fold_word_tiles4(
             inout("r8") count => _,
             in("r9") usize::from(seed_zero),
             inout("r10") permutation => _,
-            inout("r11") usize::from(prefetch_next_block) << usize::from(x7_prefetchw_enabled()) => _,
+            inout("r11") pf_mode => _,
             out("rax") _,
             out("zmm0") _,
             out("zmm1") _,

@@ -387,48 +387,60 @@ fn sibling_pair_from_cpu_list(list: &str) -> Option<[usize; 2]> {
 /// process's affinity set.
 #[allow(clippy::manual_is_multiple_of)]
 #[cfg(target_os = "linux")]
+/// Resolve SMT sibling pairs covering `rayon::current_num_threads()` from this
+/// process's active affinity mask, or `None` if disabled, mismatched, or unpaired.
+#[cfg(target_os = "linux")]
+fn affinity_sibling_pairs(disable_env: &str) -> Option<Vec<(usize, usize)>> {
+    if std::env::var_os(disable_env).is_some() {
+        return None;
+    }
+    let n = rayon::current_num_threads();
+    if n % 2 != 0 || n < 4 {
+        return None;
+    }
+    let mask = affinity::get();
+    let mut allowed = Vec::with_capacity(n);
+    for (word_idx, &word) in mask.iter().enumerate() {
+        let mut w = word;
+        while w != 0 {
+            let bit = w.trailing_zeros() as usize;
+            allowed.push(word_idx * 64 + bit);
+            w &= w - 1;
+        }
+    }
+    if allowed.len() != n {
+        return None;
+    }
+    let max_cpu = *allowed.last()?;
+    let mut is_allowed = vec![false; max_cpu + 1];
+    for &c in &allowed {
+        is_allowed[c] = true;
+    }
+    let mut pairs: Vec<(usize, usize)> = Vec::with_capacity(n / 2);
+    let mut seen = vec![false; max_cpu + 1];
+    for &c in &allowed {
+        if seen[c] {
+            continue;
+        }
+        let list = std::fs::read_to_string(format!(
+            "/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list"
+        ))
+        .ok()?;
+        let ids = sibling_pair_from_cpu_list(&list)?;
+        if ids[0] != c || ids[1] > max_cpu || !is_allowed[ids[1]] || seen[ids[1]] {
+            return None;
+        }
+        seen[c] = true;
+        seen[ids[1]] = true;
+        pairs.push((ids[0], ids[1]));
+    }
+    (pairs.len() == n / 2).then_some(pairs)
+}
+
+#[cfg(target_os = "linux")]
 fn deep_split_pairs() -> Option<&'static Vec<(usize, usize)>> {
-    static P: std::sync::LazyLock<Option<Vec<(usize, usize)>>> = std::sync::LazyLock::new(|| {
-        if std::env::var_os("FLOCK_NO_NTT_DEEP_SPLIT").is_some() {
-            return None;
-        }
-        let n = rayon::current_num_threads();
-        if n % 2 != 0 || n < 4 {
-            return None;
-        }
-        // One pair per physical core, in CPU order, covering exactly the
-        // first `n` logical CPUs.
-        let mut pairs: Vec<(usize, usize)> = Vec::with_capacity(n / 2);
-        let mut seen = vec![false; n];
-        for c in 0..n {
-            if seen[c] {
-                continue;
-            }
-            let list = std::fs::read_to_string(format!(
-                "/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list"
-            ))
-            .ok()?;
-            let ids = sibling_pair_from_cpu_list(&list)?;
-            if ids[0] != c || ids[1] >= n || seen[ids[1]] {
-                return None;
-            }
-            seen[c] = true;
-            seen[ids[1]] = true;
-            pairs.push((ids[0], ids[1]));
-        }
-        if pairs.len() != n / 2 {
-            return None;
-        }
-        // Every paired CPU must be in this process's own affinity set, or the
-        // pinning below could not place the pair on one core.
-        let mask = affinity::get();
-        for c in 0..n {
-            if mask[c / 64] & (1u64 << (c % 64)) == 0 {
-                return None;
-            }
-        }
-        Some(pairs)
-    });
+    static P: std::sync::LazyLock<Option<Vec<(usize, usize)>>> =
+        std::sync::LazyLock::new(|| affinity_sibling_pairs("FLOCK_NO_NTT_DEEP_SPLIT"));
     P.as_ref()
 }
 
@@ -509,6 +521,15 @@ fn merged_pass_enabled() -> bool {
 /// identical. `FLOCK_NO_V2_DSTEAL=1` restores the incumbent tail;
 /// `FLOCK_V2_DSTEAL_ALL=1` lets the hash workers steal too (diagnostic).
 #[cfg(target_os = "linux")]
+/// dp1: the first sub-group of every producer also opens its sweep-1 row
+/// chunks, and the idle SMT sibling (no finished block exists yet) claims
+/// them. `FLOCK_NO_DP_FIRST_STEAL=1` restores the incumbent schedule.
+fn dp_first_steal() -> bool {
+    static M: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_DP_FIRST_STEAL").is_none());
+    *M
+}
+
 fn v2_dsteal_mode() -> u8 {
     static M: std::sync::LazyLock<u8> = std::sync::LazyLock::new(|| {
         if std::env::var_os("FLOCK_NO_V2_DSTEAL").is_some() {
@@ -1270,43 +1291,8 @@ unsafe fn pf_msg_rows(
     target_feature = "vpclmulqdq"
 ))]
 fn st_fmp_pairs() -> Option<&'static Vec<(usize, usize)>> {
-    static P: std::sync::LazyLock<Option<Vec<(usize, usize)>>> = std::sync::LazyLock::new(|| {
-        if std::env::var_os("FLOCK_NO_NTT_ST_FMP").is_some() {
-            return None;
-        }
-        let n = rayon::current_num_threads();
-        if n % 2 != 0 || n < 4 {
-            return None;
-        }
-        let mut pairs: Vec<(usize, usize)> = Vec::with_capacity(n / 2);
-        let mut seen = vec![false; n];
-        for c in 0..n {
-            if seen[c] {
-                continue;
-            }
-            let list = std::fs::read_to_string(format!(
-                "/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list"
-            ))
-            .ok()?;
-            let ids = sibling_pair_from_cpu_list(&list)?;
-            if ids[0] != c || ids[1] >= n || seen[ids[1]] {
-                return None;
-            }
-            seen[c] = true;
-            seen[ids[1]] = true;
-            pairs.push((ids[0], ids[1]));
-        }
-        if pairs.len() != n / 2 {
-            return None;
-        }
-        let mask = affinity::get();
-        for c in 0..n {
-            if mask[c / 64] & (1u64 << (c % 64)) == 0 {
-                return None;
-            }
-        }
-        Some(pairs)
-    });
+    static P: std::sync::LazyLock<Option<Vec<(usize, usize)>>> =
+        std::sync::LazyLock::new(|| affinity_sibling_pairs("FLOCK_NO_NTT_ST_FMP"));
     P.as_ref()
 }
 
@@ -3783,6 +3769,7 @@ impl AdditiveNttF128 {
         debug_assert_eq!(base as usize % 16, 0);
         debug_assert!(!ALIGNED_ZMM || base as usize % 64 == 0);
         let (g4_stride, g4_base): (usize, usize) = if stage_perm { (1, 16) } else { (4, 1) };
+        let (allow_low, diet) = kernels::publish_nt_flags();
 
         // SAFETY: forwarded exact-ranked-shape contract. Each m quad is the
         // final consumer of its four staging rows; the 16 quads partition the
@@ -3802,7 +3789,7 @@ impl AdditiveNttF128 {
                         tw,
                     );
                 }
-                self.seed_top_publish2_block::<ALIGNED_ZMM>(
+                self.seed_top_publish2_block_dispatch::<ALIGNED_ZMM>(
                     region,
                     base,
                     block,
@@ -3814,6 +3801,8 @@ impl AdditiveNttF128 {
                     stage_perm,
                     &tw2[block],
                     blocked,
+                    allow_low,
+                    diet,
                 );
             }
         }
@@ -3864,13 +3853,14 @@ impl AdditiveNttF128 {
         debug_assert!(lanes2 == 60 || lanes2 == 64);
         debug_assert_eq!(base as usize % 16, 0);
         debug_assert!(!ALIGNED_ZMM || base as usize % 64 == 0);
+        let (allow_low, diet) = kernels::publish_nt_flags();
         // SAFETY: forwarded exact-ranked-shape contract. Each m quad is the
         // final consumer of its four staging rows; the 16 quads partition the
         // block's 64 logical rows, and the 8 blocks partition the task's 512.
         unsafe {
             for block in 0..8 {
                 let region = bufp.add(block * 64 * row_len);
-                self.seed_top_publish2_block::<ALIGNED_ZMM>(
+                self.seed_top_publish2_block_dispatch::<ALIGNED_ZMM>(
                     region,
                     base,
                     block,
@@ -3882,7 +3872,61 @@ impl AdditiveNttF128 {
                     stage_perm,
                     &tw2[block],
                     blocked,
+                    allow_low,
+                    diet,
                 );
+            }
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    unsafe fn seed_top_publish2_block_dispatch<const ALIGNED_ZMM: bool>(
+        &self,
+        region: *mut F128,
+        base: *mut F128,
+        block: usize,
+        row_len: usize,
+        block_size: usize,
+        sub_stride: usize,
+        r: usize,
+        lanes2: usize,
+        stage_perm: bool,
+        tw2_block: &[[F128; 3]; 16],
+        blocked: bool,
+        allow_low: bool,
+        diet: bool,
+    ) {
+        unsafe {
+            if crate::cr_flags::no_pub2() {
+                return self.seed_top_publish2_block_rec::<ALIGNED_ZMM>(
+                    region, base, block, row_len, block_size, sub_stride, r, lanes2, stage_perm,
+                    tw2_block, blocked,
+                );
+            }
+            match (allow_low, diet) {
+                (true, true) => self.seed_top_publish2_block::<ALIGNED_ZMM, true, true>(
+                    region, base, block, row_len, block_size, sub_stride, r, lanes2, stage_perm,
+                    tw2_block, blocked,
+                ),
+                (false, true) => self.seed_top_publish2_block_cold::<ALIGNED_ZMM, false, true>(
+                    region, base, block, row_len, block_size, sub_stride, r, lanes2, stage_perm,
+                    tw2_block, blocked,
+                ),
+                (true, false) => self.seed_top_publish2_block_cold::<ALIGNED_ZMM, true, false>(
+                    region, base, block, row_len, block_size, sub_stride, r, lanes2, stage_perm,
+                    tw2_block, blocked,
+                ),
+                (false, false) => self.seed_top_publish2_block_cold::<ALIGNED_ZMM, false, false>(
+                    region, base, block, row_len, block_size, sub_stride, r, lanes2, stage_perm,
+                    tw2_block, blocked,
+                ),
             }
         }
     }
@@ -3911,9 +3955,106 @@ impl AdditiveNttF128 {
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
+    #[cold]
+    #[inline(never)]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn seed_top_publish2_block_cold<
+        const ALIGNED_ZMM: bool,
+        const ALLOW_LOW: bool,
+        const DIET: bool,
+    >(
+        &self,
+        region: *mut F128,
+        base: *mut F128,
+        block: usize,
+        row_len: usize,
+        block_size: usize,
+        sub_stride: usize,
+        r: usize,
+        lanes2: usize,
+        stage_perm: bool,
+        tw2_block: &[[F128; 3]; 16],
+        blocked: bool,
+    ) {
+        unsafe {
+            self.seed_top_publish2_block::<ALIGNED_ZMM, ALLOW_LOW, DIET>(
+                region, base, block, row_len, block_size, sub_stride, r, lanes2, stage_perm,
+                tw2_block, blocked,
+            )
+        }
+    }
+
+    /// Record path of the publish block (kill switch `FLOCK_NO_CR_PUB2`).
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[cold]
     #[allow(clippy::too_many_arguments)]
     #[inline(never)]
-    unsafe fn seed_top_publish2_block<const ALIGNED_ZMM: bool>(
+    unsafe fn seed_top_publish2_block_rec<const ALIGNED_ZMM: bool>(
+        &self,
+        region: *mut F128,
+        base: *mut F128,
+        block: usize,
+        row_len: usize,
+        block_size: usize,
+        sub_stride: usize,
+        r: usize,
+        lanes2: usize,
+        stage_perm: bool,
+        tw2_block: &[[F128; 3]; 16],
+        blocked: bool,
+    ) {
+    crate::realign_frame64!(); // e2x
+
+        let g2_stride: usize = if stage_perm { 16 } else { 1 };
+        // SAFETY: forwarded exact-ranked-shape contract. Each m quad is the
+        // final consumer of its four staging rows, and the 16 quads partition
+        // this block's 64 logical rows.
+        unsafe {
+            for (m, &[t_outer, t_inner_a, t_inner_b]) in tw2_block.iter().enumerate() {
+                let k = 4 * m;
+                let p = region.add(seed_top_stage_row(k, stage_perm) * row_len);
+                let step = g2_stride * row_len;
+                let dst = |k: usize| {
+                    base.add(
+                        codeword_row(seed_top_codeword_row(block, r, k, block_size, sub_stride), blocked)
+                            * row_len,
+                    )
+                };
+                kernels::butterfly_fused_2layer_publish_nt::<ALIGNED_ZMM>(
+                    p,
+                    step,
+                    dst(k),
+                    dst(k + 1),
+                    dst(k + 2),
+                    dst(k + 3),
+                    lanes2,
+                    t_outer,
+                    t_inner_a,
+                    t_inner_b,
+                );
+            }
+        }
+    }
+
+    /// Out-of-line hot publish loop with `avx512f,vpclmulqdq` enabled and env-var flags constant.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    unsafe fn seed_top_publish2_block<
+        const ALIGNED_ZMM: bool,
+        const ALLOW_LOW: bool,
+        const DIET: bool,
+    >(
         &self,
         region: *mut F128,
         base: *mut F128,
@@ -3942,7 +4083,7 @@ impl AdditiveNttF128 {
                             * row_len,
                     )
                 };
-                kernels::butterfly_fused_2layer_publish_nt::<ALIGNED_ZMM>(
+                kernels::butterfly_fused_2layer_publish_nt_cfg::<ALIGNED_ZMM, ALLOW_LOW, DIET>(
                     p,
                     step,
                     dst(k),
@@ -5196,6 +5337,26 @@ impl AdditiveNttF128 {
                 }
             }
         };
+        // dp1 first-steal: sweep-1 row chunks of a first-round sub-group only.
+        #[cfg(target_os = "linux")]
+        let first_steal = dsteal == 1 && dp_first_steal();
+        #[cfg(target_os = "linux")]
+        let dsteal_claim0 = |w: &std::sync::atomic::AtomicU64, n_first: usize| -> Option<(usize, usize)> {
+            use std::sync::atomic::Ordering;
+            let mut cur = w.load(Ordering::Acquire);
+            loop {
+                if cur == DSTEAL_NONE || cur & DSTEAL_BLK != 0 || (cur >> 16) as usize >= n_first {
+                    return None;
+                }
+                if (cur & 0xff) >= DSTEAL_NCH {
+                    return None;
+                }
+                match w.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => return Some(((cur >> 16) as usize, (cur & 0xff) as usize)),
+                    Err(v) => cur = v,
+                }
+            }
+        };
         #[cfg(target_os = "linux")]
         let deep_role = |idx: usize| {
             use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5317,6 +5478,24 @@ impl AdditiveNttF128 {
                     }
                     let _ = got;
                 }
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                if first_steal && !producer {
+                    if let Some((i, c)) = dsteal_claim0(&dsteal_words[own], n_pairs) {
+                        crate::rstrace::evd("ds:first", (i * 16 + c) as u32);
+                        let sp = unsafe { (deep_base_addr as *mut F128).add(i * sub_bytes) };
+                        let per = (sub_size_positions >> 4) / DSTEAL_NCH as usize;
+                        // SAFETY: rows c*per..(c+1)*per of sweep 1 of sub-group
+                        // `i`, claimed exactly once; the owner joins on the count.
+                        unsafe {
+                            self.v2_sweep1_rows_x86(
+                                i, sp, c * per, (c + 1) * per, n_top, log_d,
+                                num_ntts, odd_tail, hint, group_stride, raw7_pack,
+                            );
+                        }
+                        dsteal_done[own].fetch_add(1, std::sync::atomic::Ordering::Release);
+                        continue;
+                    }
+                }
                 if let Some(b) = queues[own].try_pop() {
                     run(b);
                     continue;
@@ -5360,7 +5539,7 @@ impl AdditiveNttF128 {
                     }
                     crate::rstrace::evd("dp:claim", i as u32);
                     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-                    if dsteal != 0 && i + 2 * n_pairs >= n_subs {
+                    if dsteal != 0 && (i + 2 * n_pairs >= n_subs || (first_steal && i < n_pairs)) {
                         use std::sync::atomic::Ordering;
                         let w = &dsteal_words[slot];
                         let sp = unsafe { (deep_base_addr as *mut F128).add(sub_row(i) * num_ntts) };
@@ -6998,6 +7177,9 @@ impl Seed6Plan {
                     }
                 }
             };
+            // Lane cr1 LZ: the publish kernel's two env switches, resolved
+            // once per task instead of once per quad (`FLOCK_NO_CR_LZ=1`).
+            let cr_pub = !crate::cr_flags::no_lz() && kernels::publish_nt_flags() == (true, true);
             for b in 0..self.blocks {
                 let cur = st;
                 for i in 0..16 {
@@ -7042,6 +7224,21 @@ impl Seed6Plan {
                     }
                     let to = |i: usize| dst.add((b * 4 * q + j * q + i * s16 + r) * num_ntts);
                     for p in 0..4 {
+                        if cr_pub {
+                            kernels::butterfly_fused_2layer_publish_nt_cfg::<true, true, true>(
+                                grp.add(4 * p * nn),
+                                nn,
+                                to(4 * p),
+                                to(4 * p + 1),
+                                to(4 * p + 2),
+                                to(4 * p + 3),
+                                nn,
+                                tw[3 + p],
+                                tw[7 + 2 * p],
+                                tw[8 + 2 * p],
+                            );
+                            continue;
+                        }
                         kernels::butterfly_fused_2layer_publish_nt::<true>(
                             grp.add(4 * p * nn),
                             nn,
