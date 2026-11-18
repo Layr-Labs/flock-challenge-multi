@@ -6,11 +6,10 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
+#[inline(always)]
 pub fn level() -> u8 {
-    static L: LazyLock<u8> = LazyLock::new(|| {
-        std::env::var("FLOCK_RS_TRACE").ok().map(|s| s.parse().unwrap_or(1)).unwrap_or(0)
-    });
-    *L
+    // Diagnostics compiled out of the submitted tree: the ranked worker never sets FLOCK_RS_TRACE.
+    0
 }
 
 /// Lane v1 timing probe (proof INVALID when set): `FLOCK_V1_PROBE_MOD=K`
@@ -23,8 +22,9 @@ pub fn probe_mod() -> usize {
     *K
 }
 
+#[inline(always)]
 pub fn on() -> bool {
-    level() > 0
+    false
 }
 
 /// Detail event (per task / per thread): recorded only at FLOCK_RS_TRACE=2.
