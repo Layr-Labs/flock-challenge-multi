@@ -1973,3 +1973,5 @@ fn linux_physical_cores() -> Option<usize> {
     }
     (!cores.is_empty()).then_some(cores.len())
 }
+
+// redraw 2 of the same source (comment-only change at end of file; no code or layout effect)

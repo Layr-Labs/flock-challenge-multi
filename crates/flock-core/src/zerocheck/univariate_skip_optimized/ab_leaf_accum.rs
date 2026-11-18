@@ -57,11 +57,11 @@ fn grouped_enabled() -> bool {
 /// the 64 KiB matrix key on every band. Same tables, same kernel arguments.
 /// `FLOCK_NO_AB_PREPARED=1` restores the per-worker cache path unchanged.
 /// Mahmoud514 5b2ced50's interpolate kernels without the trailing vzeroupper
-/// (`*_nv` in ab_leaf_accum_nv.S): opt-in with `FLOCK_AB_NOVZU=1`; unset keeps
+/// (`*_nv` in ab_leaf_accum_nv.S): on by default; `FLOCK_NO_AB_NOVZU=1` restores
 /// the incumbent kernels. Same instructions otherwise, so the same planes.
 fn novzu_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_AB_NOVZU").is_some_and(|v| v == "1")
+        std::env::var_os("FLOCK_NO_AB_NOVZU").is_none()
     });
     *ON
 }
