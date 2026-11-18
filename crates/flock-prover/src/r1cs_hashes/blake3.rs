@@ -2765,18 +2765,32 @@ impl Iterator for OctaOrder<'_> {
             }
             // Atomicity alone gives each value to one caller. The octa's
             // writes reach the fold through the encoder's existing join.
-            Self::Shared(claim) => claim.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            // st2 HELP: acquire/release claims order a helping pair's
+            // registration (before its claim) before the owner's exhausted
+            // claim, so the owner's join observes it. Same x86 instructions.
+            Self::Shared(claim) => claim.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel),
             Self::Epoch(claim, epoch) => loop {
-                use std::sync::atomic::Ordering::Relaxed;
-                let v = claim.0.load(Relaxed);
+                use std::sync::atomic::Ordering::{AcqRel, Acquire};
+                let v = claim.0.load(Acquire);
                 let n = if v >> 32 == *epoch { v & 0xffff_ffff } else { 0 };
                 if n >= OCTAS_PER_GROUP {
                     break n;
                 }
-                if claim.0.compare_exchange_weak(v, (*epoch << 32) | (n + 1), Relaxed, Relaxed).is_ok() {
+                if claim.0.compare_exchange_weak(v, (*epoch << 32) | (n + 1), AcqRel, Acquire).is_ok() {
                     break n;
                 }
             },
+        };
+        // st2 HALF: claims run the even kpairs first (a bijection, so every
+        // octa still runs exactly once); see `st2_half_enabled`.
+        let kpair = if !matches!(self, Self::Parity(_))
+            && kpair < OCTAS_PER_GROUP
+            && OCTAS_PER_GROUP == 32
+            && flock_core::ntt::additive_ntt_f128::st2_half_enabled()
+        {
+            flock_core::ntt::additive_ntt_f128::st2_half_kpair(kpair)
+        } else {
+            kpair
         };
         (kpair < OCTAS_PER_GROUP).then_some(kpair)
     }
@@ -3152,6 +3166,9 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                 // sb1: per-producer deferred ab_inner window (flushed after every octa).
                 let ab_pend_on = cfg!(all(target_feature="avx512f",target_feature="avx512bw",target_feature="avx512vbmi",target_feature="gfni")) && *blake3_witgen8::SB1_DEFER_ON;
                 let mut ab_pend = core::mem::MaybeUninit::new(blake3_witgen8::AbPend::new());
+                // tc2: raw projection lines at the bit-swapped rows; the brand
+                // below requires the same hole-free compact geometry.
+                let tc2_on = ab_pend_on && ab1_hole && ab_block_bytes == 29 * 64 && blake3_witgen8::tc2_layout_active();
                 // Group g owns r=2g and r=2g+1 across every q/k input.
                 // Each octa spans four quarters and adjacent k values. Root
                 // storage follows physical octa order, so each writer still
@@ -3177,6 +3194,10 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                     // offsets. Constants may be retained only because the
                     // enclosing exact branch verified all three scratch tags.
                     unsafe {
+                        if tc2_on {
+                            (*ab_pend.as_mut_ptr()).tc2_base = (ab_addr as *mut u8).add(
+                                flock_core::zerocheck::univariate_skip_optimized::ab1_row_offset(blake3_witgen8::tc2_octa_row(base)));
+                        }
                         let seed_context=windows.as_ref().map(|window|blake3_witgen8::SeedWindowContext{window,input:input_base,prefix:prefix_base,kpair,merge_prefix});
                         let proj = blake3_witgen8::StreamProj { compact_z_tile_words: if compact_tile{window_tile_cols*4}else{0}, seed_window: seed_context.as_ref(),
                             cross_quarter: true,
@@ -3220,6 +3241,10 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                         if ab_pend_on { blake3_witgen8::flush_ab_pend(ab_pend.as_mut_ptr()); }
                         if windows.is_none() && let Some(target) = target {
                             target.seed_octa(input_base, kpair);
+                        }
+                        // st2 HALF: this octa's staging rows are complete.
+                        if let Some(target) = target {
+                            target.octa_done(kpair);
                         }
                     }
                 }
@@ -3340,7 +3365,11 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
             if blake3_witgen8::tc_layout_active()
                 && blake3_witgen8::window_seed_projection_eligible(preps.get())
             {
-                ab_inner.set_tc_layout();
+                if blake3_witgen8::tc2_layout_active() {
+                    ab_inner.set_tc2_layout();
+                } else {
+                    ab_inner.set_tc_layout();
+                }
             }
         }
         return;

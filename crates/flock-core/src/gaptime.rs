@@ -14,9 +14,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Cached `FLOCK_GAP_TIMING` presence. Read once per process.
+#[inline(always)]
 pub fn enabled() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("FLOCK_GAP_TIMING").is_some());
-    *ON
+    // Diagnostics compiled out of the submitted tree: the ranked worker never sets FLOCK_GAP_TIMING.
+    false
 }
 
 /// Process-wide monotonic epoch all marks are measured against.
@@ -42,6 +43,7 @@ pub fn begin(label: &str) {
 }
 
 /// Record a boundary: prints `+delta_ms @offset_ms label`.
+#[inline(always)]
 pub fn mark(label: &'static str) {
     crate::rstrace::ev(label, 0);
     if !enabled() {
