@@ -1501,7 +1501,7 @@ mod tests {
             let mut actual = [0u8; 64];
             unsafe {
                 let value = _mm512_loadu_si512(input.as_ptr().cast());
-                _mm512_storeu_si512(actual.as_mut_ptr().cast(), ring_prepared_pack::<false>(value));
+                _mm512_storeu_si512(actual.as_mut_ptr().cast(), ring_prepared_pack::<false,false>(value));
             }
             assert_eq!(actual, expected, "prepared input case {case}");
         }
@@ -1523,15 +1523,15 @@ mod tests {
             for rw in [0, 16] {
                 macro_rules! check_b {
                     ($($blk:literal)*) => {$(
-                        let s = pretranspose_ring_aligned::<$blk, false>(p, rw);
+                        let s = pretranspose_ring_aligned::<$blk, false,false>(p, rw);
                         assert_eq!(s.0.as_ptr() as usize % 64, 0);
-                        assert_eq!(s.0, pretranspose_ring::<$blk, false>(p, rw), "B blk={} rw={rw}", $blk);
+                        assert_eq!(s.0, pretranspose_ring::<$blk, false,false>(p, rw), "B blk={} rw={rw}", $blk);
                     )*};
                 }
                 check_b!(2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29);
-                let s = pretranspose_ring_aligned::<0, true>(p, rw);
+                let s = pretranspose_ring_aligned::<0, true,false>(p, rw);
                 assert_eq!(s.0.as_ptr() as usize % 64, 0);
-                assert_eq!(s.0, pretranspose_ring::<0, true>(p, rw), "A rw={rw}");
+                assert_eq!(s.0, pretranspose_ring::<0, true,false>(p, rw), "A rw={rw}");
             }
         }
     }
@@ -1623,7 +1623,7 @@ mod tests {
                         let bias = 128;
                         let plan=flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(&table,&output.0,true);
                         assert!(plan.bcomplement_static_eligible());
-                        let proj = StreamProj { compact_z_tile_words:0, seed_window:None,
+                        let proj = StreamProj { compact_b: None, compact_z_tile_words:0, seed_window:None,
                             cross_quarter: false, compact_z: core::ptr::null_mut(), elide_z: false,
                             stage: core::ptr::null_mut(),
                             out: output.0.as_mut_ptr(),

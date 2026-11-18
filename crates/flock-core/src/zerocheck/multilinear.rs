@@ -2041,7 +2041,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     let n_chunks = table.n_chunks;
     let n_out = 1usize << (m - k_skip);
     assert_eq!(a_packed.len(), n_out * n_chunks);
-    assert_eq!(b_packed.len(), n_out * n_chunks);
+    assert!(b_packed.len()==a_packed.len() || ((m==32 || cfg!(test)) && b_packed.len()==a_packed.len()/2048*crate::compact_b::PACKED_BYTES));
     assert_eq!(mlv_challenges.len(), m - k_skip);
     let r1 = mlv_challenges[1];
     assert_ne!(r1, F128::ZERO, "lookahead requires a non-zero r[k_skip+1]");
@@ -2256,7 +2256,20 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
             #[allow(unused_mut)]
             let mut vec_out: Option<R2Vec> = None;
             let x_in = x_hi;
-            let row_base = x_in * chunk_size;
+            #[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="avx512vbmi",target_feature="gfni",target_feature="vpclmulqdq"))]
+            let direct_b = a_packed.len()!=b_packed.len() && fast_r2 && r2_vec && r4_lv.is_some()
+                && bake_arg.is_some() && lo_size.is_multiple_of(128);
+            #[cfg(not(all(target_arch="x86_64",target_feature="avx512f",target_feature="avx512vbmi",target_feature="gfni",target_feature="vpclmulqdq")))]
+            let direct_b=false;
+            #[cfg(test)]
+            if direct_b {
+                crate::compact_b::PACKED_R2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let (a_packed,b_input,byte_base)=if direct_b {
+                (a_packed,std::borrow::Cow::Borrowed(b_packed),x_in*chunk_size*n_chunks)
+            } else {crate::compact_b::local_inputs(a_packed,b_packed,x_in*chunk_size*n_chunks,chunk_size*n_chunks)};
+            let b_packed=b_input.as_ref();
+            let row_base=byte_base/n_chunks;
             let pair_idx_base = x_in * lo_size;
             let mut none_a: [F128; 0] = [];
             let mut none_b: [F128; 0] = [];
@@ -2287,6 +2300,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                                 bk,
                                 lw,
                                 lo1_ys,
+                                direct_b,
                             );
                             use crate::field::gf2_128::x86_64::{f128x4_loadu, ghash_mul_x4_split, ghash_shift64_x4};
                             let eh = eq_hi[x_hi];
@@ -2505,6 +2519,8 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
         }
         Some(r4)
     } else if want_r4 && cfg!(test) {
+        let dense=(a_packed.len()!=b_packed.len()).then(||crate::compact_b::expand(b_packed));
+        let b_packed=dense.as_deref().unwrap_or(b_packed);
         Some(three_var::round4_lookahead_ref(
             a_packed,
             b_packed,
@@ -6471,6 +6487,71 @@ mod tests {
             for (k, line) in [0usize, 1, 30, 31].into_iter().enumerate() {
                 assert_eq!(b_out[32 * blk + line], consts[k], "block {blk} line {line}");
             }
+        }
+    }
+
+    #[test]
+    fn compact_b_round2_and_round345_differential() {
+        let m=20;
+        let k_skip=6;
+        let size=1usize<<(m-3);
+        let padding=PaddingSpec{k_log:14,useful_bits_per_block:15409};
+        let mut rng=Rng::new(76897);
+        let a:Vec<u8>=(0..size).map(|_|rng.next_u64() as u8).collect();
+        // Produce arbitrary valid variable bytes, restore structural bits,
+        // then re-pack so every sentinel in the packet is also canonical.
+        let mut packed=vec![0;size/2048*crate::compact_b::PACKED_BYTES];
+        let mut dense=vec![0;size];
+        for (packet,b) in packed.chunks_exact_mut(crate::compact_b::PACKED_BYTES)
+            .zip(dense.chunks_exact_mut(2048)) {
+            b[..1920].fill(255);
+            b[1920..1926].fill(255);
+            b[1926]=1;
+            for g in 0..56 {
+                for bit in (1153+250*g)..(1153+250*g+186) {
+                    if rng.bit() {b[bit/8]^=1<<(bit%8);}
+                }
+            }
+            crate::compact_b::pack((&*b).try_into().unwrap(),packet.try_into().unwrap());
+        }
+        let table=UniSkipFoldTable::new(k_skip,rng.f128());
+        let rho=[rng.f128(),rng.f128(),rng.f128()];
+        let mut rv:Vec<_>=(0..m-k_skip).map(|_|rng.f128()).collect();
+        rv[0]=F128::ONE;
+        rv[1..3].copy_from_slice(&crate::zerocheck::univariate_skip_optimized::small_challenges_ghash()[1..]);
+        rv[3..7].copy_from_slice(&crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash());
+        let eq=SplitEqGhash::with_n_hi(&rv[1..],2);
+        let r2=|b:&[u8]|uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
+            &a,b,m,k_skip,&table,&rv,&padding,Some(&eq),None,false);
+        if !cfg!(all(target_arch="x86_64",target_feature="avx512vbmi")) {assert_eq!(r2(&dense),r2(&packed));}
+        let rn=&rv[3..];
+        let eq3=SplitEqGhash::with_n_hi(&rn[1..],2);
+        let run=|b:&[u8]|{
+            let mut ao=vec![F128::ZERO;1<<(m-k_skip-3)];
+            let mut bo=ao.clone();
+            let out=three_var::fold3_from_packed_and_round_pair_lookahead_casc(&a,b,m,k_skip,
+                &table,&padding,&mut ao,&mut bo,rho,rn,Some((&eq3.lo,&eq3.hi)),
+                false,false,false,None,false);
+            (out,ao,bo)
+        };
+        if !cfg!(all(target_arch="x86_64",target_feature="avx512vbmi")) {assert_eq!(run(&dense),run(&packed));}
+        #[cfg(all(target_arch="x86_64",target_feature="avx512vbmi",target_feature="gfni",target_feature="vpclmulqdq"))]
+        {
+            let canonical=vec![F128::ONE;CANON_ROWS*64];
+            let r2=|b:&[u8]|uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
+                &a,b,m,k_skip,&table,&rv,&padding,Some(&eq),Some(&canonical),true);
+            assert_eq!(r2(&dense),r2(&packed));
+            let r345=|b:&[u8]|{
+                let mut ao=vec![F128::ZERO;1<<(m-k_skip-3)];
+                let mut bo=ao.clone();
+                let msgs=three_var::fold3_from_packed_and_round_pair_lookahead_casc(
+                    &a,b,m,k_skip,&table,&padding,&mut ao,&mut bo,rho,rn,
+                    Some((&eq3.lo,&eq3.hi)),false,true,true,None,true);
+                (msgs,ao,bo)
+            };
+            assert_eq!(r345(&dense),r345(&packed));
+            assert!(crate::compact_b::PACKED_R2.load(std::sync::atomic::Ordering::Relaxed)>0);
+            assert!(crate::compact_b::PACKED_R345.load(std::sync::atomic::Ordering::Relaxed)>0);
         }
     }
 

@@ -412,7 +412,7 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
     let n = 1usize << (m - k_skip);
     assert!(n >= 32);
     assert_eq!(a_packed.len(), n * n_chunks);
-    assert_eq!(b_packed.len(), n * n_chunks);
+    assert!(b_packed.len()==a_packed.len() || ((m==32 || cfg!(test)) && b_packed.len()==a_packed.len()/2048*crate::compact_b::PACKED_BYTES));
     let eighth = n / 8;
     assert_eq!(a_out.len(), eighth);
     assert_eq!(b_out.len(), eighth);
@@ -549,7 +549,19 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
     crate::rstrace::ev("r345:par0", 0);
     let leaf = |(x_hi, (a_out, b_out)): (usize, (&mut [F128], &mut [F128]))| {
             crate::rstrace::item_start();
-            let out_base = x_hi * chunk_out;
+            #[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="avx512vbmi",target_feature="gfni",target_feature="vpclmulqdq"))]
+            let direct_b = a_packed.len()!=b_packed.len() && fast.is_some() && casc && b_canon.is_some();
+            #[cfg(not(all(target_arch="x86_64",target_feature="avx512f",target_feature="avx512vbmi",target_feature="gfni",target_feature="vpclmulqdq")))]
+            let direct_b=false;
+            #[cfg(test)]
+            if direct_b {
+                crate::compact_b::PACKED_R345.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let (a_packed,b_input,byte_base)=if direct_b {
+                (a_packed,std::borrow::Cow::Borrowed(b_packed),x_hi*chunk_out*8*n_chunks)
+            } else {crate::compact_b::local_inputs(a_packed,b_packed,x_hi*chunk_out*8*n_chunks,chunk_out*8*n_chunks)};
+            let b_packed=b_input.as_ref();
+            let out_base=byte_base/(8*n_chunks);
             let mut la7 = [F128::ZERO; 18];
             #[cfg(all(
                 target_arch = "x86_64",
@@ -569,7 +581,7 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
                             ($nt:literal, $b7:literal) => {
                                 kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86::<$nt, true, true, $b7>(
                                     ap, bp, out_base, a_out, b_out, lo_size, c, rho[2],
-                                    wtab_casc.as_deref().unwrap(), bc, &mut la7, kappa6,
+                                    wtab_casc.as_deref().unwrap(), bc, &mut la7, kappa6, direct_b,
                                 )
                             };
                         }

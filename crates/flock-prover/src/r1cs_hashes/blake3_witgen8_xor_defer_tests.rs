@@ -115,7 +115,7 @@ unsafe fn run_sequence<const COLS: usize>(cq: bool, cached: bool, rw: usize) {
                             u32::from_le_bytes(bb[j][4 * w..4 * w + 4].try_into().unwrap());
                     }
                 }
-                let proj = StreamProj {
+                let proj = StreamProj { compact_b: None,
                     compact_z_tile_words: COLS * 4,
                     seed_window: None,
                     cross_quarter: cq,

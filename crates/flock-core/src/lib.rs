@@ -56,6 +56,7 @@ pub mod r1cs;
 pub mod scratch;
 pub mod verifier;
 pub mod zerocheck;
+pub mod compact_b;
 
 /// Configure rayon's global thread pool to use only performance cores on
 /// Apple silicon (excluding efficiency cores).

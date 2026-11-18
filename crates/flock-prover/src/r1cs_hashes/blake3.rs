@@ -2220,6 +2220,7 @@ impl WitnessWithCommitment {
 }
 
 struct WitnessCommitContext<'a> {
+    compact_b: Option<Vec<F128>>,
     params: &'a flock_core::pcs::PcsParams,
     odd_tail: usize,
     codeword: Option<Vec<F128>>,
@@ -2246,14 +2247,23 @@ fn generate_witness_and_commit_from(
     (WitnessWithCommitment, Vec<F128>, Vec<F128>, flock_core::zerocheck::univariate_skip_optimized::Round1AbInner),
 ) {
     let mut context = WitnessCommitContext {
-        params, odd_tail, codeword: resident_codeword, committed: None,
+        params, odd_tail, codeword: resident_codeword, committed: None, compact_b: None,
     };
-    let (z, a, b, ab_inner) = generate_witness_with_optional_commit_from(
+    let (z, a, b, mut ab_inner) = generate_witness_with_optional_commit_from(
         blocks, n_blocks_log, Some(&mut context),
     );
     // Both the producer and every codeword/Merkle reader have joined before
     // the generator returns. A panic cannot construct or return this bundle.
     assert!(context.committed.is_none() || context.codeword.is_none());
+    let b = if let Some(packed) = context.compact_b.take() {
+        ab_inner.mark_compact_b_input();
+        if !b.is_empty() {
+            flock_core::scratch::give_f128(b);
+        }
+        packed
+    } else {
+        b
+    };
     let witness = WitnessWithCommitment { z, committed: context.committed };
     (context.codeword, (witness, a, b, ab_inner))
 }
@@ -2413,6 +2423,12 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
     )
 }
 
+fn compact_b_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_COMPACT_B").is_none());
+    *ENABLED
+}
+
 fn generate_witness_with_ab_packed_and_round1_inner_impl_with_commit(
     blocks: crate::seed_pipe::BlockSource<'_>,
     n_blocks_log: usize,
@@ -2457,10 +2473,16 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_with_commit(
         n_f128,
         witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
     );
-    let (mut b, b_tok) = flock_core::scratch::take_f128_tagged(
-        n_f128,
-        witgen_simd::scratch_tag(witgen_simd::ROLE_B, n_f128),
-    );
+    // Packed mixed windows have no scratch-provenance requirement. Delay
+    // the dense B allocation until the producer actually selects a rollback.
+    let deferred_b = cfg!(all(target_os="linux",target_arch="x86_64",target_feature="avx512vbmi"))
+        && use_simd && !use_nt && ab_nt && a_tok && n_blocks_log==18 && skip_blocks==0
+        && matches!(blocks,crate::seed_pipe::BlockSource::Closed {..})
+        && commit_ctx.as_ref().is_some_and(|ctx|ctx.ranked_resident())
+        && compact_b_enabled();
+    let (mut b,b_tok) = if deferred_b { (Vec::new(),true) } else {
+        flock_core::scratch::take_f128_tagged(n_f128,witgen_simd::scratch_tag(witgen_simd::ROLE_B,n_f128))
+    };
     let (mut z, z_tok) = flock_core::scratch::take_f128_tagged(
         n_f128,
         witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
@@ -2554,7 +2576,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_with_commit(
             skip_blocks,
             &mut z,
             &mut a,
-            &mut b,
+            if deferred_b {WitnessB::Deferred(&mut b,n_f128)} else {WitnessB::Dense(&mut b)},
             &mut ab_inner,
             &inv_table,
             &padding,
@@ -2571,10 +2593,12 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_with_commit(
             a.as_ptr(),
             witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
         );
-        flock_core::scratch::register_pending_tag(
-            b.as_ptr(),
-            witgen_simd::scratch_tag(witgen_simd::ROLE_B, n_f128),
-        );
+        if !b.is_empty() {
+            flock_core::scratch::register_pending_tag(
+                b.as_ptr(),
+                witgen_simd::scratch_tag(witgen_simd::ROLE_B, n_f128),
+            );
+        }
         // z is read-only from here to its release inside the open's
         // materialize (commit encode, zerocheck c-view, lincheck repack all
         // take shared views), so its provenance survives to the next prove.
@@ -2938,9 +2962,43 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
     ranked_closed_dispatch: RankedClosedDispatch,
 ) {
     generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
-        blocks, skip_blocks, z, a, b, ab_inner, inv_table, padding,
+        blocks, skip_blocks, z, a, WitnessB::Dense(b), ab_inner, inv_table, padding,
         elide, ab_nt, ranked_closed_dispatch, None,
     )
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+enum WitnessB<'a> {
+    Dense(&'a mut [F128]),
+    Deferred(&'a mut Vec<F128>, usize),
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+impl WitnessB<'_> {
+    fn dense(&mut self) -> &mut [F128] {
+        match self {
+            Self::Dense(data) => data,
+            Self::Deferred(data, n) => {
+                if data.is_empty() {
+                    **data = flock_core::scratch::take_f128(*n);
+                    // A fallback may elide constant stores. Recreate exactly
+                    // the four windows it would find in a provenanced B.
+                    use rayon::prelude::*;
+                    data.par_chunks_mut(128).for_each(|block| {
+                        for f in &mut block[..8] {
+                            *f = F128 {
+                                lo: u64::MAX,
+                                hi: u64::MAX,
+                            };
+                        }
+                        block[120..].fill(F128::ZERO);
+                        block[120].lo = (1 << 49) - 1;
+                    });
+                }
+                data
+            }
+        }
+    }
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -2950,7 +3008,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
     skip_blocks: usize,
     z: &mut [F128],
     a: &mut [F128],
-    b: &mut [F128],
+    mut b: WitnessB<'_>,
     ab_inner: &mut flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
     inv_table: &flock_core::ntt::InvNttTableByteSingleGf8,
     padding: &Compression,
@@ -3105,7 +3163,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
             // generating region. Derive its producer pointer FROM that borrow
             // in each callback; retain no earlier z pointer across reborrowing.
             let a_addr = a.as_mut_ptr() as usize;
-            let b_addr = b.as_mut_ptr() as usize;
+
             let ab_addr = ab_inner_bytes.as_mut_ptr() as usize;
             // Lane ab1: hole-free compact layout for round one's leaf kernels
             // (switch read once here; `FLOCK_NO_AB1_HOLE=1` keeps `base * 1856`).
@@ -3120,6 +3178,24 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
             let window_tile_enabled=!flock_core::sl2_env_set!("FLOCK_NO_WITNESS_SEED_TILE");
             let window_seed_enabled=window_tile_enabled&&root_generator.is_some()&&blake3_witgen8::window_seed_projection_eligible(preps.get());
             flock_core::rstrace::evd("oc:gen", 0);
+            let mut packet_storage = if window_seed_enabled && elide_z && compact_b_enabled() {
+                let blocks = z.len() / F128_PER_BLOCK;
+                let packets = flock_core::scratch::take_f128(
+                    blocks * flock_core::compact_b::PACKED_BYTES / size_of::<F128>(),
+                );
+                if (packets.as_ptr() as usize).is_multiple_of(64) {
+                    Some(packets)
+                } else {
+                    flock_core::scratch::give_f128(packets);
+                    None
+                }
+            } else {
+                None
+            };
+            let packet_addr = packet_storage.as_mut().map(|buf| buf.as_mut_ptr() as usize);
+            // With compact publication B's dense address is only used for
+            // in-bounds offset arithmetic; all actual B stores select packets.
+            let b_addr=if packet_addr.is_some() {a_addr} else {b.dense().as_mut_ptr() as usize};
             let groups_n = z.len() / F128_PER_BLOCK / (SIMD * OCTAS_PER_GROUP);
             let epoch_claims = witness_octa_claim_enabled()
                 .then(|| gl2_octa_epoch_claims(groups_n))
@@ -3178,7 +3254,9 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                     // enclosing exact branch verified all three scratch tags.
                     unsafe {
                         let seed_context=windows.as_ref().map(|window|blake3_witgen8::SeedWindowContext{window,input:input_base,prefix:prefix_base,kpair,merge_prefix});
-                        let proj = blake3_witgen8::StreamProj { compact_z_tile_words: if compact_tile{window_tile_cols*4}else{0}, seed_window: seed_context.as_ref(),
+                        let mut prev = [core::arch::x86_64::_mm512_setzero_si512(); 8];
+                        let byte_writer = packet_addr.map(|p|(p + base * flock_core::compact_b::PACKED_BYTES, prev.as_mut_ptr() as usize));
+                        let proj = blake3_witgen8::StreamProj { compact_b: byte_writer, compact_z_tile_words: if compact_tile{window_tile_cols*4}else{0}, seed_window: seed_context.as_ref(),
                             cross_quarter: true,
                             compact_z: if target.is_some() { input_base.cast::<u32>() } else { core::ptr::null_mut() },
                             elide_z: elide_z && target.is_some(),
@@ -3244,6 +3322,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
             let committed = unsafe {
                 flock_core::pcs::commit::commit_generated_into(z, context.params, codeword, &produce)
             };
+            context.compact_b = packet_storage;
             context.committed = Some(committed);
             true
         } else {
@@ -3255,7 +3334,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
         if !pipelined {
             z.par_chunks_mut(group_f128)
                 .zip(a.par_chunks_mut(group_f128))
-                .zip(b.par_chunks_mut(group_f128))
+                .zip(b.dense().par_chunks_mut(group_f128))
                 .zip(ab_inner_bytes.par_chunks_mut(group_bytes))
                 .zip(root_storage[root_offset..root_offset + root_fields].par_chunks_mut(ROOT_FIELDS_PER_TILE))
                 .enumerate()
@@ -3268,7 +3347,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                         for half in 0..(n_here / SIMD) {
                             let base = GROUP * g + half * SIMD;
                             let off = half * SIMD * F128_PER_BLOCK;
-                            let proj = blake3_witgen8::StreamProj { compact_z_tile_words: 0, seed_window: None,
+                            let proj = blake3_witgen8::StreamProj { compact_b: None, compact_z_tile_words: 0, seed_window: None,
                                 cross_quarter: false, compact_z: core::ptr::null_mut(), elide_z: false,
                                 stage: stage.as_mut_ptr().cast::<u32>(),
                                 out: ab_out.as_mut_ptr().add(half * SIMD * ab_block_bytes),
@@ -3347,7 +3426,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
     }
     z.par_chunks_mut(group_f128)
         .zip(a.par_chunks_mut(group_f128))
-        .zip(b.par_chunks_mut(group_f128))
+        .zip(b.dense().par_chunks_mut(group_f128))
         .zip(ab_inner_bytes.par_chunks_mut(group_bytes))
         .enumerate()
         .for_each_init(
@@ -3407,7 +3486,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                         // round-1 window as it is produced, straight into
                         // this octa's ab_inner blocks.
                         let proj = stage.map(|st| {
-                            blake3_witgen8::StreamProj { compact_z_tile_words: 0, seed_window: None,
+                            blake3_witgen8::StreamProj { compact_b: None, compact_z_tile_words: 0, seed_window: None,
                                 cross_quarter: false, compact_z: core::ptr::null_mut(), elide_z: false,
                                 stage: st,
                                 out: ab_out

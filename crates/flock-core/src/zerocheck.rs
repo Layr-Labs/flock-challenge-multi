@@ -556,7 +556,13 @@ fn prove_packed_padded_inner<C: Challenger>(
     );
     let expected_bytes = (1usize << m) / 8;
     assert_eq!(a_packed.len(), expected_bytes);
-    assert_eq!(b_packed.len(), expected_bytes);
+    let packed_b = precomputed_ab.as_ref().is_some_and(|ab| ab.compact_b_input());
+    if packed_b {
+        assert_eq!(b_packed.len(),expected_bytes / crate::compact_b::DENSE_BYTES * crate::compact_b::PACKED_BYTES);
+        assert_eq!((m,padding.k_log,padding.useful_bits_per_block),(32,14,15409));
+    } else {assert_eq!(b_packed.len(), expected_bytes);}
+    let restored_b = (packed_b && c_identity_z.is_none()).then(||crate::compact_b::expand(b_packed));
+    let b_packed = restored_b.as_deref().unwrap_or(b_packed);
     assert_eq!(c_packed.len(), expected_bytes);
     let n_mlv = m - k_skip;
 
@@ -960,6 +966,11 @@ fn prove_packed_padded_inner<C: Challenger>(
         && r[k_skip + 4] != F128::ZERO
         && (cfg!(test) || cfg!(target_arch = "x86_64"))
         && !three_var_off();
+    // Rolled-back stages and diagnostic readers retain their dense inputs.
+    let dense_fallback = (b_packed.len()!=expected_bytes && (!want_3var
+        || std::env::var_os("FLOCK_ZC_3VAR_CHECK").is_some()))
+        .then(||crate::compact_b::expand(b_packed));
+    let b_packed=dense_fallback.as_deref().unwrap_or(b_packed);
     let mut la4: Option<multilinear::Round4Lookahead> = None;
     crate::rstrace::ev("r2:call", 0);
     let (mut a_mlv, mut b_mlv, msg_1, msg_inf, lookahead) = if use_nomat {
@@ -1039,6 +1050,9 @@ fn prove_packed_padded_inner<C: Challenger>(
     // N/4 outputs into freshly taken buffers and the scratch pair is sized for
     // the fold after it (N/8).
     let use_3var = la4.is_some();
+    let generic_b = (!use_3var && b_packed.len()!=expected_bytes)
+        .then(||crate::compact_b::expand(b_packed));
+    let b_packed=generic_b.as_deref().unwrap_or(b_packed);
     #[cfg(test)]
     ZC_3VAR_LAST.store(use_3var, std::sync::atomic::Ordering::Relaxed);
     if use_3var && hoisted_flag!("FLOCK_ZC_3VAR_CHECK") {

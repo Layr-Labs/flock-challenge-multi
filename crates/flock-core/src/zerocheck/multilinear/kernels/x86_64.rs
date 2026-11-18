@@ -6526,6 +6526,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_red_x86(
     bk: &R2EqBake,
     lw: &R4LaneWeights,
     ys: bool,
+    packed_b: bool,
 ) -> ([core::arch::x86_64::__m512i; 8], [core::arch::x86_64::__m512i; 10]) {
     static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var_os("FLOCK_NO_ZC_R4_CANON_PAIR").is_some()
@@ -6533,9 +6534,9 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_red_x86(
     let pair = !*OFF && lw.lv4[0] == lw.lv4[2] && lw.lv4[1] == lw.lv4[3];
     unsafe {
         macro_rules! go { ($p:literal,$a:literal,$b:literal) => {
-            round2_lookahead_chunk_baked_elide_r4_impl::<$p, $a, $b, false>(a_pkt,b_pkt,row_base,lo_size,bk,lw) } }
+            round2_lookahead_chunk_baked_elide_r4_impl::<$p, $a, $b, false>(a_pkt,b_pkt,row_base,lo_size,bk,lw,packed_b) } }
         macro_rules! go_m { ($a:literal,$b:literal) => {
-            round2_lookahead_chunk_baked_elide_r4_impl::<true, $a, $b, true>(a_pkt,b_pkt,row_base,lo_size,bk,lw) } }
+            round2_lookahead_chunk_baked_elide_r4_impl::<true, $a, $b, true>(a_pkt,b_pkt,row_base,lo_size,bk,lw,packed_b) } }
         match (pair, ys) {
             (true, true) if zc_r2_merge_enabled() => go_m!(true, true),
             (true, false) if zc_r2_merge_enabled() => go_m!(false, false),
@@ -6638,9 +6639,9 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
     let pair = !*OFF && lw.lv4[0] == lw.lv4[2] && lw.lv4[1] == lw.lv4[3];
     unsafe {
         macro_rules! go { ($p:literal,$a:literal,$b:literal) => {
-            round2_lookahead_chunk_baked_elide_r4_impl::<$p, $a, $b, false>(a_pkt,b_pkt,row_base,lo_size,bk,lw) } }
+            round2_lookahead_chunk_baked_elide_r4_impl::<$p, $a, $b, false>(a_pkt,b_pkt,row_base,lo_size,bk,lw,false) } }
         macro_rules! go_m { ($a:literal,$b:literal) => {
-            round2_lookahead_chunk_baked_elide_r4_impl::<true, $a, $b, true>(a_pkt,b_pkt,row_base,lo_size,bk,lw) } }
+            round2_lookahead_chunk_baked_elide_r4_impl::<true, $a, $b, true>(a_pkt,b_pkt,row_base,lo_size,bk,lw,false) } }
         let (red, red4) = match (pair, ys) {
             (true, true) if zc_r2_merge_enabled() => go_m!(true, true),
             (true, false) if zc_r2_merge_enabled() => go_m!(false, false),
@@ -6676,6 +6677,7 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
     lo_size: usize,
     bk: &R2EqBake,
     _lw: &R4LaneWeights,
+    packed_b: bool,
 ) -> ([core::arch::x86_64::__m512i; 8], [core::arch::x86_64::__m512i; 10]) {
     use core::arch::x86_64::*;
     debug_assert!(lo_size >= 128 && lo_size.is_multiple_of(128));
@@ -6709,7 +6711,7 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
                         core::arch::x86_64::_MM_HINT_T0,
                     );
                     _mm_prefetch(
-                        b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                        b_pkt.wrapping_add(if packed_b {next/2048*crate::compact_b::PACKED_BYTES+(next%2048+64*l)*crate::compact_b::PACKED_BYTES/2048} else {next+64*l}).cast::<i8>(),
                         core::arch::x86_64::_MM_HINT_T0,
                     );
                 }
@@ -6849,14 +6851,17 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
         }
 
         let mut x_lo = 0;
+        let mut dense_b=core::mem::MaybeUninit::<[u8;crate::compact_b::DENSE_BYTES]>::uninit();
         while x_lo + 128 <= lo_size {
+            let b_block=crate::compact_b::block_ptr(b_pkt,(row_base+2*x_lo)/256,packed_b,&mut dense_b);
+
             let batch_base = x_lo >> 5;
             if PAIR { fa=fa_first; fb=fb_first; }
             {
                 let g0 = row_base + 2 * x_lo;
                 let bm = &(*b_mats_slice.add(batch_base)).0;
                 gfni_fold64_rows_tr_bcast_skip_group_y::<true, YA>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
-                gfni_fold64_rows_tr_bcast_skip_group_y::<false, YB>(b_pkt.add(g0 * 8), bm.as_ptr(), fb, 0);
+                gfni_fold64_rows_tr_bcast_skip_group_y::<false, YB>(b_block.add((g0 & 255) * 8), bm.as_ptr(), fb, 0);
                 pf_quarter!(g0, 0);
                 #[cfg(test)]
                 R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -6871,7 +6876,7 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
                 let g0 = row_base + 2 * (x_lo + 32);
                 let bm = &(*b_mats_slice.add(batch_base + 1)).0;
                 gfni_fold64_rows_masked_tr_bcast4_y::<YA>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
-                gfni_fold64_rows_masked_tr_bcast_y::<YB>(b_pkt.add(g0 * 8), bm, fb, 0);
+                gfni_fold64_rows_masked_tr_bcast_y::<YB>(b_block.add((g0 & 255) * 8), bm, fb, 0);
                 accum2!(g0, 0, 1);
                 accum2!(g0, 2, 3);
                 r4_round4_batch(fa, fb, &mut acc4, 255);
@@ -6880,7 +6885,7 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
                 let g0 = row_base + 2 * (x_lo + 64);
                 let bm = &(*b_mats_slice.add(batch_base + 2)).0;
                 gfni_fold64_rows_masked_tr_bcast4_y::<YA>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
-                gfni_fold64_rows_masked_tr_bcast_y::<YB>(b_pkt.add(g0 * 8), bm, fb, 0);
+                gfni_fold64_rows_masked_tr_bcast_y::<YB>(b_block.add((g0 & 255) * 8), bm, fb, 0);
                 accum2!(g0, 0, 1);
                 accum2!(g0, 2, 3);
                 r4_round4_batch(fa, fb, &mut acc4, 255);
@@ -6889,7 +6894,7 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
                 let g0 = row_base + 2 * (x_lo + 96);
                 let bm = &(*b_mats_slice.add(batch_base + 3)).0;
                 gfni_fold64_rows_tr_bcast_skip_group_y::<true, YA>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 3);
-                gfni_fold64_rows_tr_bcast_skip_group_y::<false, YB>(b_pkt.add(g0 * 8), bm.as_ptr(), fb, 3);
+                gfni_fold64_rows_tr_bcast_skip_group_y::<false, YB>(b_block.add((g0 & 255) * 8), bm.as_ptr(), fb, 3);
                 accum2!(g0, 0, 1);
                 if PAIR && MERGE {
                     pf_quarter!(g0, 2);
@@ -7140,7 +7145,7 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_x86<
     unsafe {
         fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86::<NT_OUT, OUT_LM, false, false>(
             a_pkt, b_pkt, out_base, a_out, b_out, lo_size, cfold, rho3, wt, b_canon, &mut unused,
-            F128::ZERO,
+            F128::ZERO,false,
         )
     }
 }
@@ -7468,6 +7473,7 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
     b_canon: &[F128; 4],
     la7: &mut [F128; 18],
     kappa6: F128,
+    packed_b: bool,
 ) -> [F128; 8] {
     crate::realign_frame64!();
     use super::super::lane_select;
@@ -7542,9 +7548,9 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
         // B: eight lines from `$row`; returns the folds of its lines
         // (0, 2, 4, 6) and (1, 3, 5, 7).
         macro_rules! fold_b_window {
-            ($row:expr) => {{
+            ($block:expr,$row:expr) => {{
                 let [q0, q1, q2, q3] =
-                    gfni_fold64_rows_c4_lm_registers(b_pkt.add($row * 8), cfold);
+                    gfni_fold64_rows_c4_lm_registers($block.add($row * 8), cfold);
                 (fold_r3!(q0, q1), fold_r3!(q2, q3))
             }};
         }
@@ -7555,7 +7561,7 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
                 for l in $lines {
                     _mm_prefetch(a_pkt.wrapping_add($next + 64 * l).cast::<i8>(), _MM_HINT_T0);
                     if l >= $b_first && l < $b_last {
-                        _mm_prefetch(b_pkt.wrapping_add($next + 64 * l).cast::<i8>(), _MM_HINT_T0);
+                        _mm_prefetch(b_pkt.wrapping_add(if packed_b {($next/2048)*crate::compact_b::PACKED_BYTES+(($next%2048)+64*l)*crate::compact_b::PACKED_BYTES/2048} else {$next+64*l}).cast::<i8>(), _MM_HINT_T0);
                     }
                 }
             }};
@@ -7607,11 +7613,13 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
         // packed odd lanes, [1..10] = the t = ∞ corner products.
         let mut acc7 = [WideGhashX4::zero(); 10];
 
+        let mut dense_b=core::mem::MaybeUninit::<[u8;crate::compact_b::DENSE_BYTES]>::uninit();
         let mut x_lo = 0;
         while x_lo + 16 <= lo_size {
             // First packed row of this block; B's live lines are 2..30.
             let row0 = 8 * (out_base + 2 * x_lo);
             debug_assert!(row0.is_multiple_of(256));
+            let b_block=crate::compact_b::block_ptr(b_pkt,row0/256,packed_b,&mut dense_b);
             let (pf1_first, pf1_last, pf2_first, pf2_last) = if PF_FLIPS_HALF {
                 (0, 14, 2, 16)
             } else {
@@ -7623,8 +7631,8 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
             prefetch_half!(next, 0..8, pf1_first, pf1_last);
             let a_tile = fold_a_half!(row0);
             prefetch_half!(next, 8..16, pf1_first, pf1_last);
-            let (e1, o1) = fold_b_window!(row0 + 16); // lines 2,4,6,8 / 3,5,7,9
-            let (e2, o2) = fold_b_window!(row0 + 80); // lines 10,12,14,16 / 11,13,15,17
+            let (e1, o1) = fold_b_window!(b_block,16); // lines 2,4,6,8 / 3,5,7,9
+            let (e2, o2) = fold_b_window!(b_block,80); // lines 10,12,14,16 / 11,13,15,17
             let te = _mm512_shuffle_i64x2::<0xDD>(e1, e2); // lines 4, 8, 12, 16
             let to = _mm512_shuffle_i64x2::<0xDD>(o1, o2); // lines 5, 9, 13, 17
             let b_tile = [
@@ -7640,8 +7648,8 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
             prefetch_half!(next, 0..8, pf2_first, pf2_last);
             let c_tile = fold_a_half!(row0 + 128);
             prefetch_half!(next, 8..16, pf2_first, pf2_last);
-            let (e3, o3) = fold_b_window!(row0 + 144); // lines 18,20,22,24 / 19,21,23,25
-            let [h0, h1] = gfni_fold32_rows_c4_lm_registers(b_pkt.add((row0 + 208) * 8), cfold);
+            let (e3, o3) = fold_b_window!(b_block,144); // lines 18,20,22,24 / 19,21,23,25
+            let [h0, h1] = gfni_fold32_rows_c4_lm_registers(b_block.add(208*8), cfold);
             let f4 = fold_r3!(h0, h1); // lines 26, 27, 28, 29
             let d_tile = [
                 // lines 16, 20, 24, 28
@@ -7782,11 +7790,11 @@ mod r4_canonical_pair_tests {
             let bm=(0..lo/32).map(|_|R2FoldMats(std::array::from_fn(|_|next(&mut s)))).collect();
             let bk=R2EqBake { a_mats:am,b_mats:bm,b_scale:vec![F128::ONE;lo/32],lane,canonical_elide:true };
             unsafe {
-                let want=round2_lookahead_chunk_baked_elide_r4_impl::<false, false, false, false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw);
-                let got=round2_lookahead_chunk_baked_elide_r4_impl::<true, false, false, false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw);
+                let want=round2_lookahead_chunk_baked_elide_r4_impl::<false, false, false, false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw,false);
+                let got=round2_lookahead_chunk_baked_elide_r4_impl::<true, false, false, false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw,false);
                 assert_eq!(r2_r4_finish(&got.0,&got.1,&bk,&lw),r2_r4_finish(&want.0,&want.1,&bk,&lw),"lo={lo} row_base={row_base}");
                 let other=R4LaneWeights { lv4:[even,odd,even+F128::ONE,odd],lv4_odd:lw.lv4_odd };
-                let want=round2_lookahead_chunk_baked_elide_r4_impl::<false, false, false, false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&other);
+                let want=round2_lookahead_chunk_baked_elide_r4_impl::<false, false, false, false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&other,false);
                 let want=r2_r4_finish(&want.0,&want.1,&bk,&other);
                 let got=round2_lookahead_chunk_baked_elide_r4_x86(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&other,false);
                 assert_eq!(got,want,"non-periodic lane weights must retain the original route");
@@ -7859,11 +7867,11 @@ mod r4_canonical_pair_tests {
             let bk=R2EqBake { a_mats:am,b_mats:bm,b_scale:vec![F128::ONE;lo/32],lane,canonical_elide:true };
             unsafe {
                 let (ap, bp) = (a.as_ptr(), b.as_ptr());
-                let want = flat(round2_lookahead_chunk_baked_elide_r4_impl::<true, true, true, false>(ap,bp,row_base,lo,&bk,&lw));
-                let got = flat(round2_lookahead_chunk_baked_elide_r4_impl::<true, true, true, true>(ap,bp,row_base,lo,&bk,&lw));
+                let want = flat(round2_lookahead_chunk_baked_elide_r4_impl::<true, true, true, false>(ap,bp,row_base,lo,&bk,&lw,false));
+                let got = flat(round2_lookahead_chunk_baked_elide_r4_impl::<true, true, true, true>(ap,bp,row_base,lo,&bk,&lw,false));
                 assert_eq!(got, want, "merge ys lo={lo} row_base={row_base}");
-                let want = flat(round2_lookahead_chunk_baked_elide_r4_impl::<true, false, false, false>(ap,bp,row_base,lo,&bk,&lw));
-                let got = flat(round2_lookahead_chunk_baked_elide_r4_impl::<true, false, false, true>(ap,bp,row_base,lo,&bk,&lw));
+                let want = flat(round2_lookahead_chunk_baked_elide_r4_impl::<true, false, false, false>(ap,bp,row_base,lo,&bk,&lw,false));
+                let got = flat(round2_lookahead_chunk_baked_elide_r4_impl::<true, false, false, true>(ap,bp,row_base,lo,&bk,&lw,false));
                 assert_eq!(got, want, "merge lo={lo} row_base={row_base}");
             }
         }}}

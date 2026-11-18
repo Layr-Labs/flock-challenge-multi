@@ -585,6 +585,7 @@ pub struct Round1AbInner {
     /// tc: the ranked projection wrote the transpose-contract line layout
     /// (see [`Self::set_tc_layout`]); only round one's tc band fold reads it.
     tc_layout: bool,
+    compact_b_input: bool,
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -686,7 +687,7 @@ impl Round1AbInner {
             ranked_compact: false,
             ranked_w30_elided: false,
             ab1_hole_layout: false,
-            tc_layout: false,
+            tc_layout: false, compact_b_input: false,
             #[cfg(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
@@ -716,7 +717,7 @@ impl Round1AbInner {
             ranked_compact: true,
             ranked_w30_elided: false,
             ab1_hole_layout: false,
-            tc_layout: false,
+            tc_layout: false, compact_b_input: false,
             #[cfg(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
@@ -787,6 +788,13 @@ impl Round1AbInner {
 
     /// Whether the storage holds the tc layout.
     #[inline]
+    pub fn mark_compact_b_input(&mut self) {
+        assert!(self.ranked_compact() && self.invalid_prefix_bytes() == 0);
+        self.compact_b_input = true;
+    }
+
+    pub(crate) fn compact_b_input(&self) -> bool { self.compact_b_input }
+
     pub fn tc_layout(&self) -> bool {
         self.tc_layout
     }
@@ -1115,7 +1123,7 @@ fn precompute_round1_ab_inner_packed_padded_impl(
         ranked_compact: false,
         ranked_w30_elided: false,
         ab1_hole_layout: false,
-        tc_layout: false,
+        tc_layout: false, compact_b_input: false,
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx512f",
@@ -4539,10 +4547,13 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed_idle(
     let total_bytes = (1usize << m) / 8;
     assert_eq!(ab_inner.len_bytes(), total_bytes);
     assert_eq!(a_packed.len(), total_bytes);
-    assert_eq!(b_packed.len(), total_bytes);
+    if ab_inner.compact_b_input && b_packed.len() != total_bytes {
+        assert_eq!(b_packed.len(), total_bytes / crate::compact_b::DENSE_BYTES * crate::compact_b::PACKED_BYTES);
+        assert_eq!(ab_inner.invalid_prefix_bytes(), 0);
+    } else { assert_eq!(b_packed.len(), total_bytes); }
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
-    ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
+    if ab_inner.invalid_prefix_bytes() != 0 { ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table); }
     let r_outer = &r[k_skip + N_INNER..];
     let n_hi = r_outer.len().min(SplitEqGhash::MAX_N_HI);
     let n_lo = r_outer.len() - n_hi;
