@@ -1507,7 +1507,7 @@ pub mod hot_pool {
             std::env::var("FLOCK_HOT_POOL_SPINS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(2048)
+                .unwrap_or(4096)
         });
         *V
     }
