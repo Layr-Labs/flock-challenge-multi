@@ -424,12 +424,18 @@ impl RootTileCache {
             std::env::var_os("FLOCK_NO_ROOT_CACHE_PREFETCH").is_none()
         });
         let prefetch_blocks = BATCH_WORD_TILES && *PREFETCH;
+        // Schedule-only leaf (patternrecognition9-del 0cde1b93, runner in-run reads
+        // -0.15% and -0.35%): four GFNI pairs before their XORs. FLOCK_NO_ROOT_PIPELINED=1 restores.
+        static PIPELINED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_ROOT_PIPELINED").is_none()
+        });
+        let pipelined = BATCH_WORD_TILES && *PIPELINED;
         // Resolve the tile group once, outside the parallel reader. Two-tile
         // groups reduced measured lincheck latency on the ranked CPU shape.
         static WORD_BATCH: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
             std::env::var("FLOCK_ROOT_FOLD_BATCH")
                 .ok().and_then(|s| s.parse().ok())
-                .filter(|n| (1..=4).contains(n)).unwrap_or(3)
+                .filter(|n| (1..=4).contains(n)).unwrap_or(2)
         });
         let word_batch = if BATCH_WORD_TILES { *WORD_BATCH } else { 4 };
         static TAIL1: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
@@ -532,6 +538,16 @@ impl RootTileCache {
                             }
                         }
                         for block in 0..self.blocks {
+                            if pipelined {
+                                unsafe {
+                                    kernels::gfni_fold_word_tiles4_pipelined(
+                                        source.add(block * 512), matrices.as_ptr().cast::<u64>(),
+                                        dst.as_mut_ptr().cast::<u8>().add(block * 1024),
+                                        self.blocks * 512, count, first, WORD_TO_COLUMNS.as_ptr(),
+                                        prefetch_blocks && block + 1 < self.blocks);
+                                }
+                                continue;
+                            }
                             // SAFETY: tile + count <= hi <= self.tiles, each
                             // source block has eight initialized 64-byte rows,
                             // and actual tile stride is blocks*512. Arrays of
@@ -621,6 +637,7 @@ impl RootTileCache {
             vec![F128::ZERO; n_out]
         };
         out.par_chunks_mut(64).enumerate().for_each(|(block, dst)| {
+            crate::rstrace::evd("rf:rb", block as u32);
             // Leave the omitted group clear. The boundary group's surviving
             // bits are moved into it after the parallel reduction joins.
             if self.fixed_roots && block == 14 { return; }
