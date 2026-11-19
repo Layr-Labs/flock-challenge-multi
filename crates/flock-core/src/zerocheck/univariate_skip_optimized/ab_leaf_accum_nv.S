@@ -1,7 +1,7 @@
 // FLOCK_AB_NOVZU=1 alternates: Mahmoud514 5b2ced50's flock_ab_leaf_interpolate0/2
 // from ab_leaf_accum.S, renamed *_nv. They drop the trailing vzeroupper (the
 // next call, flock_ab_poly_finalize, is ZMM code) and one dead vmovdqa64.
-// Every other instruction equals the incumbent copies in ab_leaf_accum.S.
+// Every other instruction equals the incumbent copies in ab_leaf_accum.S (regenerated on c0202046's ternlog-folded copies).
 .text
 .p2align 5
 .globl flock_ab_leaf_interpolate0_nv
@@ -674,8 +674,7 @@ vpternlogq zmm2, zmm11, zmm20, 0x96
 vpxorq zmm2, zmm2, zmm10
 vmovdqu64 ZMMWORD PTR [rsi + 1216], zmm2
 vmovdqu64 zmm2, ZMMWORD PTR [rsp + 768]
-vpxorq zmm2, zmm2, zmm1
-vpxorq zmm2, zmm2, zmm17
+vpternlogq zmm2,zmm1,zmm17,0x96
 vmovdqu64 ZMMWORD PTR [rsi + 1536], zmm2
 vmovdqu64 zmm2, ZMMWORD PTR [rsp + 960]
 vpxorq zmm2, zmm2, zmm16
@@ -688,8 +687,7 @@ vpternlogq zmm17, zmm1, zmm2, 0x96
 vpxorq zmm17, zmm17, zmm3
 vmovdqu64 ZMMWORD PTR [rsi + 1728], zmm17
 vmovdqu64 zmm17, ZMMWORD PTR [rsp + 2176]
-vpxorq zmm17, zmm17, zmm19
-vpxorq zmm17, zmm17, zmm16
+vpternlogq zmm17,zmm19,zmm16,0x96
 vmovdqu64 ZMMWORD PTR [rsi + 1792], zmm17
 mov rsp, rbp
 pop rbp
