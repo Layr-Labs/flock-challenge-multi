@@ -2692,6 +2692,16 @@ fn inverse_ntt_final_layers_local(
 /// workers WHILE the owner is still drawing the later queries; after alpha
 /// only the alpha-weighted sums and the move into sorted order remain.
 /// Read once.
+/// Lane od1 (`FLOCK_NO_OD_DUALTEAM=1`): [`SparseDualL0::from_stream`]'s
+/// snapshot gather on the hot-pool team when the caller owns a live team.
+fn od_dual_team(chunks: usize) -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OD_DUALTEAM").is_none());
+    *ON && (2..=64).contains(&chunks)
+        && crate::flat_par::team_enabled()
+        && crate::flat_par::team_ready()
+}
+
 fn gl2_stream_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL2_STREAM").is_none());
@@ -3055,27 +3065,54 @@ impl SparseDualL0 {
         let mut w2_pows = crate::alloc_uninit_vec::<F128>(n_queries);
         const CH: usize = 16;
         let zero = crate::field::F256Unreduced::ZERO;
-        let (enf_acc, u0_acc, u2_acc) = rows
-            .par_chunks_mut(stride * CH)
-            .zip(w2_pows.par_chunks_mut(CH))
-            .enumerate()
-            .map(|(c, (rows_c, w2_c))| {
-                let (mut e, mut u0, mut u2) = (zero, zero, zero);
-                for (j, w2) in w2_c.iter_mut().enumerate() {
-                    let i = c * CH + j;
-                    let d = perm[i] as usize;
-                    rows_c[j * stride..(j + 1) * stride]
-                        .copy_from_slice(&src_rows[d * stride..(d + 1) * stride]);
-                    let [cq, f0, s, qs0] = vals[d];
-                    let a = alpha_pows[i];
-                    e ^= a.mul_unreduced(cq);
-                    u0 ^= a.mul_unreduced(f0);
-                    u2 ^= (a * s).mul_unreduced(qs0);
-                    *w2 = a * qs0;
-                }
-                (e, u0, u2)
-            })
-            .reduce(|| (zero, zero, zero), |a, b| (a.0 ^ b.0, a.1 ^ b.1, a.2 ^ b.2));
+        let chunk = |c: usize, rows_c: &mut [[F128; 16]], w2_c: &mut [F128]| {
+            let (mut e, mut u0, mut u2) = (zero, zero, zero);
+            for (j, w2) in w2_c.iter_mut().enumerate() {
+                let i = c * CH + j;
+                let d = perm[i] as usize;
+                rows_c[j * stride..(j + 1) * stride]
+                    .copy_from_slice(&src_rows[d * stride..(d + 1) * stride]);
+                let [cq, f0, s, qs0] = vals[d];
+                let a = alpha_pows[i];
+                e ^= a.mul_unreduced(cq);
+                u0 ^= a.mul_unreduced(f0);
+                u2 ^= (a * s).mul_unreduced(qs0);
+                *w2 = a * qs0;
+            }
+            (e, u0, u2)
+        };
+        let n_chunks = n_queries.div_ceil(CH);
+        let (enf_acc, u0_acc, u2_acc) = if od_dual_team(n_chunks) {
+            // Lane od1 (`FLOCK_NO_OD_DUALTEAM=1`: rayon route): the snapshot
+            // gather (<= 16 chunks) as a hot-pool team region; the owner spins
+            // on the done count instead of a rayon join tail. Same chunk
+            // bodies; XOR sums in another grouping: identical.
+            let (rp, wp) = (rows.as_mut_ptr() as usize, w2_pows.as_mut_ptr() as usize);
+            crate::flat_par::team_map_reduce(
+                n_chunks,
+                |c| {
+                    let lo = c * CH;
+                    let len = CH.min(n_queries - lo);
+                    // SAFETY: chunk `c` is claimed once and owns query slots
+                    // [lo, lo + len) of `rows` (stride rows each) and `w2_pows`.
+                    let (rows_c, w2_c) = unsafe {
+                        (
+                            std::slice::from_raw_parts_mut((rp as *mut [F128; 16]).add(lo * stride), len * stride),
+                            std::slice::from_raw_parts_mut((wp as *mut F128).add(lo), len),
+                        )
+                    };
+                    chunk(c, rows_c, w2_c)
+                },
+                || (zero, zero, zero),
+                |a, b| (a.0 ^ b.0, a.1 ^ b.1, a.2 ^ b.2),
+            )
+        } else {
+            rows.par_chunks_mut(stride * CH)
+                .zip(w2_pows.par_chunks_mut(CH))
+                .enumerate()
+                .map(|(c, (rows_c, w2_c))| chunk(c, rows_c, w2_c))
+                .reduce(|| (zero, zero, zero), |a, b| (a.0 ^ b.0, a.1 ^ b.1, a.2 ^ b.2))
+        };
         let enforced_sum = enf_acc.reduce();
         let round0_msg = SumcheckMessage {
             u_0: u0_acc.reduce(),
@@ -5617,6 +5654,32 @@ fn fold_and_msg_lsb_inner(
     lazy_ood: Option<(&[F128], &[F128], F128)>,
     deferred_basis: Option<(&[F128], F128)>,
 ) -> (FoldBuf, FoldBuf, SumcheckMessage) {
+    let chunk = fold_and_msg_chunk_len(f.len() / 2, rayon::current_num_threads());
+    fold_and_msg_lsb_inner_chunked(f, b, r, arena, lazy_ood, deferred_basis, chunk)
+}
+
+fn fold_and_msg_chunk_len(half: usize, threads: usize) -> usize {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_LIG_ADAPTIVE_FOLD_CHUNKS").is_none()
+        });
+        if *ON {
+            return (half / threads.max(1).next_power_of_two()).clamp(256, 2048);
+        }
+    }
+    2048
+}
+
+fn fold_and_msg_lsb_inner_chunked(
+    f: &[F128],
+    b: &[F128],
+    r: F128,
+    arena: Option<&mut FoldArena>,
+    lazy_ood: Option<(&[F128], &[F128], F128)>,
+    deferred_basis: Option<(&[F128], F128)>,
+    chunk: usize,
+) -> (FoldBuf, FoldBuf, SumcheckMessage) {
     use rayon::prelude::*;
     let n = f.len();
     debug_assert!(n.is_power_of_two() && n >= 2);
@@ -5728,6 +5791,7 @@ fn fold_and_msg_lsb_inner(
     }
 
     const CHUNK: usize = 2048;
+    assert!(chunk.is_power_of_two() && (256..=CHUNK).contains(&chunk));
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     let use_nt = lazy_ood.is_none()
         && deferred_basis.is_none()
@@ -5786,11 +5850,15 @@ fn fold_and_msg_lsb_inner(
         assert_eq!(eq_lo.len(), CHUNK, "ranked lazy OOD chunk width changed");
     }
     let (u_0, u_2) = nf_s
-        .par_chunks_mut(CHUNK)
-        .zip(nb_s.par_chunks_mut(CHUNK))
+        .par_chunks_mut(chunk)
+        .zip(nb_s.par_chunks_mut(chunk))
         .enumerate()
         .map(|(ci, (fc, bc))| {
-            let base = ci * CHUNK;
+            let base = ci * chunk;
+            let ood = lazy_ood.map(|(eq_lo, eq_hi, gamma)| {
+                let offset = base % eq_lo.len();
+                (&eq_lo[offset..offset + fc.len()], gamma * eq_hi[base / eq_lo.len()])
+            });
             #[cfg(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
@@ -5805,7 +5873,6 @@ fn fold_and_msg_lsb_inner(
                     };
                 }
                 return unsafe {
-                    let ood = lazy_ood.map(|(eq_lo, eq_hi, gamma)| (eq_lo, gamma * eq_hi[ci]));
                     fold_and_msg_chunk_x86::<true>(
                         f,
                         b,
@@ -5852,8 +5919,7 @@ fn fold_and_msg_lsb_inner(
                 } else {
                     crate::field::f128_slice::fold_pairs(b, base, bc, r);
                 }
-                if let Some((eq_lo, eq_hi, gamma)) = lazy_ood {
-                    let scale = gamma * eq_hi[ci];
+                if let Some((eq_lo, scale)) = ood {
                     crate::field::f128_slice::add_scaled(bc, &eq_lo[..len], scale);
                 }
                 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
@@ -7335,6 +7401,9 @@ fn ranked_sparse_dual_l0_depth(
 #[inline]
 fn ranked_sparse_dual_deep_depth_for_level(n_level: usize) -> Option<usize> {
     match n_level {
+        // Lane od1: depth 3 ends the dual with its level's last fold, so its
+        // basis can materialize in the background (`od_deep_bg_enabled`).
+        16 | 13 | 10 if od_deep_bg_enabled() => Some(3),
         16 | 13 | 10 => Some(SPARSE_DUAL_MAX_DEPTH),
         7 => Some(3),
         _ => None,
@@ -7601,6 +7670,166 @@ pub fn bench_direct_fold8_f_dense(
         });
 }
 
+/// Lane od1 (`FLOCK_NO_OD_BTAIL=1`): workers of the fold64 / seed6
+/// pipeline that find its claim list exhausted while its last tasks still
+/// run fold blocks of the level-one GFNI basis (b only) instead of idling at
+/// the region's end. The commit-phase basis pass then folds only the other
+/// blocks and, for blocks folded here, adds the round message with the
+/// two-pass `msg_reduce_avx512(f, b)`, which sees the same accumulation
+/// sequence as the fused strip form. Same b, same per-block (u0, u2), XOR
+/// sums: identical.
+fn od_btail_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OD_BTAIL").is_none());
+    *ON
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+type F8BasisSetup = (
+    [super::ring_switch::GfniDirectFoldMap; 2],
+    [(Vec<u64>, Vec<u64>); 2],
+);
+
+/// Lane od1: shared state of the level-one basis blocks folded early.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+struct F8BasisTail<'a> {
+    claims: &'a [super::ring_switch::DirectFold8Factors],
+    challenges: [F128; 6],
+    block_len: usize,
+    n_blocks: usize,
+    b_addr: usize,
+    next: std::sync::atomic::AtomicUsize,
+    done: Vec<std::sync::atomic::AtomicBool>,
+    setup: std::sync::OnceLock<F8BasisSetup>,
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+// SAFETY: `b_addr` is the base of `folded_b`, which outlives the tail; each
+// block of it is written by the one worker that claimed it from `next`.
+unsafe impl Sync for F8BasisTail<'_> {}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+impl<'a> F8BasisTail<'a> {
+    fn new(
+        claims: &'a [super::ring_switch::DirectFold8Factors],
+        challenges: [F128; 6],
+        block_len: usize,
+        folded_b: &mut [F128],
+    ) -> Self {
+        let n_blocks = folded_b.len() / block_len;
+        Self {
+            claims,
+            challenges,
+            block_len,
+            n_blocks,
+            b_addr: folded_b.as_mut_ptr() as usize,
+            next: std::sync::atomic::AtomicUsize::new(0),
+            done: (0..n_blocks).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
+            setup: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn setup(&self) -> &F8BasisSetup {
+        self.setup.get_or_init(|| f8_basis_setup(self.claims, self.challenges))
+    }
+
+    /// Claim and fold one basis block (b only); false once none is left.
+    fn run_one(&self, gfni_tmp: &mut Option<crate::scratch::LocalBuf>) -> bool {
+        use std::sync::atomic::Ordering;
+        let x = self.next.fetch_add(1, Ordering::Relaxed);
+        if x >= self.n_blocks {
+            return false;
+        }
+        const ALIGN64_MIN_F128: usize = (32 * 1024) / core::mem::size_of::<F128>();
+        let tmp = gfni_tmp.get_or_insert_with(|| {
+            crate::scratch::LocalBuf::new(64usize.max(ALIGN64_MIN_F128), crate::scratch::fold_buf_pool_enabled())
+        });
+        let (mats, rows) = self.setup();
+        crate::rstrace::evd("bt:s", x as u32);
+        // SAFETY: block `x` is claimed once; its slots lie inside `folded_b`.
+        unsafe {
+            let b_out = std::slice::from_raw_parts_mut((self.b_addr as *mut F128).add(x * self.block_len), self.block_len);
+            materialize_direct_fold8_b_gfni_block_x86(
+                mats,
+                rows,
+                self.claims[0].eq_hi[x],
+                self.claims[1].eq_hi[x],
+                self.block_len,
+                b_out,
+                None,
+                tmp,
+            );
+        }
+        self.done[x].store(true, Ordering::Release);
+        crate::rstrace::evd("bt:e", x as u32);
+        true
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn f8_basis_setup(claims: &[super::ring_switch::DirectFold8Factors], challenges: [F128; 6]) -> F8BasisSetup {
+    (
+        [
+            super::ring_switch::build_gfni_direct_fold_map_from_generators(
+                &direct_fold8_final_generators(&claims[0], challenges[5]),
+            ),
+            super::ring_switch::build_gfni_direct_fold_map_from_generators(
+                &direct_fold8_final_generators(&claims[1], challenges[5]),
+            ),
+        ],
+        [split_eq_lo_halves_avx512(&claims[0].eq_lo), split_eq_lo_halves_avx512(&claims[1].eq_lo)],
+    )
+}
+
+/// Lane od1: the pipeline's view of an [`F8BasisTail`] (type-erased so the
+/// non-GFNI build keeps one signature).
+pub(crate) trait H3Tail: Sync {
+    fn run_one(&self, gfni_tmp: &mut Option<crate::scratch::LocalBuf>) -> bool;
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+impl H3Tail for F8BasisTail<'_> {
+    fn run_one(&self, gfni_tmp: &mut Option<crate::scratch::LocalBuf>) -> bool {
+        F8BasisTail::run_one(self, gfni_tmp)
+    }
+}
+
 /// Lane h3 (`FLOCK_NO_H3_F8_PIPE=1` restores fold64, then the commit).
 fn h3_f8_pipe_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
@@ -7643,6 +7872,7 @@ fn h3_fold64_seed_pipeline(
     r4: F128,
     r5: F128,
     precommit: &DirectFold8L1Precommit,
+    tail: Option<&dyn H3Tail>,
 ) -> Option<H3Seeded> {
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -7719,14 +7949,20 @@ fn h3_fold64_seed_pipeline(
     }
     let done: Vec<AtomicU32> = (0..groups).map(|_| AtomicU32::new(0)).collect();
     let next = AtomicUsize::new(0);
+    // Lane od1: finished claim-list items (the basis tail runs while < len).
+    let fin = AtomicUsize::new(0);
     let out = folded_f.as_mut_ptr() as usize;
     let cw = mat.as_mut_ptr() as usize;
-    let (tasks, plan, seq, done, next) = (&*tasks, &plan, &seq, &done, &next);
+    let (tasks, plan, seq, done, next, fin) = (&*tasks, &plan, &seq, &done, &next, &fin);
     (0..rayon::current_num_threads()).into_par_iter().for_each(|_| {
         let mut buf: Option<Vec<F128>> = None;
+        let mut gfni_tmp: Option<crate::scratch::LocalBuf> = None;
         loop {
             let s = next.fetch_add(1, Ordering::Relaxed);
             if s >= seq.len() {
+                if let Some(t) = tail {
+                    while fin.load(Ordering::Acquire) < seq.len() && t.run_one(&mut gfni_tmp) {}
+                }
                 break;
             }
             let item = seq[s];
@@ -7758,6 +7994,7 @@ fn h3_fold64_seed_pipeline(
                     }
                 }
             }
+            fin.fetch_add(1, Ordering::Release);
         }
     });
     for d in done.iter() {
@@ -7778,6 +8015,7 @@ fn h3_fold64_seed_pipeline(
     _r4: F128,
     _r5: F128,
     _precommit: &DirectFold8L1Precommit,
+    _tail: Option<&dyn H3Tail>,
 ) -> Option<H3Seeded> {
     None
 }
@@ -7994,7 +8232,7 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
     challenges: [F128; 6],
     block_len: usize,
 ) -> (Vec<F128>, SumcheckMessage) {
-    materialize_direct_fold8_b_gfni_impl(Some(folded_f), folded_b, claims, challenges, block_len)
+    materialize_direct_fold8_b_gfni_impl(Some(folded_f), folded_b, claims, challenges, block_len, None)
 }
 
 #[cfg(all(
@@ -8010,6 +8248,7 @@ fn materialize_direct_fold8_b_gfni_impl(
     claims: &[super::ring_switch::DirectFold8Factors],
     challenges: [F128; 6],
     block_len: usize,
+    tail: Option<&F8BasisTail<'_>>,
 ) -> (Vec<F128>, SumcheckMessage) {
     use rayon::prelude::*;
 
@@ -8022,18 +8261,17 @@ fn materialize_direct_fold8_b_gfni_impl(
         claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == folded_b.len()
     }));
 
-    let direct_gfni_mats = [
-        super::ring_switch::build_gfni_direct_fold_map_from_generators(
-            &direct_fold8_final_generators(&claims[0], challenges[5]),
-        ),
-        super::ring_switch::build_gfni_direct_fold_map_from_generators(
-            &direct_fold8_final_generators(&claims[1], challenges[5]),
-        ),
-    ];
-    let direct_gfni_rows = [
-        split_eq_lo_halves_avx512(&claims[0].eq_lo),
-        split_eq_lo_halves_avx512(&claims[1].eq_lo),
-    ];
+    let local_setup;
+    let (direct_gfni_mats, direct_gfni_rows) = match tail {
+        Some(t) => {
+            let (m, r) = t.setup();
+            (m, r)
+        }
+        None => {
+            local_setup = f8_basis_setup(claims, challenges);
+            (&local_setup.0, &local_setup.1)
+        }
+    };
 
     const ALIGN64_MIN_F128: usize = (32 * 1024) / core::mem::size_of::<F128>();
     let stats = folded_b
@@ -8048,9 +8286,17 @@ fn materialize_direct_fold8_b_gfni_impl(
             },
             |gfni_tmp, (block, b_out)| unsafe {
                 let f_out = folded_f.map(|f| &f[block * block_len..(block + 1) * block_len]);
+                // Lane od1: a block the pipeline tail already folded needs
+                // only its message (two-pass form, same sums).
+                if tail.is_some_and(|t| t.done[block].load(std::sync::atomic::Ordering::Acquire)) {
+                    return match f_out {
+                        Some(f_out) => msg_reduce_avx512(f_out, b_out),
+                        None => (F128::ZERO, F128::ZERO),
+                    };
+                }
                 materialize_direct_fold8_b_gfni_block_x86(
-                    &direct_gfni_mats,
-                    &direct_gfni_rows,
+                    direct_gfni_mats,
+                    direct_gfni_rows,
                     claims[0].eq_hi[block],
                     claims[1].eq_hi[block],
                     block_len,
@@ -8189,7 +8435,7 @@ fn materialize_direct_fold8(
                     },
                     || {
                         let r = materialize_direct_fold8_b_gfni_impl(
-                            None, folded_b, claims, challenges, block_len,
+                            None, folded_b, claims, challenges, block_len, None,
                         );
                         crate::rstrace::ev("f8:basis:end", 0);
                         r
@@ -8233,6 +8479,10 @@ fn materialize_direct_fold8(
             crate::rstrace::ev("f8s:start", 0);
             let mut folded_f = crate::scratch::take_f128(out_len);
             let t_f8a = t_f8.elapsed();
+            // Lane od1: the basis buffer is taken before the pipeline so its
+            // idle tail can fold basis blocks into it.
+            let mut folded_b = crate::scratch::take_f128(out_len);
+            let btail = od_btail_enabled().then(|| F8BasisTail::new(claims, challenges, block_len, &mut folded_b));
             // Lane h3: fold64 and the L1 commit's seed pass in one region
             // (see `h3_fold64_seed_pipeline`); `None` folded nothing.
             let h3_seeded = h3_fold64_seed_pipeline(
@@ -8242,6 +8492,7 @@ fn materialize_direct_fold8(
                 r4,
                 r5,
                 &precommit,
+                btail.as_ref().map(|t| t as &dyn H3Tail),
             );
             if h3_seeded.is_none() {
                 materialize_direct_fold8_f_for_precommit(
@@ -8259,7 +8510,6 @@ fn materialize_direct_fold8(
             }
             crate::rstrace::ev("f8s:fold64", 0);
             let t_f8 = std::time::Instant::now();
-            let folded_b = crate::scratch::take_f128(out_len);
             crate::scratch::give_f128(packed_witness);
             crate::scratch::give_f128(ordinary_basis);
 
@@ -8289,8 +8539,8 @@ fn materialize_direct_fold8(
                     }
                 },
                 || {
-                    let r = materialize_direct_fold8_b_gfni_for_precommit(
-                        &folded_f, folded_b, claims, challenges, block_len,
+                    let r = materialize_direct_fold8_b_gfni_impl(
+                        Some(&folded_f), folded_b, claims, challenges, block_len, btail.as_ref(),
                     );
                     crate::rstrace::ev("f8s:basis", 0);
                     r
@@ -8949,6 +9199,20 @@ impl SumcheckProver {
 }
 
 
+/// Lane od1 (`FLOCK_NO_OD_DEEPBG=1`: depth 4, materialized inside the next
+/// level's first fold): piece 8's background materialization for the deep
+/// levels' sparse duals. Their depth goes from 4 to 3, so each basis is
+/// complete with its level's last fold; it then materializes as a detached
+/// job (gated like the level-0 dual's) during the next commit, OOD and query
+/// draws, and the next level's first fold folds `b + basis`. Every depth
+/// yields the same basis and the round deltas are linear in it, so messages
+/// and transcript are unchanged.
+fn od_deep_bg_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OD_DEEPBG").is_none());
+    *ON
+}
+
 /// Lane op (`FLOCK_NO_OP_OODTEAM=1`: rayon route): run a factorized OOD pass
 /// of `chunks` chunks on the hot-pool team when the caller owns a live team.
 fn op_ood_team(chunks: usize) -> bool {
@@ -8981,6 +9245,9 @@ struct SparseDualFoldWork {
     /// sum equals adding them one by one; no per-round Vec).
     deep_delta: Option<SumcheckMessage>,
     deep_basis: Option<Vec<F128>>,
+    /// Lane od1: index of the deep dual that reached its depth but whose
+    /// materialization was left to the caller (`defer_deep`).
+    deep_left: Option<usize>,
 }
 
 /// Lane opus-pcs: whether the next fold step materializes any sparse dual
@@ -9003,6 +9270,7 @@ fn sparse_duals_fold_step(
     deep: &mut [(SparseDualL0, Vec<F128>)],
     ri: F128,
     defer_l0: bool,
+    defer_deep: bool,
 ) -> SparseDualFoldWork {
     let mut work = SparseDualFoldWork {
         l0_delta: None,
@@ -9010,6 +9278,7 @@ fn sparse_duals_fold_step(
         l0_left: false,
         deep_delta: None,
         deep_basis: None,
+        deep_left: None,
     };
     if let Some((dual, fold_challenges)) = l0.as_mut() {
         fold_challenges.push(ri);
@@ -9025,7 +9294,7 @@ fn sparse_duals_fold_step(
         }
     }
     let l0_materialized_here = work.l0_basis.is_some() || work.l0_left;
-    for (dual, fold_challenges) in deep.iter_mut() {
+    for (k, (dual, fold_challenges)) in deep.iter_mut().enumerate() {
         fold_challenges.push(ri);
         if fold_challenges.len() <= dual.depth {
             let d = dual.round_msg_step(fold_challenges);
@@ -9039,10 +9308,14 @@ fn sparse_duals_fold_step(
         }
         if fold_challenges.len() == dual.depth {
             assert!(
-                !l0_materialized_here && work.deep_basis.is_none(),
+                !l0_materialized_here && work.deep_basis.is_none() && work.deep_left.is_none(),
                 "two sparse duals materialize into one fold"
             );
-            work.deep_basis = Some(dual.materialize_after_folds(fold_challenges));
+            if defer_deep {
+                work.deep_left = Some(k);
+            } else {
+                work.deep_basis = Some(dual.materialize_after_folds(fold_challenges));
+            }
         }
     }
     work
@@ -10498,6 +10771,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             // materializes in the background (the next level's first fold adds
             // it to the combined basis).
             let defer_l0 = op_bg_dual_enabled() && j + 1 == k_i && i + 1 < r;
+            // Lane od1: likewise a deep dual reaching its depth here.
+            let defer_deep = od_deep_bg_enabled() && j + 1 == k_i && i + 1 < r;
             // Lane op: a background basis joins this level's first fold.
             if j == 0 {
                 if let Some(job) = op_bg_job.take() {
@@ -10510,18 +10785,18 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 let (l0, deep, scp) =
                     (&mut active_sparse_dual_0, &mut active_deep_duals, &mut sc_prover);
                 let (work, msg) =
-                    rayon::join(|| sparse_duals_fold_step(l0, deep, ri, defer_l0), || scp.fold(ri));
+                    rayon::join(|| sparse_duals_fold_step(l0, deep, ri, defer_l0, defer_deep), || scp.fold(ri));
                 (msg, work)
             } else {
                 let msg = sc_prover.fold(ri);
-                (msg, sparse_duals_fold_step(&mut active_sparse_dual_0, &mut active_deep_duals, ri, defer_l0))
+                (msg, sparse_duals_fold_step(&mut active_sparse_dual_0, &mut active_deep_duals, ri, defer_l0, defer_deep))
             };
             if let Some(delta) = dual_work.l0_delta {
                 msg = sc_prover.add_to_last_message(delta);
             }
             // Lane op: the L0 dual whose materialization was left to us (its
             // round delta was applied above, as before).
-            let left = if dual_work.l0_left { active_sparse_dual_0.take() } else { None };
+            let mut left = if dual_work.l0_left { active_sparse_dual_0.take() } else { None };
             if let Some(basis) = dual_work.l0_basis {
                 if j + 1 < k_i {
                     sc_prover.defer_folded_sparse_dual(basis, F128::ONE);
@@ -10540,6 +10815,10 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     } else {
                         sc_prover.merge_folded_sparse_dual(basis);
                     }
+                }
+                if let Some(k) = dual_work.deep_left {
+                    assert!(left.is_none(), "one background basis per fold");
+                    left = Some(active_deep_duals.remove(k));
                 }
                 active_deep_duals
                     .retain(|(dual, fold_challenges)| fold_challenges.len() < dual.depth);
@@ -12572,6 +12851,156 @@ mod tests {
     }
 
     use super::*;
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    #[test]
+    fn adaptive_fold_chunks_fill_middle_level_pools() {
+        for (half, chunk) in [(4096, 256), (8192, 512), (16384, 1024), (32768, 2048)] {
+            assert_eq!(fold_and_msg_chunk_len(half, 16), chunk);
+            assert_eq!(half / chunk, 16);
+        }
+        assert_eq!(fold_and_msg_chunk_len(0, 0), 256);
+        assert_eq!(fold_and_msg_chunk_len(4096, 1), 2048);
+        assert_eq!(fold_and_msg_chunk_len(4096, 3), 1024);
+        assert_eq!(fold_and_msg_chunk_len(1 << 20, 16), 2048);
+    }
+
+    #[test]
+    fn adaptive_fold_chunks_match_fixed_with_ood_and_deferred_basis() {
+        use crate::challenger::Challenger;
+        let mut rng = crate::challenger::RandomChallenger::new(0xADAF_01D6);
+        let mut cases = 0;
+        for threads in [1, 3, 16] {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            for log_n in [13, 14, 15] {
+                let n = 1 << log_n;
+                let point = rng.sample_f128_vec(log_n);
+                let eq_lo = build_eq_table(&point[1..12]);
+                let eq_hi = build_eq_table(&point[12..]);
+                let r = rng.sample_f128();
+                let gamma = rng.sample_f128();
+                let alpha = rng.sample_f128();
+                for pattern in 0..3 {
+                    let mut values = || match pattern {
+                        0 => vec![F128::ZERO; n],
+                        1 => vec![F128::new(u64::MAX, u64::MAX); n],
+                        _ => rng.sample_f128_vec(n),
+                    };
+                    let f = values();
+                    let b = values();
+                    let basis = values();
+                    for mode in 0..5 {
+                        let ood = (mode >= 3).then_some((eq_lo.as_slice(), eq_hi.as_slice(), gamma));
+                        let deferred = match mode {
+                            1 => Some((basis.as_slice(), F128::ONE)),
+                            2 | 4 => Some((basis.as_slice(), alpha)),
+                            _ => None,
+                        };
+                        pool.install(|| {
+                            let want = fold_and_msg_lsb_inner_chunked(&f, &b, r, None, ood, deferred, 2048);
+                            let got = fold_and_msg_lsb_inner(&f, &b, r, None, ood, deferred);
+                            assert_eq!(&*got.0, &*want.0, "folded witness");
+                            assert_eq!(&*got.1, &*want.1, "folded corrected basis");
+                            assert_eq!(got.2, want.2, "round message");
+                        });
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        println!("ADAPTIVE_FOLD {cases} zero/all-one/random fold, OOD and deferred-basis cases match fixed chunks");
+    }
+
+    #[test]
+    #[should_panic(expected = "chunk.is_power_of_two()")]
+    fn adaptive_fold_chunks_reject_invalid_partition() {
+        let data = vec![F128::ZERO; 8192];
+        fold_and_msg_lsb_inner_chunked(&data, &data, F128::ONE, None, None, None, 384);
+    }
+
+    #[test]
+    fn adaptive_fold_complete_proof_bytes() {
+        use crate::challenger::Challenger;
+        let log_n = 15;
+        let initial_k = 6;
+        let mut config = prover_config_for(log_n, initial_k, LigeritoProfile::Fast).unwrap();
+        let mut verifier = verifier_config_for(log_n, initial_k, LigeritoProfile::Fast).unwrap();
+        config.merkle_hash = HashKind::Blake3;
+        verifier.merkle_hash = HashKind::Blake3;
+        let mut rng = crate::challenger::RandomChallenger::new(0xADAF_B176);
+        let poly = rng.sample_f128_vec(1 << log_n);
+        let point = rng.sample_f128_vec(log_n);
+        let basis = build_eq_table(&point);
+        let target = poly.iter().zip(&basis).fold(F128::ZERO, |a, (&f, &b)| a + f * b);
+        let log_msg = log_n - initial_k;
+        let rate = config.log_inv_rates[0];
+        let ntt = AdditiveNttF128::standard(log_msg + rate);
+        let witness = ligero_commit(&poly, log_msg, initial_k, rate, &ntt, HashKind::Blake3);
+        let mut prover_ch = crate::challenger::FsChallenger::with_hash(b"adaptive-fold-bytes", HashKind::Blake3);
+        let proof = recursive_prover_with_basis(
+            &config, poly, basis.clone(), target, &witness.mat, &witness.tree, &mut prover_ch,
+        );
+        let mut verifier_ch = crate::challenger::FsChallenger::with_hash(b"adaptive-fold-bytes", HashKind::Blake3);
+        assert!(recursive_verifier_with_basis(
+            &verifier, &proof, &basis, target, &witness.root(), &mut verifier_ch,
+        ));
+        let bytes = bincode::serialize(&proof).unwrap();
+        println!("ADAPTIVE_PROOF bytes={} blake3={}", bytes.len(), blake3::hash(&bytes));
+        assert_eq!(blake3::hash(&bytes).to_hex().as_str(),
+            "84ae0d7acd0c83cf2c115d78607b064f3f73616d484cae07c367c681589230b7");
+        prover_ch.sample_f128_vec(ceil_log2(*config.queries.last().unwrap()));
+        prover_ch.sample_f128();
+        assert_eq!(prover_ch.sample_f128(), verifier_ch.sample_f128());
+    }
+
+    #[test]
+    #[ignore = "emulated task-partition timing probe"]
+    fn adaptive_fold_ranked_task_timing() {
+        use crate::challenger::Challenger;
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(16).build().unwrap();
+        pool.install(|| {
+            let mut rng = crate::challenger::RandomChallenger::new(0xADAF_71AE);
+            let mut total = [0.0; 2];
+            for log_n in [15, 14, 13] {
+                let n = 1 << log_n;
+                let f = rng.sample_f128_vec(n);
+                let b = rng.sample_f128_vec(n);
+                let basis = rng.sample_f128_vec(n);
+                let point = rng.sample_f128_vec(log_n);
+                let eq_lo = build_eq_table(&point[1..12]);
+                let eq_hi = build_eq_table(&point[12..]);
+                let r = rng.sample_f128();
+                let gamma = rng.sample_f128();
+                let ood = (log_n == 13).then_some((eq_lo.as_slice(), eq_hi.as_slice(), gamma));
+                let deferred = (log_n == 13).then_some((basis.as_slice(), F128::ONE));
+                let chunks = [2048, fold_and_msg_chunk_len(n / 2, 16)];
+                let mut samples = [Vec::new(), Vec::new()];
+                for rep in 0..17 {
+                    for turn in 0..2 {
+                        let arm = (turn + rep) % 2;
+                        let t = std::time::Instant::now();
+                        let (nf, nb, msg) = fold_and_msg_lsb_inner_chunked(
+                            &f, &b, r, None, ood, deferred, chunks[arm],
+                        );
+                        std::hint::black_box((&*nf, &*nb, msg));
+                        if let FoldBuf::Owned(v) = nf { crate::scratch::give_f128(v); }
+                        if let FoldBuf::Owned(v) = nb { crate::scratch::give_f128(v); }
+                        if rep != 0 { samples[arm].push(t.elapsed().as_secs_f64() * 1000.0); }
+                    }
+                }
+                let mut med = [0.0; 2];
+                for arm in 0..2 {
+                    samples[arm].sort_by(f64::total_cmp);
+                    med[arm] = (samples[arm][7] + samples[arm][8]) / 2.0;
+                    total[arm] += med[arm];
+                }
+                println!("ADAPTIVE_TIMING n={n} tasks={}->{} fixed_ms={:.3} adaptive_ms={:.3}",
+                    (n / 2) / chunks[0], (n / 2) / chunks[1], med[0], med[1]);
+            }
+            println!("ADAPTIVE_TIMING affected_ranked_folds fixed_ms={:.3} adaptive_ms={:.3} delta_ms={:.3}",
+                total[0], total[1], total[0] - total[1]);
+        });
+    }
 
     #[test]
     fn query_phase_gathers_match_sequential_oracles() {
