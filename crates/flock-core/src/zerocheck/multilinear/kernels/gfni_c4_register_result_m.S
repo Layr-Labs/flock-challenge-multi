@@ -1,11 +1,11 @@
-// FLOCK_MAH_ASM=1 alternate (crate::MAH_ASM): Mahmoud514 a4aa6fa2's gfni_c4_register_result.S verbatim, every flock_ name suffixed _m.
+// Register-result GFNI fold with memory-source affine matrices.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Exact composed GFNI fold, lane-major output, with a private register ABI.
 // Inputs: RDI = 512 input bytes, RSI = CFoldMats.1. Returns ZMM8..11 in lane-major order.
 // Clobbers: RAX, flags, ZMM0..11. Preserves every other GPR and ZMM12..31.
 // Called ONLY by the matching inline-asm wrapper, never through the C ABI.
 // No vzeroupper: the upper lanes of ZMM12..15 belong to the caller.
-.text
+.section .text.r345,"ax",@progbits
 .p2align 6
 .globl flock_gfni_c4_lm_register_result_m
 .hidden flock_gfni_c4_lm_register_result_m
@@ -46,17 +46,14 @@ flock_gfni_c4_lm_register_result_m:
 .macro flock_c4_result_pair_m j
     vpbroadcastq zmm4, [rsp + 8*\j]
     vpbroadcastq zmm5, [rsp + 256 + 8*\j]
-    vmovdqu64 zmm6, [rsi + 64*\j]
-    vmovdqu64 zmm7, [rsi + 2048 + 64*\j]
-    vgf2p8affineqb zmm0, zmm4, zmm6, 0
-    vgf2p8affineqb zmm1, zmm4, zmm7, 0
-    vgf2p8affineqb zmm2, zmm5, zmm6, 0
-    vgf2p8affineqb zmm3, zmm5, zmm7, 0
+    vgf2p8affineqb zmm0, zmm4, [rsi + 64*\j], 0
+    vgf2p8affineqb zmm1, zmm4, [rsi + 2048 + 64*\j], 0
+    vgf2p8affineqb zmm2, zmm5, [rsi + 64*\j], 0
+    vgf2p8affineqb zmm3, zmm5, [rsi + 2048 + 64*\j], 0
     vpbroadcastq zmm4, [rsp + 8*(\j+1)]
     vpbroadcastq zmm5, [rsp + 256 + 8*(\j+1)]
-    vmovdqu64 zmm6, [rsi + 64*(\j+1)]
-    vgf2p8affineqb zmm7, zmm4, zmm6, 0
-    vgf2p8affineqb zmm6, zmm5, zmm6, 0
+    vgf2p8affineqb zmm7, zmm4, [rsi + 64*(\j+1)], 0
+    vgf2p8affineqb zmm6, zmm5, [rsi + 64*(\j+1)], 0
 .if \j == 0
     vpxorq zmm8, zmm0, zmm7
     vpxorq zmm10, zmm2, zmm6
@@ -64,9 +61,8 @@ flock_gfni_c4_lm_register_result_m:
     vpternlogq zmm8, zmm0, zmm7, 0x96
     vpternlogq zmm10, zmm2, zmm6, 0x96
 .endif
-    vmovdqu64 zmm0, [rsi + 2048 + 64*(\j+1)]
-    vgf2p8affineqb zmm4, zmm4, zmm0, 0
-    vgf2p8affineqb zmm5, zmm5, zmm0, 0
+    vgf2p8affineqb zmm4, zmm4, [rsi + 2048 + 64*(\j+1)], 0
+    vgf2p8affineqb zmm5, zmm5, [rsi + 2048 + 64*(\j+1)], 0
 .if \j == 0
     vpxorq zmm9, zmm1, zmm4
     vpxorq zmm11, zmm3, zmm5
