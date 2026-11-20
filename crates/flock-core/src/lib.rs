@@ -1973,3 +1973,4 @@ fn linux_physical_cores() -> Option<usize> {
     }
     (!cores.is_empty()).then_some(cores.len())
 }
+// Second official run of the 12f68acc source (this comment is the only difference).
