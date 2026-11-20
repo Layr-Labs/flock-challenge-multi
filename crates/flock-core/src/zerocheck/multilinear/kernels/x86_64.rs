@@ -1619,7 +1619,7 @@ pub(crate) unsafe fn fold2_and_message_lookahead_defer_wtab_casc_x86<
             let (c0w, c1w, c2w, c3w, d0, d1, d2, d3, c_t, wc) = step8_fast!(x_lo + 8);
             if CASC {
                 let _ = (wa, wc);
-                casc_block::<NT_OUT, false>(
+                let _ = casc_block::<NT_OUT, false, false>(
                     a_t, c_t, [a0w, a1w, a2w, a3w], [c0w, c1w, c2w, c3w],
                     [b0, b1, b2, b3], [d0, d1, d2, d3],
                     a_out.add(2 * x_lo), b_out.add(2 * x_lo), &mut acc7,
@@ -1762,6 +1762,7 @@ pub(crate) unsafe fn fold3_oct_and_message_lookahead_wtab_x86<
     const NT_OUT: bool,
     const OUT_LM: bool,
     const B7: bool,
+    const A31: bool,
 >(
     a_in: *const F128,
     b_in: *const F128,
@@ -1801,7 +1802,8 @@ pub(crate) unsafe fn fold3_oct_and_message_lookahead_wtab_x86<
                 let x = $x_lo;
                 let output = 2 * x;
                 let input = 8 * output;
-                let a_src = a_in.add(input);
+                // A31 groups of four blocks are 124 inputs instead of 128.
+                let a_src = if A31 { a_in.add(31 * input / 32) } else { a_in.add(input) };
                 // B7 blocks are 28 inputs (seven lines) instead of 32.
                 let b_src = if B7 { b_in.add(7 * input / 8) } else { b_in.add(input) };
                 let pa = a_src.cast::<i8>().wrapping_add(PF_OFF);
@@ -1813,10 +1815,24 @@ pub(crate) unsafe fn fold3_oct_and_message_lookahead_wtab_x86<
                         _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
                     }
                 }
-                let oa0 = fold32_oct_to_4(a_src, &r);
-                let oa1 = fold32_oct_to_4(a_src.add(32), &r);
-                let oa2 = fold32_oct_to_4(a_src.add(64), &r);
-                let oa3 = fold32_oct_to_4(a_src.add(96), &r);
+                let fa = |k: usize, z7: __m512i| {
+                    let p = a_src.add(28 * k);
+                    let x: [__m512i; 8] = core::array::from_fn(|j| {
+                        if j == 7 { z7 } else { _mm512_loadu_si512(p.add(4 * j).cast::<__m512i>()) }
+                    });
+                    fold32_oct_regs_to_4(x, &r)
+                };
+                let (oa0, oa1, oa2, oa3) = if A31 {
+                    let z7 = a31_unpack(a_src.add(112));
+                    (fa(0, z7[0]), fa(1, z7[1]), fa(2, z7[2]), fa(3, z7[3]))
+                } else {
+                    (
+                        fold32_oct_to_4(a_src, &r),
+                        fold32_oct_to_4(a_src.add(32), &r),
+                        fold32_oct_to_4(a_src.add(64), &r),
+                        fold32_oct_to_4(a_src.add(96), &r),
+                    )
+                };
                 for l in 16..32 {
                     _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
                     if l - 16 < b_lines / 2 {
@@ -2521,7 +2537,12 @@ pub(crate) fn zc_pkt_pf_enabled() -> bool {
     *ON
 }
 
-const ZC_PKT_PF_TILES: usize = 3;
+/// Lane r5: shared packed-row prefetch lead 3 -> 2 tiles (r2 and the other
+/// packed sweeps); build-time env `NO_ZC_PKT_PF2=1` restores 3. Prefetch only.
+const ZC_PKT_PF_TILES: usize = match option_env!("NO_ZC_PKT_PF2") {
+    Some(_) => 3,
+    None => 2,
+};
 
 pub(crate) fn zc_pkt_pf_far_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
@@ -5059,8 +5080,60 @@ core::arch::global_asm!(
     include_str!("gfni_c4_pass4_register_result.S"),
     // `FLOCK_MAH_ASM=1` alternates (crate::MAH_ASM), appended after the originals.
     include_str!("gfni_c4_lm_m.S"),
+);
+
+// Lane la1: the r345 hot cluster. The two GFNI kernels the casc kernel calls
+// and the hot casc instances (`fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86`) share one 4 KiB-aligned
+// section, so their addresses mod 4 KiB (64 B windows, uop-cache sets) are
+// fixed by this code alone, not by whatever else the binary links before it.
+// Build env R345_PADA / R345_PADC (bytes) shift the kernels / the casc
+// instance inside the cluster (layout sweep knobs).
+const fn la1_env_usize(s: Option<&str>, d: usize) -> usize {
+    match s {
+        None => d,
+        Some(s) => {
+            let b = s.as_bytes();
+            let mut i = 0;
+            let mut v = 0usize;
+            while i < b.len() {
+                v = v * 10 + (b[i] - b'0') as usize;
+                i += 1;
+            }
+            v
+        }
+    }
+}
+// Defaults (measured best on rig A, c7i/SPR, r345 -0.215 ms vs record): the
+// register-result kernel at 0xa80 mod 4 KiB, pass4 at 0x500, and the hot casc
+// instance <true,true,true,true,1,1> at 0xb20 (the relative 4 KiB placement
+// of these three loci is what moves r345; the other placements tried read
+// -0.05..-0.16 ms).
+const R345_PADA: usize = la1_env_usize(option_env!("R345_PADA"), 2688);
+// fs4a: with z3a A31 the hot instance is <true,true,true,true,1,1,true>;
+// PADC 1584 puts it at 0xda0 mod 4 KiB (its asm call block then sits where
+// la1's did; best measured with 0xaf0..0xb50).
+const R345_PADC: usize = la1_env_usize(option_env!("R345_PADC"), 1584);
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+core::arch::global_asm!(
+    ".section .text.r345,\"ax\",@progbits",
+    ".p2align 12",
+    ".skip {pa}, 0xcc",
     include_str!("gfni_c4_register_result_m.S"),
     include_str!("gfni_c4_pass4_register_result_m.S"),
+    ".section .text.r345,\"ax\",@progbits",
+    ".p2align 6",
+    ".skip {pc}, 0xcc",
+    ".text",
+    pa = const R345_PADA,
+    pc = const R345_PADC,
 );
 
 #[cfg(all(
@@ -5078,6 +5151,130 @@ unsafe extern "C" {
     fn flock_gfni_c4_lm_preserving_m();
     fn flock_gfni_c4_lm_register_result_m();
     fn flock_gfni_c4_pass4_register_result_m();
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn gfni_fold64_rows_c4_lm_registers_k<const MAH: bool>(
+    rows: *const u8,
+    m: &CFoldMats,
+) -> [core::arch::x86_64::__m512i; 4] {
+    use core::arch::x86_64::*;
+    let a: __m512i;
+    let b: __m512i;
+    let c: __m512i;
+    let d: __m512i;
+    unsafe {
+        if MAH {
+            core::arch::asm!(
+                "call {kernel}",
+                kernel = sym flock_gfni_c4_lm_register_result_m,
+                in("rdi") rows,
+                in("rsi") m.1.as_ptr(),
+                lateout("rax") _,
+                out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+                out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+                out("zmm8") a, out("zmm9") b, out("zmm10") c, out("zmm11") d,
+                options(pure,readonly),
+            );
+        } else {
+            core::arch::asm!(
+                "call {kernel}",
+                kernel = sym flock_gfni_c4_lm_register_result,
+                in("rdi") rows,
+                in("rsi") m.1.as_ptr(),
+                lateout("rax") _,
+                out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+                out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+                out("zmm8") a, out("zmm9") b, out("zmm10") c, out("zmm11") d,
+                options(pure,readonly),
+            );
+        }
+    }
+    [a, b, c, d]
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn gfni_fold32_rows_c4_lm_registers_k<const MAH: bool>(
+    rows: *const u8,
+    m: &CFoldMats,
+) -> [core::arch::x86_64::__m512i; 2] {
+    use core::arch::x86_64::*;
+    let lo: __m512i;
+    let hi: __m512i;
+    unsafe {
+        if MAH {
+            core::arch::asm!(
+                "call {kernel}",
+                kernel = sym flock_gfni_c4_pass4_register_result_m,
+                in("rdi") rows,
+                in("rsi") m.1.as_ptr(),
+                lateout("rax") _,
+                out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+                out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+                out("zmm8") lo, out("zmm9") hi,
+                options(pure,readonly),
+            );
+        } else {
+            core::arch::asm!(
+                "call {kernel}",
+                kernel = sym flock_gfni_c4_pass4_register_result,
+                in("rdi") rows,
+                in("rsi") m.1.as_ptr(),
+                lateout("rax") _,
+                out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+                out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+                out("zmm8") lo, out("zmm9") hi,
+                options(pure,readonly),
+            );
+        }
+    }
+    [lo, hi]
+}
+
+/// Lane r5 (`FLOCK_NO_R5_PF1`): the r345 casc kernel prefetches its packed
+/// rows ONE half-block ahead instead of `ZC_PKT_PF_TILES` (3). On SPR one
+/// half-block (~1300 cycles per thread) already covers DRAM latency, and the
+/// shorter lead keeps less of L1 (shared by both hyperthreads) in flight:
+/// r345 -0.09..-0.11 ms; leads 4/6 and L2 hints were slower, no prefetch +3.3 ms.
+/// `FLOCK_NO_R5_PF1=1` restores lead 3; `FLOCK_R5_PFD=1|2|3` picks a lead (A/B sweeps).
+pub(crate) fn zc_r5_pfd() -> u8 {
+    static PFD: std::sync::LazyLock<u8> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_R5_PF1").is_some() {
+            return 3;
+        }
+        match std::env::var("FLOCK_R5_PFD").as_deref() {
+            Ok("2") => 2,
+            Ok("3") => 3,
+            _ => 1,
+        }
+    });
+    *PFD
+}
+
+/// Lane r5 (`FLOCK_NO_R5_MAHK`): the rounds 3+4+5 casc kernel picks its GFNI
+/// asm variant at compile time (const generic) instead of a `LazyLock` check
+/// per call; halves the hot loop's code.
+pub(crate) fn zc_r5_mahk_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        cfg!(target_os = "linux") && std::env::var_os("FLOCK_NO_R5_MAHK").is_none()
+    });
+    *ON
 }
 
 /// One pass of [`gfni_fold64_rows_c4_lm_registers`] over four contiguous
@@ -6684,18 +6881,14 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
     unsafe {
         let mut acc = [WideGhashX4::zero(); 8];
         let mut acc4 = [WideGhashX4::zero(); 10];
-        let mut fa_store = core::mem::MaybeUninit::<FoldCache>::uninit();
-        let mut fb_store = core::mem::MaybeUninit::<FoldCache>::uninit();
-        let fa_work = (*fa_store.as_mut_ptr()).0.as_mut_ptr();
-        let fb_work = (*fb_store.as_mut_ptr()).0.as_mut_ptr();
-        // A distinct first-quarter cache survives until the last quarter.
-        // PAIR=false leaves these unused and removes them at compile time.
-        let mut fa_first_store = core::mem::MaybeUninit::<FoldCache>::uninit();
-        let mut fb_first_store = core::mem::MaybeUninit::<FoldCache>::uninit();
-        let fa_first = core::ptr::addr_of_mut!((*fa_first_store.as_mut_ptr()).0).cast::<F128>();
-        let fb_first = core::ptr::addr_of_mut!((*fb_first_store.as_mut_ptr()).0).cast::<F128>();
-        let mut fa = fa_work;
-        let mut fb = fb_work;
+        let mut fa_store = core::mem::MaybeUninit::<[FoldCache; 4]>::uninit();
+        let mut fb_store = core::mem::MaybeUninit::<[FoldCache; 4]>::uninit();
+        let fa_cache = fa_store.as_mut_ptr().cast::<FoldCache>();
+        let fb_cache = fb_store.as_mut_ptr().cast::<FoldCache>();
+        let fa_first = core::ptr::addr_of_mut!((*fa_cache).0).cast::<F128>();
+        let fb_first = core::ptr::addr_of_mut!((*fb_cache).0).cast::<F128>();
+        let mut fa;
+        let mut fb;
         let a_mats_ptr = bk.a_mats.as_ptr().cast::<u64>();
         let b_mats_slice = bk.b_mats.as_ptr();
 
@@ -6851,12 +7044,29 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
         let mut x_lo = 0;
         while x_lo + 128 <= lo_size {
             let batch_base = x_lo >> 5;
-            if PAIR { fa=fa_first; fb=fb_first; }
+            macro_rules! prepare_quarter {
+                ($quarter:literal) => {{
+                    let g0 = row_base + 2 * (x_lo + 32 * $quarter);
+                    let bm = &(*b_mats_slice.add(batch_base + $quarter)).0;
+                    let a = core::ptr::addr_of_mut!((*fa_cache.add($quarter)).0).cast::<F128>();
+                    let b = core::ptr::addr_of_mut!((*fb_cache.add($quarter)).0).cast::<F128>();
+                    if $quarter == 0 || $quarter == 3 {
+                        let skip = if $quarter == 0 { 0 } else { 3 };
+                        gfni_fold64_rows_tr_bcast_skip_group_y::<true, YA>(a_pkt.add(g0 * 8), a_mats_ptr, a, skip);
+                        gfni_fold64_rows_tr_bcast_skip_group_y::<false, YB>(b_pkt.add(g0 * 8), bm.as_ptr(), b, skip);
+                    } else {
+                        gfni_fold64_rows_masked_tr_bcast4_y::<YA>(a_pkt.add(g0 * 8), a_mats_ptr, a, 0);
+                        gfni_fold64_rows_masked_tr_bcast_y::<YB>(b_pkt.add(g0 * 8), bm, b, 0);
+                    }
+                }};
+            }
+            prepare_quarter!(0);
+            prepare_quarter!(1);
+            prepare_quarter!(2);
+            prepare_quarter!(3);
+            fa = fa_first; fb = fb_first;
             {
                 let g0 = row_base + 2 * x_lo;
-                let bm = &(*b_mats_slice.add(batch_base)).0;
-                gfni_fold64_rows_tr_bcast_skip_group_y::<true, YA>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
-                gfni_fold64_rows_tr_bcast_skip_group_y::<false, YB>(b_pkt.add(g0 * 8), bm.as_ptr(), fb, 0);
                 pf_quarter!(g0, 0);
                 #[cfg(test)]
                 R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -6864,32 +7074,25 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
                 // (`fa_first` survives until then).
                 if PAIR && MERGE { pf_quarter!(g0, 1); } else { accum1!(g0, 1); }
                 accum2!(g0, 2, 3);
-                if !PAIR { r4_round4_batch(fa, fb, &mut acc4, 0); }
             }
-            fa=fa_work; fb=fb_work;
+            fa = core::ptr::addr_of_mut!((*fa_cache.add(1)).0).cast::<F128>();
+            fb = core::ptr::addr_of_mut!((*fb_cache.add(1)).0).cast::<F128>();
             {
                 let g0 = row_base + 2 * (x_lo + 32);
-                let bm = &(*b_mats_slice.add(batch_base + 1)).0;
-                gfni_fold64_rows_masked_tr_bcast4_y::<YA>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
-                gfni_fold64_rows_masked_tr_bcast_y::<YB>(b_pkt.add(g0 * 8), bm, fb, 0);
                 accum2!(g0, 0, 1);
                 accum2!(g0, 2, 3);
-                r4_round4_batch(fa, fb, &mut acc4, 255);
             }
+            fa = core::ptr::addr_of_mut!((*fa_cache.add(2)).0).cast::<F128>();
+            fb = core::ptr::addr_of_mut!((*fb_cache.add(2)).0).cast::<F128>();
             {
                 let g0 = row_base + 2 * (x_lo + 64);
-                let bm = &(*b_mats_slice.add(batch_base + 2)).0;
-                gfni_fold64_rows_masked_tr_bcast4_y::<YA>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
-                gfni_fold64_rows_masked_tr_bcast_y::<YB>(b_pkt.add(g0 * 8), bm, fb, 0);
                 accum2!(g0, 0, 1);
                 accum2!(g0, 2, 3);
-                r4_round4_batch(fa, fb, &mut acc4, 255);
             }
+            fa = core::ptr::addr_of_mut!((*fa_cache.add(3)).0).cast::<F128>();
+            fb = core::ptr::addr_of_mut!((*fb_cache.add(3)).0).cast::<F128>();
             {
                 let g0 = row_base + 2 * (x_lo + 96);
-                let bm = &(*b_mats_slice.add(batch_base + 3)).0;
-                gfni_fold64_rows_tr_bcast_skip_group_y::<true, YA>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 3);
-                gfni_fold64_rows_tr_bcast_skip_group_y::<false, YB>(b_pkt.add(g0 * 8), bm.as_ptr(), fb, 3);
                 accum2!(g0, 0, 1);
                 if PAIR && MERGE {
                     pf_quarter!(g0, 2);
@@ -6914,6 +7117,12 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
                 pf_quarter!(g0, 3);
                 #[cfg(test)]
                 R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if !PAIR { r4_round4_batch(fa_first, fb_first, &mut acc4, 0); }
+            for quarter in 1..3 {
+                let a = core::ptr::addr_of_mut!((*fa_cache.add(quarter)).0).cast::<F128>();
+                let b = core::ptr::addr_of_mut!((*fb_cache.add(quarter)).0).cast::<F128>();
+                r4_round4_batch(a, b, &mut acc4, 255);
             }
             x_lo += 128;
         }
@@ -7138,7 +7347,7 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_x86<
 ) -> [F128; 8] {
     let mut unused = [F128::ZERO; 18];
     unsafe {
-        fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86::<NT_OUT, OUT_LM, false, false>(
+        fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86::<NT_OUT, OUT_LM, false, false, 0, ZC_PKT_PF_TILES, false>(
             a_pkt, b_pkt, out_base, a_out, b_out, lo_size, cfold, rho3, wt, b_canon, &mut unused,
             F128::ZERO,
         )
@@ -7261,7 +7470,7 @@ unsafe fn stream_tile3_as_xmm12(
 ))]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn casc_block<const NT_OUT: bool, const B7: bool>(
+unsafe fn casc_block<const NT_OUT: bool, const B7: bool, const A31: bool>(
     a_t0: [core::arch::x86_64::__m512i; 4],
     a_t1: [core::arch::x86_64::__m512i; 4],
     aw_t0: [core::arch::x86_64::__m512i; 4],
@@ -7271,14 +7480,42 @@ unsafe fn casc_block<const NT_OUT: bool, const B7: bool>(
     ap: *mut F128,
     bp: *mut F128,
     acc7: &mut [WideGhashX4; 10],
-) {
+) -> core::arch::x86_64::__m512i {
     use core::arch::x86_64::*;
     unsafe {
         let ev = |p: __m512i, q: __m512i| _mm512_shuffle_i64x2::<0x88>(p, q);
         let od = |p: __m512i, q: __m512i| _mm512_shuffle_i64x2::<0xDD>(p, q);
         let eb: [__m512i; 4] = core::array::from_fn(|k| ev(b_t0[k], b_t1[k]));
         let ob: [__m512i; 4] = core::array::from_fn(|k| od(b_t0[k], b_t1[k]));
-        if NT_OUT {
+        // A31 (lane z3a): A's ZMM 7 (lines 7, 15, 23, 31; line 31 is zero) is
+        // returned for the caller's four-block group pack instead of stored.
+        let a_z7 = od(a_t0[3], a_t1[3]);
+        if A31 {
+            if NT_OUT {
+                stream_tile_as_xmm16(
+                    ap,
+                    ev(a_t0[0], a_t1[0]),
+                    ev(a_t0[1], a_t1[1]),
+                    ev(a_t0[2], a_t1[2]),
+                    ev(a_t0[3], a_t1[3]),
+                );
+                stream_tile3_as_xmm12(
+                    ap.add(16),
+                    od(a_t0[0], a_t1[0]),
+                    od(a_t0[1], a_t1[1]),
+                    od(a_t0[2], a_t1[2]),
+                );
+            } else {
+                for k in 0..4 {
+                    _mm512_storeu_si512(ap.add(4 * k).cast::<__m512i>(), ev(a_t0[k], a_t1[k]));
+                }
+                for k in 0..3 {
+                    _mm512_storeu_si512(ap.add(16 + 4 * k).cast::<__m512i>(), od(a_t0[k], a_t1[k]));
+                }
+            }
+        }
+        if A31 {
+        } else if NT_OUT {
             stream_tile_as_xmm16(
                 ap,
                 ev(a_t0[0], a_t1[0]),
@@ -7301,6 +7538,12 @@ unsafe fn casc_block<const NT_OUT: bool, const B7: bool>(
             for k in 0..4 {
                 _mm512_storeu_si512(ap.add(4 * k).cast::<__m512i>(), ev(a_t0[k], a_t1[k]));
                 _mm512_storeu_si512(ap.add(16 + 4 * k).cast::<__m512i>(), od(a_t0[k], a_t1[k]));
+            }
+        }
+        // The A31 layout is only produced together with the B7 B table.
+        const { assert!(!A31 || B7) };
+        if !A31 && !NT_OUT {
+            for k in 0..4 {
                 if !B7 {
                     _mm512_storeu_si512(bp.add(4 * k).cast::<__m512i>(), eb[k]);
                     _mm512_storeu_si512(bp.add(16 + 4 * k).cast::<__m512i>(), ob[k]);
@@ -7349,6 +7592,50 @@ unsafe fn casc_block<const NT_OUT: bool, const B7: bool>(
         acc7[7].mul_acc(_mm512_xor_si512(z0, z2), _mm512_xor_si512(y0, y2));
         acc7[8].mul_acc(_mm512_xor_si512(z1, z3), _mm512_xor_si512(y1, y3));
         acc7[9].mul_acc(_mm512_xor_si512(z01, z23), _mm512_xor_si512(y01, y23));
+        a_z7
+    }
+}
+
+/// A31 (lane z3a, `FLOCK_NO_Z3_A31`): pack the live lanes 0..3 of the four
+/// A ZMM 7s of a four-block group (lane 3 = line 31 is zero) into three ZMMs:
+/// `[z0.0 z0.1 z0.2 z1.0] [z1.1 z1.2 z2.0 z2.1] [z2.2 z3.0 z3.1 z3.2]`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline(always)]
+unsafe fn a31_pack(z: [core::arch::x86_64::__m512i; 4]) -> [core::arch::x86_64::__m512i; 3] {
+    use super::super::lane_select;
+    use core::arch::x86_64::*;
+    const P0: [u64; 8] = lane_select([(0, 0), (0, 1), (0, 2), (1, 0)]);
+    const P1: [u64; 8] = lane_select([(0, 1), (0, 2), (1, 0), (1, 1)]);
+    const P2: [u64; 8] = lane_select([(0, 2), (1, 0), (1, 1), (1, 2)]);
+    unsafe {
+        let ix = |t: &[u64; 8]| _mm512_loadu_si512(t.as_ptr().cast::<__m512i>());
+        [
+            _mm512_permutex2var_epi64(z[0], ix(&P0), z[1]),
+            _mm512_permutex2var_epi64(z[1], ix(&P1), z[2]),
+            _mm512_permutex2var_epi64(z[2], ix(&P2), z[3]),
+        ]
+    }
+}
+
+/// Inverse of [`a31_pack`] from the three packed ZMMs at `src`: the four
+/// ZMM 7s with lane 3 zero.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline(always)]
+unsafe fn a31_unpack(src: *const F128) -> [core::arch::x86_64::__m512i; 4] {
+    use core::arch::x86_64::*;
+    // The packed lanes are the four ZMM 7s' lanes 0..3 back to back, so ZMM
+    // 7 of block k is three F128s at `src + 3k` with lane 3 masked to zero:
+    // four masked loads, no shuffles.
+    unsafe {
+        core::array::from_fn(|k| _mm512_maskz_loadu_epi64(0x3F, src.add(3 * k).cast::<i64>()))
     }
 }
 
@@ -7449,12 +7736,17 @@ pub(crate) fn zc_c3_enabled() -> bool {
     target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
 )]
 #[inline(never)]
+// Lane la1: r345 hot cluster (see the `.text.r345` global_asm above).
+#[unsafe(link_section = ".text.r345")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
     const NT_OUT: bool,
     const OUT_LM: bool,
     const CASC: bool,
     const B7: bool,
+    const MAHK: u8,
+    const PFD: usize,
+    const A31: bool,
 >(
     a_pkt: *const u8,
     b_pkt: *const u8,
@@ -7476,7 +7768,8 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
     debug_assert!(lo_size.is_multiple_of(16));
     debug_assert!(out_base.is_multiple_of(32));
     debug_assert!(!B7 || CASC, "the B7 layout is the cascade's octet layout");
-    debug_assert_eq!(a_out.len(), 2 * lo_size);
+    debug_assert_eq!(a_out.len(), if A31 { 31 * lo_size / 16 } else { 2 * lo_size });
+    debug_assert!(!A31 || (CASC && B7 && lo_size.is_multiple_of(64)));
     debug_assert_eq!(b_out.len(), if B7 { 7 * lo_size / 4 } else { 2 * lo_size });
     #[cfg(test)]
     R345_B_CANON_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -7491,7 +7784,8 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
     const A0_A2_B1_B1: [u64; 8] = lane_select([(0, 0), (0, 2), (1, 1), (1, 1)]);
     // Prefetch targets sit `ZC_PKT_PF_TILES` half-blocks ahead, so an odd
     // lead makes a block's first half prefetch a second half and vice versa.
-    const PF_FLIPS_HALF: bool = ZC_PKT_PF_TILES % 2 == 1;
+    // Lane r5: `PFD` (FLOCK_R5_PFD) is the lead in half-blocks, 0 = none.
+    let pf_flips_half: bool = PFD % 2 == 1;
 
     unsafe {
         let mut acc = [WideGhashX4::zero(); 8];
@@ -7511,6 +7805,34 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
         let i_a02_b0 = ix(&A0_A2_B0_B0);
         let i_a02_b1 = ix(&A0_A2_B1_B1);
 
+        // Lane r5: MAHK 1 = Mahmoud asm, 2 = original asm, 0 = runtime check per call.
+        macro_rules! g64 {
+            ($p:expr) => {{
+                #[cfg(target_os = "linux")]
+                let r = match MAHK {
+                    1 => gfni_fold64_rows_c4_lm_registers_k::<true>($p, cfold),
+                    2 => gfni_fold64_rows_c4_lm_registers_k::<false>($p, cfold),
+                    _ => gfni_fold64_rows_c4_lm_registers($p, cfold),
+                };
+                #[cfg(not(target_os = "linux"))]
+                let r = gfni_fold64_rows_c4_lm_registers($p, cfold);
+                r
+            }};
+        }
+        macro_rules! g32 {
+            ($p:expr) => {{
+                #[cfg(target_os = "linux")]
+                let r = match MAHK {
+                    1 => gfni_fold32_rows_c4_lm_registers_k::<true>($p, cfold),
+                    2 => gfni_fold32_rows_c4_lm_registers_k::<false>($p, cfold),
+                    _ => gfni_fold32_rows_c4_lm_registers($p, cfold),
+                };
+                #[cfg(not(target_os = "linux"))]
+                let r = gfni_fold32_rows_c4_lm_registers($p, cfold);
+                r
+            }};
+        }
+
         // The rho3 level: (rows 0..4 fold) + rho3·(rows 0..4 fold + rows 4..8 fold).
         macro_rules! fold_r3 {
             ($e:expr, $o:expr) => {{
@@ -7522,10 +7844,8 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
         // A: the incumbent's 16-line half-block, lane-major [4i, 4i+1, 4i+2, 4i+3].
         macro_rules! fold_a_half {
             ($row0:expr) => {{
-                let [q0, q1, q2, q3] =
-                    gfni_fold64_rows_c4_lm_registers(a_pkt.add($row0 * 8), cfold);
-                let [p0, p1, p2, p3] =
-                    gfni_fold64_rows_c4_lm_registers(a_pkt.add($row0 * 8 + 512), cfold);
+                let [q0, q1, q2, q3] = g64!(a_pkt.add($row0 * 8));
+                let [p0, p1, p2, p3] = g64!(a_pkt.add($row0 * 8 + 512));
                 let oe1 = fold_r3!(q0, q1);
                 let oo1 = fold_r3!(q2, q3);
                 let oe2 = fold_r3!(p0, p1);
@@ -7543,8 +7863,7 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
         // (0, 2, 4, 6) and (1, 3, 5, 7).
         macro_rules! fold_b_window {
             ($row:expr) => {{
-                let [q0, q1, q2, q3] =
-                    gfni_fold64_rows_c4_lm_registers(b_pkt.add($row * 8), cfold);
+                let [q0, q1, q2, q3] = g64!(b_pkt.add($row * 8));
                 (fold_r3!(q0, q1), fold_r3!(q2, q3))
             }};
         }
@@ -7552,7 +7871,7 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
         // `$b_first..$b_last` are the half-block lines of B worth prefetching.
         macro_rules! prefetch_half {
             ($next:expr, $lines:expr, $b_first:expr, $b_last:expr) => {{
-                for l in $lines {
+                for l in if PFD == 0 { 0..0 } else { $lines } {
                     _mm_prefetch(a_pkt.wrapping_add($next + 64 * l).cast::<i8>(), _MM_HINT_T0);
                     if l >= $b_first && l < $b_last {
                         _mm_prefetch(b_pkt.wrapping_add($next + 64 * l).cast::<i8>(), _MM_HINT_T0);
@@ -7606,20 +7925,22 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
         // Round-seven accumulators (CASC only): [0] = A(0,0,1)·B(0,0,1) on
         // packed odd lanes, [1..10] = the t = ∞ corner products.
         let mut acc7 = [WideGhashX4::zero(); 10];
+        // A31: the current four-block group's A ZMM 7s.
+        let mut a7s = [_mm512_setzero_si512(); 4];
 
         let mut x_lo = 0;
         while x_lo + 16 <= lo_size {
             // First packed row of this block; B's live lines are 2..30.
             let row0 = 8 * (out_base + 2 * x_lo);
             debug_assert!(row0.is_multiple_of(256));
-            let (pf1_first, pf1_last, pf2_first, pf2_last) = if PF_FLIPS_HALF {
+            let (pf1_first, pf1_last, pf2_first, pf2_last) = if pf_flips_half {
                 (0, 14, 2, 16)
             } else {
                 (2, 16, 0, 14)
             };
 
             // Lines 0..16.
-            let next = (row0 + 128 * ZC_PKT_PF_TILES) * 8;
+            let next = (row0 + 128 * PFD) * 8;
             prefetch_half!(next, 0..8, pf1_first, pf1_last);
             let a_tile = fold_a_half!(row0);
             prefetch_half!(next, 8..16, pf1_first, pf1_last);
@@ -7636,12 +7957,12 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
             let (a0w, a1w, a2w, a3w, b0, b1, b2, b3, wa, wa64) = emit_tile!(x_lo, a_tile, b_tile);
 
             // Lines 16..32.
-            let next = (row0 + 128 + 128 * ZC_PKT_PF_TILES) * 8;
+            let next = (row0 + 128 + 128 * PFD) * 8;
             prefetch_half!(next, 0..8, pf2_first, pf2_last);
             let c_tile = fold_a_half!(row0 + 128);
             prefetch_half!(next, 8..16, pf2_first, pf2_last);
             let (e3, o3) = fold_b_window!(row0 + 144); // lines 18,20,22,24 / 19,21,23,25
-            let [h0, h1] = gfni_fold32_rows_c4_lm_registers(b_pkt.add((row0 + 208) * 8), cfold);
+            let [h0, h1] = g32!(b_pkt.add((row0 + 208) * 8));
             let f4 = fold_r3!(h0, h1); // lines 26, 27, 28, 29
             let d_tile = [
                 // lines 16, 20, 24, 28
@@ -7666,13 +7987,29 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
 
             if CASC {
                 let _ = (wa, wa64, wc, wc64);
-                casc_block::<NT_OUT, B7>(
+                // A31: a four-block group is 4 x 7 ZMMs, then the 3 packed ZMM 7s.
+                let j = (x_lo / 16) % 4;
+                let group = a_out_ptr.add(124 * (x_lo / 64));
+                let z7 = casc_block::<NT_OUT, B7, A31>(
                     a_tile, c_tile, [a0w, a1w, a2w, a3w], [c0w, c1w, c2w, c3w],
                     [b0, b1, b2, b3], [d0, d1, d2, d3],
-                    a_out_ptr.add(2 * x_lo),
+                    if A31 { group.add(28 * j) } else { a_out_ptr.add(2 * x_lo) },
                     if B7 { b_out_ptr.add(7 * x_lo / 4) } else { b_out_ptr.add(2 * x_lo) },
                     &mut acc7,
                 );
+                if A31 {
+                    a7s[j] = z7;
+                    if j == 3 {
+                        let p = a31_pack(a7s);
+                        if NT_OUT {
+                            stream_tile3_as_xmm12(group.add(112), p[0], p[1], p[2]);
+                        } else {
+                            for (k, v) in p.iter().enumerate() {
+                                _mm512_storeu_si512(group.add(112 + 4 * k).cast::<__m512i>(), *v);
+                            }
+                        }
+                    }
+                }
             }
 
             acc[0].mul_acc2(a1w, b1, c1w, d1);
@@ -7825,10 +8162,10 @@ mod r4_canonical_pair_tests {
                 let mut bo = vec![F128::ZERO; 2 * lo];
                 let sums = unsafe {
                     if b7 {
-                        fold3_oct_and_message_lookahead_wtab_x86::<false, false, true>(
+                        fold3_oct_and_message_lookahead_wtab_x86::<false, false, true, false>(
                             a.as_ptr(), b7_ref.as_ptr(), ao.as_mut_ptr(), bo.as_mut_ptr(), rho, lo, &wt, &kc)
                     } else {
-                        fold3_oct_and_message_lookahead_wtab_x86::<false, false, false>(
+                        fold3_oct_and_message_lookahead_wtab_x86::<false, false, false, false>(
                             a.as_ptr(), b.as_ptr(), ao.as_mut_ptr(), bo.as_mut_ptr(), rho, lo, &wt, &kc)
                     }
                 };
@@ -7869,4 +8206,3 @@ mod r4_canonical_pair_tests {
         }}}
     }
 }
-
