@@ -1,3 +1,4 @@
+// Calibration resubmission of dabc838e: no functional change.
 //! Timed-window seed pipelining for the ranked BLAKE3 benchmark.
 //!
 //! # The gap this closes
