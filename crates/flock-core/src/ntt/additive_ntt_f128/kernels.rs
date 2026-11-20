@@ -161,6 +161,14 @@ pub(super) fn butterfly_fused_2layer(
 /// or 64. When `ALIGNED_ZMM`, every destination must be 64-byte aligned; the
 /// fallback only requires 16-byte alignment. The cfg gate guarantees the
 /// required target features.
+/// st2 ZTAIL: `lanes` flag for [`butterfly_fused_2layer_publish_nt`] at
+/// `lanes == 60`: do not store the four contractually zero tail fields
+/// (60..64). Only the seed+top publish sets it; its sole reader, the deep pass,
+/// never loads those fields of an odd row (see `st2_ztail_enabled`).
+pub(super) const ZT_SKIP: usize = 1 << 16;
+/// st2 ZTAIL diagnostics: store all-ones there instead (proves no reader).
+pub(super) const ZT_POISON: usize = 1 << 17;
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -180,7 +188,7 @@ pub(super) unsafe fn butterfly_fused_2layer_publish_nt<const ALIGNED_ZMM: bool>(
     t_inner_a: F128,
     t_inner_b: F128,
 ) {
-    debug_assert!(lanes == 60 || lanes == 64);
+    debug_assert!(lanes & 0xff == 60 || lanes == 64);
     debug_assert_eq!(dst_a as usize % 16, 0);
     debug_assert_eq!(dst_b as usize % 16, 0);
     debug_assert_eq!(dst_c as usize % 16, 0);
