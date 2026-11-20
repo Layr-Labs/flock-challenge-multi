@@ -649,6 +649,9 @@ unsafe fn butterfly_fused_2layer_publish_nt_impl<
     // SAFETY: the caller guarantees four readable scratch rows, four disjoint
     // 16-byte-aligned destinations, target features, and lanes in {60, 64}.
     unsafe {
+        // st2 ZTAIL flags ride above the lane count (`super::ZT_SKIP`).
+        let zt = lanes & !0xff;
+        let lanes = lanes & 0xff;
         debug_assert!(lanes == 60 || lanes == 64);
         debug_assert!(!OUTER_LOW || t_outer.hi == 0);
         debug_assert!(!INNER_LOW || (t_inner_a.hi == 0 && t_inner_b.hi == 0));
@@ -757,7 +760,16 @@ unsafe fn butterfly_fused_2layer_publish_nt_impl<
         // published from the R1CS padding descriptor, so lanes 60..64 are
         // contractually zero. Publish a zero register: every destination byte
         // is initialized, with no dependency or reload from the scratch suffix.
-        if i < 64 {
+        if i < 64 && zt & super::ZT_SKIP != 0 {
+            debug_assert_eq!(i, 60);
+            if zt & super::ZT_POISON != 0 {
+                let ones = _mm512_set1_epi64(-1);
+                stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i), ones);
+                stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i), ones);
+                stream_f128x4::<ALIGNED_ZMM>(dst_c.add(i), ones);
+                stream_f128x4::<ALIGNED_ZMM>(dst_d.add(i), ones);
+            }
+        } else if i < 64 {
             debug_assert_eq!(i, 60);
             let zero = _mm512_setzero_si512();
             stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i), zero);
