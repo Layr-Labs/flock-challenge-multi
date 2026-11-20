@@ -7,7 +7,7 @@
 // Same private register ABI as flock_gfni_c4_lm_register_result_m:
 // clobbers RAX, flags, ZMM0..9. Preserves every other GPR and ZMM10..31.
 // Called ONLY by the matching inline-asm wrapper, never through the C ABI.
-.text
+.section .text.r345,"ax",@progbits
 .p2align 6
 .globl flock_gfni_c4_pass4_register_result_m
 .hidden flock_gfni_c4_pass4_register_result_m

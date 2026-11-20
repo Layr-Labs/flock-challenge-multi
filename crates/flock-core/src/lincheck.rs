@@ -4815,6 +4815,62 @@ fn gl1_lc_team_min() -> usize {
 
 const GL1_LC_CHUNKS: usize = 16;
 
+/// Lincheck capture by move: leech1996's submission
+/// 56d40be1-e5d6-456d-baff-3bbe8ac9cc51 (change 7).
+/// `FLOCK_NO_LC_CAPTURE_MOVE=1` restores the clone of the post-round-0 Fold8
+/// capture. Read once per process; default ON.
+fn lc_capture_move_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_CAPTURE_MOVE").is_none());
+    *ON
+}
+
+/// [`gl1_bind_both_and_eval_next_team`] with `z` bound out of place: `z` is
+/// only read, and the bound table (length `z.len() / 2`) is returned.
+fn gl1_bind_both_and_eval_next_team_zout(
+    comb: &mut Vec<F128>,
+    z: &[F128],
+    r: F128,
+) -> ((F128, F128), Vec<F128>) {
+    let len = comb.len();
+    debug_assert_eq!(z.len(), len);
+    let half = len / 2;
+    let half2 = half / 2;
+    let ch = half2 / GL1_LC_CHUNKS;
+    let mut z_next: Vec<F128> = Vec::with_capacity(half);
+    let (cp, zp, op) = (comb.as_mut_ptr() as usize, z.as_ptr() as usize, z_next.as_mut_ptr() as usize);
+    let out = crate::flat_par::team_map_reduce(
+        GL1_LC_CHUNKS,
+        |i| {
+            let s = i * ch;
+            // SAFETY: chunk `i` writes only slots [s, s+ch) of the two low
+            // quarters of `comb` and of `z_next`, and reads [s, s+ch) of the
+            // four quarters of `z` / two high quarters of `comb`; chunks are
+            // disjoint, `z` is never written, and all buffers outlive
+            // `team_map_reduce`.
+            unsafe {
+                let c = cp as *mut F128;
+                let zz = zp as *const F128;
+                let o = op as *mut F128;
+                let m = |p: *mut F128, o: usize| core::slice::from_raw_parts_mut(p.add(o), ch);
+                let r_ = |p: *const F128, o: usize| core::slice::from_raw_parts(p.add(o), ch);
+                crate::field::f128_slice::bind_both_and_msg_split_zout(
+                    m(c, s), m(c, half2 + s), r_(c as *const F128, half + s), r_(c as *const F128, half + half2 + s),
+                    r_(zz, s), r_(zz, half2 + s), r_(zz, half + s), r_(zz, half + half2 + s),
+                    m(o, s), m(o, half2 + s),
+                    r, ch,
+                )
+            }
+        },
+        || (F128::ZERO, F128::ZERO),
+        |a, b| (a.0 + b.0, a.1 + b.1),
+    );
+    // SAFETY: the `half` slots were all written above (2 quarters x 16 chunks x ch).
+    unsafe { z_next.set_len(half) };
+    comb.truncate(half);
+    (out, z_next)
+}
+
 /// [`sumcheck_round_eval_par`] on the spinning team (x4 leaves).
 fn gl1_round_eval_team(c: &[F128], z: &[F128]) -> (F128, F128) {
     let half = c.len() / 2;
@@ -5739,6 +5795,13 @@ fn prove_padded_inner<Ch: Challenger>(
             sumcheck_round_eval_par(&comb_vec, &z_vec)
         };
         crate::rstrace::ev("lc:sc:r0", 0);
+        // Round 1 binds the post-round-0 table (half the current length) on the
+        // team out of place when it would take the team path anyway.
+        let oop_t1 = fold8_ready
+            && lc_capture_move_enabled()
+            && inner_rest_len > 2
+            && z_vec.len() == comb_vec.len()
+            && gl1_ok(z_vec.len() / 2);
         for t in 0..inner_rest_len {
             challenger.observe_f128(e1);
             challenger.observe_f128(einf);
@@ -5747,7 +5810,13 @@ fn prove_padded_inner<Ch: Challenger>(
             r_rounds.push(r);
             if t + 1 < inner_rest_len {
                 // Fused: bind both tables at r AND compute round (t+1)'s message.
-                let (ne1, neinf) = if gl1_ok(comb_vec.len()) && comb_vec.len() == z_vec.len() {
+                let (ne1, neinf) = if oop_t1 && t == 1 {
+                    // Bind z out of place so the post-round-0 capture is moved,
+                    // not cloned; the capture is never written.
+                    let (m, z_next) = gl1_bind_both_and_eval_next_team_zout(&mut comb_vec, &z_vec, r);
+                    captured_z_vec = Some(std::mem::replace(&mut z_vec, z_next));
+                    m
+                } else if gl1_ok(comb_vec.len()) && comb_vec.len() == z_vec.len() {
                     gl1_bind_both_and_eval_next_team(&mut comb_vec, &mut z_vec, r)
                 } else {
                     sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r)
@@ -5759,7 +5828,7 @@ fn prove_padded_inner<Ch: Challenger>(
                 sumcheck_bind_top_in_place_par(&mut comb_vec, r);
                 sumcheck_bind_top_in_place_par(&mut z_vec, r);
             }
-            if fold8_ready && t == 0 {
+            if fold8_ready && t == 0 && !oop_t1 {
                 debug_assert_eq!(z_vec.len(), 64usize << crate::pcs::LOG_PACKING);
                 captured_z_vec = Some(z_vec.clone());
             }
