@@ -101,6 +101,15 @@ std::thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// `FLOCK_NO_XP_CASC_BATCH_INV=1` restores the three separate inversions of
+/// the deeper tail cascade step (Meganpark980320
+/// 1cd0dc51-7c29-4c24-840c-1b822cc02738 piece 9). Read once.
+fn casc_batch_inv_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_XP_CASC_BATCH_INV").is_none());
+    *ON
+}
+
 #[inline]
 fn dup_inv_elide_enabled() -> bool {
     #[cfg(test)]
@@ -1163,6 +1172,67 @@ fn gl1_split_lo() -> usize {
         std::env::var("FLOCK_GL1_SPLIT_LO").ok().and_then(|v| v.parse().ok()).unwrap_or(6)
     });
     *LO
+}
+
+/// Lane z3a TEQ (`FLOCK_NO_Z3_TEQ`): every tail level's split eq is built over
+/// `r_next[1..]`, a suffix of the zerocheck point `r`, which is fixed before
+/// round one. Each level used to build its `eq_lo`/`eq_hi` tensors (up to
+/// 2^12 products at level 1) and its `(w, w·x⁶⁴)` pair table serially between
+/// two Fiat-Shamir samples. Round one's idle AB thread now builds them for
+/// every suffix length the levels use, with the same functions on the same
+/// inputs; a level takes the entry whose key equals its own coordinates and
+/// `n_hi`, or builds as before. Same field elements, so the proof is unchanged.
+pub(crate) fn z3_teq_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_Z3_TEQ").is_none());
+    *ON
+}
+
+struct Z3TeqEntry {
+    key: Vec<F128>,
+    n_hi: usize,
+    eq: SplitEqGhash,
+    wt: Option<Vec<F128>>,
+}
+
+static Z3_TEQ: std::sync::Mutex<Vec<Z3TeqEntry>> = std::sync::Mutex::new(Vec::new());
+
+/// Suffix lengths prebuilt by [`z3_teq_prebuild`] (the ranked levels use 19,
+/// 17, 15, 13, 11, ...).
+const Z3_TEQ_MIN_LEN: usize = 5;
+const Z3_TEQ_MAX_LEN: usize = 19;
+
+/// Build the split eq (and pair table) of every suffix of `r` whose length is
+/// in `Z3_TEQ_MIN_LEN..=Z3_TEQ_MAX_LEN`, replacing any earlier entries.
+pub(crate) fn z3_teq_prebuild(r: &[F128]) {
+    if !z3_teq_enabled() {
+        return;
+    }
+    let mut v = Vec::with_capacity(Z3_TEQ_MAX_LEN);
+    for len in Z3_TEQ_MIN_LEN..=Z3_TEQ_MAX_LEN.min(r.len()) {
+        let key = &r[r.len() - len..];
+        let n_hi = tail_split_n_hi(len);
+        let eq = SplitEqGhash::with_n_hi(key, n_hi);
+        let wt = eq.lo.len().is_multiple_of(8).then(|| build_w_pair_table(&eq.lo));
+        v.push(Z3TeqEntry { key: key.to_vec(), n_hi, eq, wt });
+    }
+    if let Ok(mut g) = Z3_TEQ.lock() {
+        *g = v;
+    }
+}
+
+/// `SplitEqGhash::with_n_hi(r, n_hi)`, from the prebuilt entry when one has
+/// exactly these coordinates, plus its pair table (`None`: build it).
+fn z3_tail_eq(r: &[F128], n_hi: usize) -> (SplitEqGhash, Option<Vec<F128>>) {
+    if z3_teq_enabled() {
+        if let Ok(mut g) = Z3_TEQ.lock() {
+            if let Some(i) = g.iter().position(|e| e.n_hi == n_hi && e.key[..] == *r) {
+                let e = g.swap_remove(i);
+                return (e.eq, e.wt);
+            }
+        }
+    }
+    (SplitEqGhash::with_n_hi(r, n_hi), None)
 }
 
 /// Per-chunk `eq_lo` length of the plain composed tail level whose input has
@@ -3597,7 +3667,7 @@ pub fn fold2_plain_and_round4_into(
     assert_eq!(r_next4.len(), log_n - 2);
 
     let n_vars = r_next4.len() - 1;
-    let eq = SplitEqGhash::with_n_hi(&r_next4[1..], tail_split_n_hi(n_vars));
+    let (eq, _) = z3_tail_eq(&r_next4[1..], tail_split_n_hi(n_vars));
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert!(lo_size >= 2, "composed fold requires lo_size ≥ 2");
@@ -3759,7 +3829,11 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm_casc(
     }
     // Deeper cascade: both lanes of an eight-group ride the odd lane's weight;
     // κ restores the even lanes' own weight in the message sums.
-    let kappa_c = if casc { (F128::ONE + r_next[2]) * r_next[2].inv() } else { F128::ZERO };
+    // With the batched inverse (below) κ_c is derived from the shared
+    // inversion once both weights have been checked.
+    let casc_batch_inv = casc && casc_batch_inv_enabled();
+    let kappa_c_single =
+        if casc && !casc_batch_inv { (F128::ONE + r_next[2]) * r_next[2].inv() } else { F128::ZERO };
     // In-place handoff input (`TlPieces`): `a`/`b` are level 1's input
     // buffers, read piece by piece; `n` is the logical length.
     let n = pieces.map_or(a.len(), |p| p.n);
@@ -3783,7 +3857,7 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm_casc(
     );
 
     let n_vars = r_next.len() - 1;
-    let eq = SplitEqGhash::with_n_hi(&r_next[1..], tail_split_n_hi(n_vars));
+    let (eq, z3_wt) = z3_tail_eq(&r_next[1..], tail_split_n_hi(n_vars));
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert!(lo_size >= 2, "composed lookahead requires lo_size ≥ 2");
@@ -3792,7 +3866,23 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm_casc(
         !(in_lm || out_lm) || (lo_size.is_multiple_of(8) && zc_lane_major_handoff_on()),
         "lane-major tiles need eight-group AVX-512 chunks"
     );
-    let (kappa, r_inv) = lookahead_inv_factors(r);
+    // `FLOCK_NO_XP_CASC_BATCH_INV`: the deeper cascade needs r1⁻¹, r2⁻¹ and
+    // (r1·r2)⁻¹. One inversion P = (r1·r2)⁻¹ gives all three exactly:
+    // r1⁻¹ = r2·P and r2⁻¹ = r1·P (inverses in GF(2^128) are unique, so
+    // these are the same field elements, bit for bit). Both weights are
+    // asserted non-zero above. Port of terrapinelf's batched tri-pass
+    // inversion from the Apple track (28dfebfb, `FLOCK_NO_ZC_TRI_BATCH_INV`).
+    let (kappa, r_inv, kappa_c, la7_scale) = if casc_batch_inv {
+        let p = (r_next[1] * r_next[2]).inv();
+        let r1_inv = r_next[2] * p;
+        let r2_inv = r_next[1] * p;
+        // (1 + r1)·r1⁻¹ = r1⁻¹ + 1: the value both arms of
+        // `lookahead_inv_factors` return.
+        (r1_inv + F128::ONE, r1_inv, (F128::ONE + r_next[2]) * r2_inv, Some(p))
+    } else {
+        let (kappa, r_inv) = lookahead_inv_factors(r);
+        (kappa, r_inv, kappa_c_single, None)
+    };
 
     let chunk_in = 8 * lo_size;
     let chunk_out = 2 * lo_size;
@@ -3807,7 +3897,7 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm_casc(
         target_feature = "vpclmulqdq"
     ))]
     let wtab_vec = if kernels::x86_64::zc_wtab_enabled() && lo_size.is_multiple_of(8) {
-        Some(build_w_pair_table(eq_lo))
+        Some(z3_wt.unwrap_or_else(|| build_w_pair_table(eq_lo)))
     } else {
         None
     };
@@ -4089,7 +4179,8 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm_casc(
     let la = lookahead_from_odd_weighted(&agg, r_inv);
     let la7 = casc.then(|| {
         assert_ne!(r_next[2], F128::ZERO, "deeper cascade needs a non-zero second weight");
-        Round4Lookahead::from_flat(&la7_acc).scaled((r_next[1] * r_next[2]).inv())
+        Round4Lookahead::from_flat(&la7_acc)
+            .scaled(la7_scale.unwrap_or_else(|| (r_next[1] * r_next[2]).inv()))
     });
     (r_next[0] * sum1, sum_inf, la, la7)
 }
@@ -4126,7 +4217,7 @@ pub(crate) fn fold3_oct_plain_and_round_pair_lookahead_into(
     assert_ne!(r, F128::ZERO, "cascade lookahead requires a non-zero parity weight");
 
     let n_vars = r_next.len() - 1;
-    let eq = SplitEqGhash::with_n_hi(&r_next[1..], tail_split_n_hi(n_vars));
+    let (eq, z3_wt) = z3_tail_eq(&r_next[1..], tail_split_n_hi(n_vars));
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert!(lo_size >= 2);
@@ -4158,7 +4249,7 @@ pub(crate) fn fold3_oct_plain_and_round_pair_lookahead_into(
             && eighth >= (1usize << kernels::x86_64::ZC_TAIL_NT_LOG)
             && (a_out.as_ptr() as usize) % 16 == 0
             && (b_out.as_ptr() as usize) % 16 == 0;
-        (build_w_pair_table(eq_lo), nt)
+        (z3_wt.unwrap_or_else(|| build_w_pair_table(eq_lo)), nt)
     });
 
     let leaf = |(x_hi, (a_out, b_out)): (usize, (&mut [F128], &mut [F128]))| {
@@ -4180,7 +4271,7 @@ pub(crate) fn fold3_oct_plain_and_round_pair_lookahead_into(
                 unsafe {
                     macro_rules! go {
                         ($nt:literal, $lm:literal, $b7:literal) => {
-                            kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<$nt, $lm, $b7>(ap, bp, aop, bop, rho, lo_size, wt, bc)
+                            kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<$nt, $lm, $b7, false>(ap, bp, aop, bop, rho, lo_size, wt, bc)
                         };
                     }
                     match (*nt, out_lm, b7.is_some()) {
@@ -4343,7 +4434,7 @@ pub(crate) fn fold2_plain_tl_inplace(
     let r = r_next[1];
     assert_ne!(r, F128::ZERO, "cascade lookahead requires a non-zero parity weight");
     let n_vars = r_next.len() - 1;
-    let eq = SplitEqGhash::with_n_hi(&r_next[1..], tail_split_n_hi(n_vars));
+    let (eq, z3_wt) = z3_tail_eq(&r_next[1..], tail_split_n_hi(n_vars));
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert_eq!(lo_size * hi_size * 2, quarter);
@@ -4366,7 +4457,7 @@ pub(crate) fn fold2_plain_tl_inplace(
     let per = chunk_in / p.piece;
     let sub_lo = lo_size / per;
     assert!(sub_lo.is_multiple_of(16) && sub_lo * 8 == p.piece);
-    let wt = build_w_pair_table(&eq.lo);
+    let wt = z3_wt.unwrap_or_else(|| build_w_pair_table(&eq.lo));
     let eq_hi = &eq.hi;
     let (ab, bb) = (a.as_mut_ptr() as usize, b.as_mut_ptr() as usize);
     let (sa, sb) = (p.stride_a, p.stride_b);
@@ -4503,6 +4594,59 @@ pub(crate) fn tl2_route_ok(n: usize) -> bool {
     }
 }
 
+/// Lane sc1 `FLOCK_NO_SC_TL3=1` keeps level 3's separate output tables under
+/// the in-place handoff (level 4 then reads them as usual).
+pub(crate) fn tl3_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SC_TL3").is_none());
+    *ON
+}
+
+/// Whether level 3 of the in-place handoff (level-1 input of `n` elements)
+/// can also write in place: it runs [`fold2_plain_tl_inplace`] on level 2's
+/// pieces, and level 4 is the same plain `wtab` kernel whose chunks cover
+/// whole level-3 pieces in sub-runs of a multiple of 16 groups. Level 3 writes
+/// its outputs over the start of each piece it has just read instead of into
+/// the cold scratch table, exactly as level 2 does.
+pub(crate) fn tl3_route_ok(n: usize) -> bool {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        if !tl3_enabled() || !tl2_route_ok(n) || n < (1usize << 10) {
+            return false;
+        }
+        let n_vars1 = n.trailing_zeros() as usize - 4;
+        let lo1 = 1usize << (n_vars1 - tail_split_n_hi(n_vars1).min(n_vars1));
+        let lo2 = plain_cascade_lo_size(n / 8);
+        let per2 = 8 * lo2 / (2 * lo1);
+        let piece3 = 2 * (lo2 / per2);
+        let lo3 = plain_cascade_lo_size(n / 32);
+        let per3 = 8 * lo3 / piece3;
+        let piece4 = 2 * (lo3 / per3);
+        let lo4 = plain_cascade_lo_size(n / 128);
+        let chunk_in4 = 8 * lo4;
+        kernels::x86_64::fold2_plain_defer_wtab_route_ok(
+            kernels::x86_64::zc_defer_split_enabled(),
+            lo4,
+            true,
+        ) && kernels::x86_64::zc_wtab_enabled()
+            && chunk_in4.is_multiple_of(piece4)
+            && (lo4 / (chunk_in4 / piece4)).is_multiple_of(16)
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        let _ = n;
+        false
+    }
+}
+
 /// [`fold3_oct_plain_and_round_pair_lookahead_into`] with the in-place
 /// handoff (see [`TlPieces`]): output chunk `i` (both tables) is written over
 /// the start of input chunk `i`, whose lines the octet kernel has just read
@@ -4519,10 +4663,14 @@ pub(crate) fn fold3_oct_plain_and_round_pair_lookahead_inplace(
     r_next: &[F128],
     out_lm: bool,
     b7: Option<&[F128; 4]>,
+    a31: bool,
 ) -> (F128, F128, Round3Lookahead, TlPieces) {
     use rayon::prelude::*;
     let n = a.len();
     assert!(tl_route_ok(n), "in-place handoff route unavailable");
+    // A31 (lane z3a): the A table fills the first 31/32 of its buffer.
+    assert!(!a31 || b7.is_some(), "the A31 table comes with the B7 table");
+    let a = &mut a[..if a31 { 31 * n / 32 } else { n }];
     // The B7 table fills the first seven eighths of its buffer.
     let n_b = if b7.is_some() { 7 * n / 8 } else { n };
     assert!(b.len() >= n_b);
@@ -4534,7 +4682,7 @@ pub(crate) fn fold3_oct_plain_and_round_pair_lookahead_inplace(
     assert_ne!(r, F128::ZERO, "cascade lookahead requires a non-zero parity weight");
 
     let n_vars = r_next.len() - 1;
-    let eq = SplitEqGhash::with_n_hi(&r_next[1..], tail_split_n_hi(n_vars));
+    let (eq, z3_wt) = z3_tail_eq(&r_next[1..], tail_split_n_hi(n_vars));
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert!(lo_size >= 16 && lo_size.is_multiple_of(16));
@@ -4544,8 +4692,9 @@ pub(crate) fn fold3_oct_plain_and_round_pair_lookahead_inplace(
         "lane-major tiles need eight-group chunks"
     );
     let (kappa, r_inv) = lookahead_inv_factors(r);
-    let chunk_in = 16 * lo_size;
-    let chunk_in_b = if b7.is_some() { 14 * lo_size } else { chunk_in };
+    assert!(!a31 || lo_size.is_multiple_of(16));
+    let chunk_in = if a31 { 31 * lo_size / 2 } else { 16 * lo_size };
+    let chunk_in_b = if b7.is_some() { 14 * lo_size } else { 16 * lo_size };
     let chunk_out = 2 * lo_size;
     let eq_hi = &eq.hi;
     let b_canon = b7.copied().unwrap_or([F128::ZERO; 4]);
@@ -4556,7 +4705,7 @@ pub(crate) fn fold3_oct_plain_and_round_pair_lookahead_inplace(
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
-    let wt = build_w_pair_table(&eq.lo);
+    let wt = z3_wt.unwrap_or_else(|| build_w_pair_table(&eq.lo));
 
     let leaf = |(x_hi, (a_ch, b_ch)): (usize, (&mut [F128], &mut [F128]))| {
         crate::rstrace::evd("zt:c0", x_hi as u32);
@@ -4578,17 +4727,19 @@ pub(crate) fn fold3_oct_plain_and_round_pair_lookahead_inplace(
             // overwrites were loaded (see above).
             unsafe {
                 macro_rules! go {
-                    ($lm:literal, $b7:literal) => {
-                        kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<false, $lm, $b7>(
+                    ($lm:literal, $b7:literal, $a31:literal) => {
+                        kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<false, $lm, $b7, $a31>(
                             ap as *const F128, bp as *const F128, ap, bp, rho, lo_size, wt, bc,
                         )
                     };
                 }
-                match (out_lm, b7.is_some()) {
-                    (true, false) => go!(true, false),
-                    (false, false) => go!(false, false),
-                    (true, true) => go!(true, true),
-                    (false, true) => go!(false, true),
+                match (out_lm, b7.is_some(), a31) {
+                    (true, false, _) => go!(true, false, false),
+                    (false, false, _) => go!(false, false, false),
+                    (true, true, false) => go!(true, true, false),
+                    (false, true, false) => go!(false, true, false),
+                    (true, true, true) => go!(true, true, true),
+                    (false, true, true) => go!(false, true, true),
                 }
             }
         };
@@ -4656,6 +4807,16 @@ pub(crate) fn fold3_oct_b7_route_ok(n: usize) -> bool {
 
 /// `FLOCK_NO_ZC_B7=1` keeps the rounds 3+4+5 pass's B table in the full
 /// eight-ZMM octet layout (its four static lanes per block stored and read).
+/// Lane z3a A31 (`FLOCK_NO_Z3_A31`): with B7 and the in-place level-1
+/// hand-off, the rounds 3+4+5 pass also drops A's zero line 31 (rows
+/// 248..256 of every block are padding): four blocks are stored as 4 x 7
+/// ZMMs plus the three packed ZMM 7s, and only tail level 1 reads them.
+pub(crate) fn z3_a31_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_Z3_A31").is_none());
+    *ON
+}
+
 pub(crate) fn b7_tables_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_B7").is_none());
@@ -6508,7 +6669,7 @@ mod tests {
                 let mut b_out = vec![F128::ZERO; n_out];
                 let msg = three_var::fold3_from_packed_and_round_pair_lookahead_casc(
                     &a, &b, m, K_SKIP, &table, &padding, &mut a_out, &mut b_out, rho, &r_next5,
-                    Some((&eq.lo[..], &eq.hi[..])), false, true, casc, None, false,
+                    Some((&eq.lo[..], &eq.hi[..])), false, true, casc, None, false, false,
                 );
                 (msg, a_out, b_out)
             };
@@ -6521,7 +6682,7 @@ mod tests {
                 let mut b7 = vec![F128::ZERO; n_out];
                 let msg7 = three_var::fold3_from_packed_and_round_pair_lookahead_casc(
                     &a, &b, m, K_SKIP, &table, &padding, &mut a7, &mut b7, rho, &r_next5,
-                    Some((&eq.lo[..], &eq.hi[..])), false, true, true, None, true,
+                    Some((&eq.lo[..], &eq.hi[..])), false, true, true, None, true, false,
                 );
                 assert_eq!(msg7, got, "b7 messages {case}");
                 assert!(a7 == a_oct, "b7 a table {case}");
@@ -6574,6 +6735,65 @@ mod tests {
             }
             assert_eq!(got.3.unwrap(), want, "round-seven lookahead {case}");
         }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+    #[test]
+    fn r345_deferred_simd_matches_incumbent() {
+        let padding = PaddingSpec { k_log: 14, useful_bits_per_block: 15_409 };
+        let poison = F128::new(0xa5a5_a5a5_a5a5_a5a5, 0x5a5a_5a5a_5a5a_5a5a);
+        let mut cases = 0;
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            for (blocks_log, n_hi) in [(4, 2), (6, 2), (6, 5)] {
+                let m = 6 + 8 + blocks_log;
+                let n_rows = 1 << (m - 6);
+                let n_out = n_rows / 8;
+                let mut rng = Rng::new(0x345de + m as u64 + n_hi as u64);
+                let table = UniSkipFoldTable::new(6, rng.f128());
+                let rho = [rng.f128(), rng.f128(), rng.f128()];
+                let mut r_next = rng.f128_vec(m - 9);
+                r_next[0] = F128::ONE;
+                let eq = SplitEqGhash::with_n_hi(&r_next[1..], n_hi);
+                for kind in 0..3 {
+                    let (mut a, mut b) = ranked_canonical_witness(&mut rng, n_rows);
+                    if kind < 2 {
+                        let byte = if kind == 0 { 0 } else { 255 };
+                        for blk in 0..n_rows / 256 {
+                            let base = blk * 256 * 8;
+                            a[base..base + 240 * 8].fill(byte);
+                            a[base + 240 * 8..base + 241 * 8].copy_from_slice(
+                                &(if kind == 0 { 0u64 } else { 0x0001_ffff_ffff_ffff }).to_le_bytes()
+                            );
+                            b[base + 16 * 8..base + 240 * 8].fill(byte);
+                        }
+                    }
+                    for (b7, a31) in [(false, false), (true, false), (true, true)] {
+                        if a31 && !eq.lo.len().is_multiple_of(64) { continue; }
+                        let run = |enabled| pool.install(|| {
+                            let mut ao = vec![poison; n_out + 2];
+                            let mut bo = vec![poison; n_out + 2];
+                            let was = three_var::R345_VEC_OVERRIDE.with(|v| v.replace(Some(enabled)));
+                            let msg = three_var::fold3_from_packed_and_round_pair_lookahead_casc(
+                                &a, &b, m, 6, &table, &padding,
+                                &mut ao[1..n_out + 1], &mut bo[1..n_out + 1], rho, &r_next,
+                                Some((&eq.lo, &eq.hi)), false, true, true, None, b7, a31,
+                            );
+                            three_var::R345_VEC_OVERRIDE.with(|v| v.set(was));
+                            assert!(msg.3.is_some(), "the cascade kernel must execute");
+                            for out in [&ao, &bo] {
+                                assert_eq!(out[0], poison);
+                                assert_eq!(out[n_out + 1], poison);
+                            }
+                            (msg, ao, bo)
+                        });
+                        assert_eq!(run(false), run(true), "threads={threads} kind={kind} b7={b7} a31={a31}");
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        println!("R345_DEFERRED {cases} zero/one/random threaded cases match incumbent messages, lookaheads, tables and guards");
     }
 
     /// Deeper cascade emitted by a plain two-variable level: same message and
@@ -6726,7 +6946,7 @@ mod tests {
                     );
                     let (mut ai, mut bi) = (a.clone(), b.clone());
                     let (g0, g1, g2, pieces) = fold3_oct_plain_and_round_pair_lookahead_inplace(
-                        &mut ai, &mut bi, rho, &r1, lm, b7,
+                        &mut ai, &mut bi, rho, &r1, lm, b7, false,
                     );
                     assert_eq!((g0, g1, g2), m1, "level 1 log_n={log_n} b7={} lm={lm}", b7.is_some());
                     for e in 0..n / 8 {
@@ -6760,9 +6980,64 @@ mod tests {
                             assert_eq!(aj[i * next.stride_a + k], a2[e], "a2 e={e}");
                             assert_eq!(bj[i * next.stride_b + k], b2[e], "b2 e={e}");
                         }
+                        // Level 3 in place too (lane sc1, `FLOCK_NO_SC_TL3`):
+                        // same messages and tables as level 3 on the level-2
+                        // pieces with separate outputs, and level 4 on the
+                        // level-3 pieces equals level 4 on that table.
+                        if tl3_route_ok(n) {
+                            let mut r3 = rng.f128_vec(log_n - 7);
+                            r3[0] = F128::ONE;
+                            let mut r4 = rng.f128_vec(log_n - 9);
+                            r4[0] = F128::ONE;
+                            let (rc, rd, re, rf) = (rng.f128(), rng.f128(), rng.f128(), rng.f128());
+                            let mut a3 = vec![F128::ZERO; n / 128];
+                            let mut b3 = vec![F128::ZERO; n / 128];
+                            let m3 = fold2_plain_and_round_pair_lookahead_into_lm_casc(
+                                &aj, &bj, &mut a3, &mut b3, rc, rd, &r3, false, false, false, false,
+                                Some(next),
+                            );
+                            let mut a4 = vec![F128::ZERO; n / 512];
+                            let mut b4 = vec![F128::ZERO; n / 512];
+                            let m4 = fold2_plain_and_round_pair_lookahead_into_lm_casc(
+                                &a3, &b3, &mut a4, &mut b4, re, rf, &r4, false, false, false, false,
+                                None,
+                            );
+                            let (mut ak, mut bk) = (aj.clone(), bj.clone());
+                            let (q0, q1, q2, next3) = fold2_plain_tl_inplace(
+                                &mut ak, &mut bk, next, rc, rd, &r3, false, false, false,
+                            );
+                            assert_eq!((q0, q1, q2), (m3.0, m3.1, m3.2), "level 3 in place log_n={log_n}");
+                            assert_eq!(next3.n, n / 128);
+                            for e in 0..n / 128 {
+                                let (i, k) = (e / next3.piece, e % next3.piece);
+                                assert_eq!(ak[i * next3.stride_a + k], a3[e], "a3 e={e}");
+                                assert_eq!(bk[i * next3.stride_b + k], b3[e], "b3 e={e}");
+                            }
+                            let mut a4i = vec![F128::ZERO; n / 512];
+                            let mut b4i = vec![F128::ZERO; n / 512];
+                            let got4 = fold2_plain_and_round_pair_lookahead_into_lm_casc(
+                                &ak, &bk, &mut a4i, &mut b4i, re, rf, &r4, false, false, false, false,
+                                Some(next3),
+                            );
+                            assert_eq!((got4.0, got4.1, got4.2), (m4.0, m4.1, m4.2), "level 4 log_n={log_n}");
+                            assert!(a4i == a4 && b4i == b4, "level 4 tables log_n={log_n}");
+                        }
                     }
                 }
             }
+        }
+    }
+
+    /// Lane sc1: the ranked tail (level-1 input 2^23) takes the level-3
+    /// in-place route, and its geometry needs level 2 in place.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    #[test]
+    fn tl3_route_holds_at_ranked_shape() {
+        if tl_enabled() && tl2_enabled() && tl3_enabled() && tl2_route_ok(1 << 23) {
+            assert!(tl3_route_ok(1 << 23));
+        }
+        for log_n in 10..24 {
+            assert!(!tl3_route_ok(1 << log_n) || tl2_route_ok(1 << log_n));
         }
     }
 

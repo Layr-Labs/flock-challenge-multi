@@ -15,6 +15,7 @@
 //! byte-identical. `FLOCK_NO_ZC_3VAR=1` restores the two-variable route.
 
 use super::*;
+use super::{R2Vec as DeferredSums, r2vec_add as deferred_add, r2vec_zero as deferred_zero};
 
 /// Deferred round-four message. `v1[i + 3j]` / `vinf[i + 3j]` are the
 /// eq₄-weighted sums of the products at `(ρ₁, ρ₂) = (P_i, P_j)`, `P = (0, 1, ∞)`,
@@ -344,7 +345,7 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_into_with_eq(
 ) -> (F128, F128, Round3Lookahead) {
     let (m1, mi, la, _) = fold3_from_packed_and_round_pair_lookahead_casc(
         a_packed, b_packed, m, k_skip, table, padding, a_out, b_out, rho, r_next5, eq_override,
-        out_lm, b_canonical, false, None, false,
+        out_lm, b_canonical, false, None, false, false,
     );
     (m1, mi, la)
 }
@@ -404,6 +405,7 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
     casc: bool,
     pre_wtab: Option<&[F128]>,
     b7: bool,
+    a31: bool,
 ) -> (F128, F128, Round3Lookahead, Option<Round4Lookahead>) {
     use rayon::prelude::*;
     assert_eq!(k_skip, 6);
@@ -525,6 +527,9 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
     // block layout, which only the cascade's b-canonical kernel produces.
     assert!(!b7 || casc, "the B7 table layout needs the deeper-cascade route");
     let chunk_b = if b7 { 7 * (2 * lo_size) / 8 } else { 2 * lo_size };
+    // A31 (lane z3a): four-block groups of 124 A outputs; needs B7.
+    assert!(!a31 || (b7 && lo_size.is_multiple_of(64)), "the A31 table needs the B7 route");
+    let chunk_a = if a31 { 31 * (2 * lo_size) / 32 } else { 2 * lo_size };
     // Deeper cascade: both lanes of an eight-group ride the odd lane's
     // weight; κ₆ restores the even lanes' own weight in the message sums.
     crate::rstrace::ev("r345:s3", 0);
@@ -546,11 +551,14 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
     )))]
     let _ = b_canonical;
 
+    let defer = casc && r345_vec_sums_enabled();
     crate::rstrace::ev("r345:par0", 0);
     let leaf = |(x_hi, (a_out, b_out)): (usize, (&mut [F128], &mut [F128]))| {
             crate::rstrace::item_start();
             let out_base = x_hi * chunk_out;
             let mut la7 = [F128::ZERO; 18];
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+            let mut planes = core::mem::MaybeUninit::<DeferredSums>::uninit();
             #[cfg(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
@@ -566,19 +574,43 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
                 unsafe {
                     if casc && let Some(bc) = b_canon.as_ref() {
                         macro_rules! casc {
-                            ($nt:literal, $b7:literal) => {
-                                kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86::<$nt, true, true, $b7>(
+                            ($nt:literal, $b7:literal, $mk:literal) => {
+                                if a31 { casc!(# $nt, $b7, $mk, true) } else { casc!(# $nt, $b7, $mk, false) }
+                            };
+                            (# $nt:literal, $b7:literal, $mk:literal, $a31:literal) => {
+                                // Lane r5 (FLOCK_NO_R5_PF1 / FLOCK_R5_PFD): prefetch lead in half-blocks.
+                                match kernels::x86_64::zc_r5_pfd() {
+                                    1 => casc!(@ $nt, $b7, $mk, 1, $a31),
+                                    2 => casc!(@ $nt, $b7, $mk, 2, $a31),
+                                    _ => casc!(@ $nt, $b7, $mk, 3, $a31),
+                                }
+                            };
+                            (@ $nt:literal, $b7:literal, $mk:literal, $pf:literal, $a31:literal) => {
+                                kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86::<$nt, true, true, $b7, $mk, $pf, $a31>(
                                     ap, bp, out_base, a_out, b_out, lo_size, c, rho[2],
                                     wtab_casc.as_deref().unwrap(), bc, &mut la7, kappa6,
+                                    defer.then_some(&mut planes),
                                 )
                             };
                         }
                         let _ = wt;
-                        match (*nt, b7) {
-                            (true, true) => casc!(true, true),
-                            (false, true) => casc!(false, true),
-                            (true, false) => casc!(true, false),
-                            (false, false) => casc!(false, false),
+                        // Lane r5 (FLOCK_NO_R5_MAHK): asm variant fixed at compile time.
+                        let mk = if !kernels::x86_64::zc_r5_mahk_enabled() {
+                            0
+                        } else if *crate::MAH_ASM_C4 {
+                            1
+                        } else {
+                            2
+                        };
+                        match (*nt, b7, mk) {
+                            (true, true, 1) => casc!(true, true, 1),
+                            (true, true, 2) => casc!(true, true, 2),
+                            (true, true, _) => casc!(true, true, 0),
+                            (false, true, 1) => casc!(false, true, 1),
+                            (false, true, 2) => casc!(false, true, 2),
+                            (false, true, _) => casc!(false, true, 0),
+                            (true, false, _) => casc!(# true, false, 0, false),
+                            (false, false, _) => casc!(# false, false, 0, false),
                         }
                     } else if let Some(bc) = b_canon.as_ref() {
                         match (*nt, out_lm) {
@@ -650,6 +682,18 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
             };
             let eq_h = eq_hi[x_hi];
             crate::rstrace::item_end();
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+            if defer {
+                use crate::field::gf2_128::x86_64::{f128x4_loadu, ghash_mul_x4_split, ghash_shift64_x4};
+                // The cascade route wrote all eighteen reduced SIMD planes.
+                let weighted = unsafe {
+                    let red = planes.assume_init();
+                    let w = f128x4_loadu([eq_h; 4].as_ptr());
+                    let w64 = ghash_shift64_x4(w);
+                    core::array::from_fn(|i| ghash_mul_x4_split(red[i], w, w64))
+                };
+                return (F128::ZERO, F128::ZERO, [F128::ZERO; 6], [F128::ZERO; 18], weighted);
+            }
             (
                 eq_h * out[0],
                 eq_h * out[1],
@@ -662,11 +706,12 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
                     eq_h * out[7],
                 ],
                 if casc { la7.map(|v| eq_h * v) } else { la7 },
+                deferred_zero(),
             )
     };
-    type R345Sums = (F128, F128, [F128; 6], [F128; 18]);
-    let id = || -> R345Sums { (F128::ZERO, F128::ZERO, [F128::ZERO; 6], [F128::ZERO; 18]) };
-    let op = |(s1, sinf, sa, sl): R345Sums, (c1, cinf, ca, cl): R345Sums| -> R345Sums {
+    type R345Sums = (F128, F128, [F128; 6], [F128; 18], DeferredSums);
+    let id = || -> R345Sums { (F128::ZERO, F128::ZERO, [F128::ZERO; 6], [F128::ZERO; 18], deferred_zero()) };
+    let op = |(s1, sinf, sa, sl, sv): R345Sums, (c1, cinf, ca, cl, cv): R345Sums| -> R345Sums {
                 let mut a = sa;
                 for (x, y) in a.iter_mut().zip(ca.iter()) {
                     *x += *y;
@@ -675,17 +720,19 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
                 for (x, y) in l.iter_mut().zip(cl.iter()) {
                     *x += *y;
                 }
-                (s1 + c1, sinf + cinf, a, l)
+                (s1 + c1, sinf + cinf, a, l, deferred_add(sv, cv))
             };
     // Lane ru flat claim route (`FLOCK_NO_RU_FLAT_PAR`), see `super::flat_tail`.
     let b_len = b_out.len() / chunk_out * chunk_b;
     let b_out = &mut b_out[..b_len];
-    let (sum1_even, sum_inf_even, agg, la7_acc) =
+    let a_len = a_out.len() / chunk_out * chunk_a;
+    let a_out = &mut a_out[..a_len];
+    let (mut sum1_even, mut sum_inf_even, mut agg, mut la7_acc, vsum) =
         if crate::flat_par::enabled() && rayon::current_thread_index().is_some() {
-            super::flat_chunks2(a_out, chunk_out, b_out, chunk_b, leaf, id, op)
+            super::flat_chunks2(a_out, chunk_a, b_out, chunk_b, leaf, id, op)
         } else {
             a_out
-                .par_chunks_mut(chunk_out)
+                .par_chunks_mut(chunk_a)
                 .zip(b_out.par_chunks_mut(chunk_b))
                 .enumerate()
                 .map(leaf)
@@ -693,6 +740,18 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
         };
     crate::rstrace::ev("r345:par1", 0);
     crate::rstrace::flush_items("r345:first", "r345:last");
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+    if defer {
+        // Linearity lets high-coordinate weights and XOR reduction precede
+        // the horizontal lane sums and the shared parity correction.
+        let (out, l7) = unsafe { kernels::x86_64::r345_deferred_finish(&vsum, kappa6) };
+        sum1_even += out[0];
+        sum_inf_even += out[1];
+        for i in 0..6 { agg[i] += out[2 + i]; }
+        for i in 0..18 { la7_acc[i] += l7[i]; }
+        crate::gaptime::mark("zc: R345 deferred SIMD reduction done");
+    }
+    let _ = (&vsum, defer);
     let sum1 = kappa * sum1_even + agg[0];
     let sum_inf = kappa * sum_inf_even + agg[1];
     let la = lookahead_from_odd_weighted(&agg, r_inv);
@@ -701,4 +760,17 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
         Round4Lookahead::from_flat(&la7_acc).scaled((r_next5[1] * r_next5[2]).inv())
     });
     (r_next5[0] * sum1, sum_inf, la, la7)
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static R345_VEC_OVERRIDE: core::cell::Cell<Option<bool>> = const { core::cell::Cell::new(None) };
+}
+
+fn r345_vec_sums_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = R345_VEC_OVERRIDE.with(|v| v.get()) { return on; }
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R345_VEC_SUMS").is_none());
+    *ON
 }
