@@ -585,6 +585,10 @@ pub struct Round1AbInner {
     /// tc: the ranked projection wrote the transpose-contract line layout
     /// (see [`Self::set_tc_layout`]); only round one's tc band fold reads it.
     tc_layout: bool,
+    /// tc2: on top of `tc_layout`, the rows are stored with row bits 10 and
+    /// 11 swapped and every line is a raw projection accumulator (see
+    /// [`Self::set_tc2_layout`]).
+    tc2_layout: bool,
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -687,6 +691,7 @@ impl Round1AbInner {
             ranked_w30_elided: false,
             ab1_hole_layout: false,
             tc_layout: false,
+            tc2_layout: false,
             #[cfg(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
@@ -717,6 +722,7 @@ impl Round1AbInner {
             ranked_w30_elided: false,
             ab1_hole_layout: false,
             tc_layout: false,
+            tc2_layout: false,
             #[cfg(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
@@ -791,6 +797,30 @@ impl Round1AbInner {
         self.tc_layout
     }
 
+    /// tc2: brand the storage as written in the second transpose-contract
+    /// layout. Storage row `pi(R)` (row bits 10 and 11 of `R` swapped) of
+    /// octa pair `b_base + e * 2048` (`e` = 0, 1; bits 10, 11 and 16.. of
+    /// `b_base` clear) is `pi(b_base + e * 2048) + (j >> 1) * 65536 +
+    /// (j & 1) * 2048` for slot `j = 0..8`, and every live window line holds
+    /// octa `e`'s raw accumulator `j`: byte `4 * (2y + h) + k` is the
+    /// incumbent byte `8j + y` of lane `2k + h`, whose true row is
+    /// `b_base + e * 2048 + k * 65536 + h * 1024`. With bits 10 and 11 of the
+    /// row index exchanged, lane `2k + h` sits in storage band
+    /// `(x & 30) | h | k << 5` of the same pair and window, so round one runs
+    /// on the storage rows with challenges 11 and 12 of `r_outer` exchanged
+    /// and its band-end fold weighs each lane with its own band's eq_hi
+    /// (`fold_ab_plane_banks_tc2_x86_avx512`). Implies [`Self::set_tc_layout`].
+    pub fn set_tc2_layout(&mut self) {
+        self.set_tc_layout();
+        self.tc2_layout = true;
+    }
+
+    /// Whether the storage holds the tc2 layout.
+    #[inline]
+    pub fn tc2_layout(&self) -> bool {
+        self.tc2_layout
+    }
+
     /// Undo the tc layout in place (exact inverse byte permutation inside
     /// each octa's eight lines per window), for any consumer other than the
     /// tc band fold. Cold: only kill switches and gate mismatches reach it.
@@ -802,12 +832,58 @@ impl Round1AbInner {
         self.tc_layout = false;
         assert!(self.ranked_compact);
         let ab1 = self.ab1_hole_layout;
+        let tc2 = core::mem::take(&mut self.tc2_layout);
         let bytes = self.as_bytes_mut();
         assert_eq!(bytes.len(), (1usize << 18) * RANKED_AB_COMPACT_BLOCK_BYTES);
         let base = bytes.as_mut_ptr() as usize;
         let row_at = move |row: usize| {
             if ab1 { ab1_row_offset(row) } else { row * RANKED_AB_COMPACT_BLOCK_BYTES }
         };
+        if tc2 {
+            // Octa pairs: the sixteen true rows b_base + {0, 2048} + h*1024 +
+            // k*65536 are the sixteen storage rows too (pi swaps bits 10, 11).
+            (0..1usize << 14).into_par_iter().for_each(|o| {
+                let b_base = (o & 1023) | ((o >> 10) << 12);
+                let srows: [[usize; 8]; 2] = core::array::from_fn(|e| {
+                    core::array::from_fn(|j| row_at(b_base + e * 1024 + (j & 1) * 2048 + (j >> 1) * 65536))
+                });
+                let trows: [[usize; 8]; 2] = core::array::from_fn(|e| {
+                    core::array::from_fn(|c| row_at(b_base + e * 2048 + (c & 1) * 1024 + (c >> 1) * 65536))
+                });
+                for w in 0..AB1_ROW_LIVE / ELL {
+                    let mut lines = [[[0u8; ELL]; 8]; 2];
+                    // SAFETY: the pair's sixteen rows are disjoint from every
+                    // other pair's; each line lies inside the checked storage.
+                    unsafe {
+                        for e in 0..2 {
+                            for j in 0..8 {
+                                core::ptr::copy_nonoverlapping((base + srows[e][j] + w * ELL) as *const u8, lines[e][j].as_mut_ptr(), ELL);
+                            }
+                        }
+                    }
+                    let mut orig = [[[0u8; ELL]; 8]; 2];
+                    for e in 0..2 {
+                        for j in 0..8 {
+                            for y in 0..8 {
+                                for h in 0..2 {
+                                    for k in 0..4 {
+                                        orig[e][2 * k + h][8 * j + y] = lines[e][j][4 * (2 * y + h) + k];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    unsafe {
+                        for e in 0..2 {
+                            for c in 0..8 {
+                                core::ptr::copy_nonoverlapping(orig[e][c].as_ptr(), (base + trows[e][c] + w * ELL) as *mut u8, ELL);
+                            }
+                        }
+                    }
+                }
+            });
+            return;
+        }
         (0..1usize << 15).into_par_iter().for_each(|o| {
             let b = (o & 1023) | ((o >> 10) << 11);
             let rows: [usize; 8] = core::array::from_fn(|s| row_at(b + (s >> 1) * 65536 + (s & 1) * 1024));
@@ -1116,6 +1192,7 @@ fn precompute_round1_ab_inner_packed_padded_impl(
         ranked_w30_elided: false,
         ab1_hole_layout: false,
         tc_layout: false,
+            tc2_layout: false,
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx512f",
@@ -3794,6 +3871,9 @@ pub(crate) struct WorkerStateAbOnly {
     /// tc: this band's quarter and the eq_hi of the four bands its lanes
     /// carry (`None`: incumbent layout and fold).
     tc_band: Option<(usize, [F128; 4])>,
+    /// tc2: this band's raw slot and the eq_hi of the eight bands its lanes
+    /// carry, index `4h + k` (`None` unless the tc2 layout is read).
+    tc2_band: Option<(usize, [F128; 8])>,
 }
 
 impl WorkerStateAbOnly {
@@ -3810,6 +3890,7 @@ impl WorkerStateAbOnly {
             local_res_ab: [F128::ZERO; ELL],
             ab1_layout: 0,
             tc_band: None,
+            tc2_band: None,
         }
     }
 }
@@ -4403,7 +4484,15 @@ unsafe fn process_one_x_hi_ab_only_direct_x86(
     let wide = r1_eqfold_x4_enabled();
     if wide {
         unsafe {
-            if let Some((q, eq4)) = state.tc_band {
+            if let Some((j, eq8)) = state.tc2_band {
+                kernels::x86_64::fold_ab_plane_banks_tc2_x86_avx512(
+                    &mut state.plane_banks,
+                    eq_bot,
+                    j,
+                    &eq8,
+                    &mut state.local_res_ab,
+                );
+            } else if let Some((q, eq4)) = state.tc_band {
                 kernels::x86_64::fold_ab_plane_banks_tc_x86_avx512(
                     &mut state.plane_banks,
                     eq_bot,
@@ -4422,7 +4511,7 @@ unsafe fn process_one_x_hi_ab_only_direct_x86(
         }
         return;
     }
-    assert!(state.tc_band.is_none(), "tc layout requires the wide plane fold");
+    assert!(state.tc_band.is_none() && state.tc2_band.is_none(), "tc layout requires the wide plane fold");
     fold_ab_plane_banks_fallback_cold(state, eq_bot, eq_hi_val, wide);
 }
 
@@ -4543,7 +4632,23 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed_idle(
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
     ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
-    let r_outer = &r[k_skip + N_INNER..];
+    // tc2: the storage exchanges row bits 10 and 11 (w bit 4 and x_hi bit 0
+    // at the ranked shape, n_lo = 12), so every table below is built from
+    // r_outer with coordinates 11 and 12 exchanged. eq is a product of
+    // per-coordinate factors, so each storage row gets its true row's weight.
+    let tc2 = ab_inner.tc2_layout && r.len() == k_skip + N_INNER + 19;
+    if ab_inner.tc2_layout && !tc2 {
+        ab_inner.restore_tc_layout();
+    }
+    let r_outer_tc2: Vec<F128>;
+    let r_outer: &[F128] = if tc2 {
+        let mut v = r[k_skip + N_INNER..].to_vec();
+        v.swap(11, 12);
+        r_outer_tc2 = v;
+        &r_outer_tc2
+    } else {
+        &r[k_skip + N_INNER..]
+    };
     let n_hi = r_outer.len().min(SplitEqGhash::MAX_N_HI);
     let n_lo = r_outer.len() - n_hi;
     let big_lo_size = 1usize << n_lo;
@@ -4727,6 +4832,13 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed_idle(
     let tc_bands = ab_inner.tc_layout && ab1_leaf_ok && hi_size == 128 && r1_eqfold_x4_enabled();
     if ab_inner.tc_layout && !tc_bands {
         ab_inner.restore_tc_layout();
+        if tc2 {
+            // Tables above used the exchanged challenges: rebuild them for
+            // the canonical rows (cold: kill switches and gate mismatches).
+            return round1_shift_reduce_ab_packed_padded_with_precomputed_idle(
+                ab_inner, a_packed, b_packed, m, k_skip, r, inv_table, padding, idle,
+            );
+        }
     }
     if ab_inner.ab1_hole_layout && !ab1_leaf_ok {
         ab_inner.restore_ab1_hole_layout();
@@ -4746,7 +4858,13 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed_idle(
     let band = |state: &mut WorkerStateAbOnly, x_hi: usize| {
         crate::rstrace::evd("ab:b", x_hi as u32);
         state.ab1_layout = ab1_layout;
-        state.tc_band = tc_bands.then(|| {
+        // tc2: band x holds raw slot j = 2 (x >> 5) + (x & 1); lane 2k + h
+        // of each line belongs to storage band (x & 30) | h | k << 5.
+        state.tc2_band = (tc_bands && tc2).then(|| {
+            let b = x_hi & 30;
+            (2 * (x_hi >> 5) + (x_hi & 1), core::array::from_fn(|i| eq_hi[b | (i >> 2) | (i & 3) << 5]))
+        });
+        state.tc_band = (tc_bands && !tc2).then(|| {
             let x0 = x_hi & 31;
             (x_hi >> 5, [eq_hi[x0], eq_hi[x0 + 32], eq_hi[x0 + 64], eq_hi[x0 + 96]])
         });
@@ -7295,5 +7413,87 @@ mod ab_batch4_worker_tests {
         drop(recycled);
         println!("actual direct-worker integration matched incumbent planes + scalar collapse; batch4_enabled={}",
                  zc_r1_ab_batch4_enabled());
+    }
+}
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64", target_feature = "avx512f",
+          target_feature = "avx512bw", target_feature = "avx512vbmi",
+          target_feature = "vpclmulqdq", target_feature = "gfni"))]
+mod tc2_layout_tests {
+    use super::*;
+
+    fn next(s: &mut u64) -> u64 {
+        *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; *s
+    }
+
+    /// Canonical ranked compact rows -> the tc2 storage (the producer's map:
+    /// octa pair e, slot j, raw byte 4(2y + h) + k = lane 2k + h, byte 8j + y).
+    fn apply_tc2(bytes: &mut [u8]) {
+        let src = bytes.to_vec();
+        for o in 0..1usize << 14 {
+            let b_base = (o & 1023) | ((o >> 10) << 12);
+            for e in 0..2 {
+                for j in 0..8 {
+                    let srow = ab1_row_offset(b_base + e * 1024 + (j & 1) * 2048 + (j >> 1) * 65536);
+                    for w in 0..AB1_ROW_LIVE / ELL {
+                        for y in 0..8 {
+                            for h in 0..2 {
+                                for k in 0..4 {
+                                    let trow = ab1_row_offset(b_base + e * 2048 + h * 1024 + k * 65536);
+                                    bytes[srow + w * ELL + 4 * (2 * y + h) + k] = src[trow + w * ELL + 8 * j + y];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn ranked_inner(fill: &[u8]) -> Round1AbInner {
+        let mut inner = Round1AbInner::take_ranked_compact_uninit(1usize << 29);
+        inner.set_ranked_one_rows_elided();
+        inner.set_ranked_w30_elided();
+        inner.set_ab1_hole_layout();
+        inner.as_bytes_mut().copy_from_slice(fill);
+        inner
+    }
+
+    /// The round-one AB message from the tc2 storage (raw lines, row bits
+    /// 10/11 exchanged, challenges 11/12 exchanged, tc2 band fold) equals
+    /// the message from the canonical rows; the cold restore inverts the
+    /// producer map exactly.
+    #[test]
+    fn tc2_ab_message_matches_canonical_layout() {
+        use crate::challenger::Challenger;
+        let n = (1usize << 18) * RANKED_AB_COMPACT_BLOCK_BYTES;
+        let mut seed = 0x7c2_5eedu64;
+        let mut canon = vec![0u8; n];
+        for c in canon.chunks_mut(8) {
+            let v = next(&mut seed).to_le_bytes();
+            c.copy_from_slice(&v[..c.len()]);
+        }
+        let mut tc2 = canon.clone();
+        apply_tc2(&mut tc2);
+        let a = vec![0u8; 1usize << 29];
+        let b = vec![0u8; 1usize << 29];
+        let inv = super::super::build_urm_inv_table(K_SKIP);
+        let padding = PaddingSpec { k_log: 14, useful_bits_per_block: 15409 };
+        let mut rng = crate::challenger::RandomChallenger::new(0x7c2_0001);
+        let r = rng.sample_f128_vec(32);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+        let mut inner = ranked_inner(&canon);
+        let want = pool.install(|| round1_shift_reduce_ab_packed_padded_with_precomputed(
+            &mut inner, &a, &b, 32, K_SKIP, &r, &inv, &padding));
+        drop(inner);
+        let mut inner = ranked_inner(&tc2);
+        inner.set_tc2_layout();
+        let got = pool.install(|| round1_shift_reduce_ab_packed_padded_with_precomputed(
+            &mut inner, &a, &b, 32, K_SKIP, &r, &inv, &padding));
+        assert!(inner.tc2_layout(), "the tc2 band fold must have run");
+        assert_eq!(got, want);
+        inner.restore_tc_layout();
+        assert!(!inner.tc_layout() && !inner.tc2_layout());
+        assert!(inner.as_bytes() == canon.as_slice(), "restore must invert the tc2 map");
     }
 }

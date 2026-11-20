@@ -417,14 +417,22 @@ fn finalize_cpu_commit(
     let super_ok = std::sync::atomic::AtomicBool::new(sl2_super);
     crate::rstrace::ev("fc:enc", 0);
     let t_ntt = std::time::Instant::now();
-    // `encode` reports whether the codeword rows were stored page-blocked;
-    // the hashing callback below sees logical leaf ranges either way.
+    let cw_addr = codeword.as_ptr() as usize;
+    let cw_len = codeword.len();
+    // Tiled callbacks borrow a complete retired subgroup. Other layouts pass
+    // contiguous logical rows directly.
     let blocked = encode(
         &mut codeword,
         &|range, sub_data| {
+            let layout = crate::ntt::additive_ntt_f128::L0Rows::at(cw_addr as *const F128, cw_len);
+            let canonical = if layout.is_tiled() {
+                layout.rows(sub_data, range.start % 2048, range.len(), num_ntts)
+            } else {
+                std::borrow::Cow::Borrowed(sub_data)
+            };
+            let sub_data = canonical.as_ref();
             debug_assert_eq!(sub_data.len(), range.len() * num_ntts);
-            // Zero-copy: F128 is repr(C, align(16)) lo||hi LE — same bytes as
-            // the one-shot `merkle_tree` cast in the previous barrier path.
+            // F128 is repr(C, align(16)) lo||hi LE, matching merkle_tree's bytes.
             let bytes: &[u8] = unsafe {
                 core::slice::from_raw_parts(
                     sub_data.as_ptr() as *const u8,
@@ -592,7 +600,9 @@ fn finalize_cpu_commit(
         );
     }
     crate::rstrace::ev("cm:encoded", 0);
-    crate::ntt::additive_ntt_f128::note_l0_layout(codeword.as_ptr(), codeword.len(), blocked);
+    if !crate::ntt::additive_ntt_f128::L0Rows::of(&codeword).is_tiled() {
+        crate::ntt::additive_ntt_f128::note_l0_layout(codeword.as_ptr(), codeword.len(), blocked);
+    }
     let t_merkle = std::time::Instant::now();
     let folded = match local_levels.load(Ordering::Acquire) {
         usize::MAX | 0 => 0,
