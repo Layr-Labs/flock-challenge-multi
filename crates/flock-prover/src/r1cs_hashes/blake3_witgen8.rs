@@ -1241,6 +1241,11 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const<
 }
 
 const RING_WORDS: usize = 32;
+/// st1: pair two ring words into one 64-byte zmm store (on; build-time env
+/// `NO_ST1_ZP=1` restores one 32-byte store per word). Same ring bytes.
+const ST1_ZP: bool = match option_env!("NO_ST1_ZP") { Some(x) => x.as_bytes()[0] != b'1', None => true };
+#[repr(C, align(64))]
+struct Ring64([V8; RING_WORDS]);
 /// Words the pre-round prologue fills, starting at word 16.
 const PROLOGUE_WORDS: usize = 20;
 /// Ranked static windows whose B side is supplied without reading the ring.
@@ -1324,6 +1329,29 @@ mod xor_projection;
 /// ab_inner layout (see `xor_projection`). The pipelined producer brands
 /// ab_inner with it only when this holds and every window 2..=29 of every
 /// octa is projected there ([`window_seed_projection_eligible`]).
+/// tc2: whether the tc projection also stores raw accumulators at the
+/// bit-swapped rows (see `xor_projection::tc2_layout_active`).
+pub(crate) fn tc2_layout_active() -> bool {
+    #[cfg(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
+    {
+        xor_projection::tc2_layout_active() && *SB1_DEFER_ON
+    }
+    #[cfg(not(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    )))]
+    {
+        false
+    }
+}
+
 pub(crate) fn tc_layout_active() -> bool {
     #[cfg(all(
         target_feature = "avx512f",
@@ -1775,6 +1803,7 @@ fn packer_high_to_low<const BACK: i32>(pending: V8) -> V8 {
 /// incumbent low-aligned `pending` representation.
 struct W8<'t, const FLUSH: bool, const RANKED_CLOSED: bool = false, const WINDOW_COLS:usize=0> {
     pending: V8,
+    held: V8,
     stage: *mut V8,
     drain: *mut Drain8<'t>,
     ranked_static: bool,
@@ -1785,6 +1814,7 @@ impl<'t, const FLUSH: bool, const RANKED_CLOSED: bool, const WINDOW_COLS:usize> 
     fn at(stage: *mut V8, pending: V8, drain: *mut Drain8<'t>, ranked_static: bool) -> Self {
         Self {
             pending,
+            held: pending,
             stage,
             drain,
             ranked_static,
@@ -1805,7 +1835,13 @@ impl<'t, const FLUSH: bool, const RANKED_CLOSED: bool, const WINDOW_COLS:usize> 
             let static_b = FLUSH
                 && (WORD < RANKED_STATIC_B_PREFIX_END || WORD >= RANKED_STATIC_B_TAIL_START)
                 && is_ranked_static;
-            if !static_b {
+            if !static_b && RANKED_CLOSED && ST1_ZP && WORD % 2 == 0 {
+                // Even word: hold it; the odd partner stores the full 64-byte line.
+                self.held = v;
+            } else if !static_b && RANKED_CLOSED && ST1_ZP {
+                let line = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(self.held), v);
+                _mm512_store_si512(self.stage.add((WORD - 1) & (RING_WORDS - 1)).cast(), line);
+            } else if !static_b {
                 store_v8(self.stage.add(WORD & (RING_WORDS - 1)) as *mut u32, v);
             }
             if FLUSH && WORD % RING_WORDS == RING_WORDS - 1 {
@@ -2046,21 +2082,39 @@ pub(crate) struct AbPend {
     pub(crate) stride: usize,
     pub(crate) cq: bool,
     pub(crate) live: bool,
+    /// tc2: the pending lines use [`tc2_lane_offset`] from `base`.
+    pub(crate) tc2: bool,
+    /// tc2: start of storage row `pi(b)` (row bits 10 and 11 of the octa's
+    /// first row `b` exchanged), set by the octa's producer; null keeps tc.
+    pub(crate) tc2_base: *mut u8,
 }
 impl AbPend {
     pub(crate) const fn new() -> Self {
-        Self { v: [[0; 64]; 8], base: core::ptr::null_mut(), stride: 0, cq: false, live: false }
+        Self { v: [[0; 64]; 8], base: core::ptr::null_mut(), stride: 0, cq: false, live: false, tc2: false, tc2_base: core::ptr::null_mut() }
     }
+}
+/// tc2: storage row of raw slot `j` relative to `pi(b)`.
+#[inline(always)]
+pub(crate) const fn tc2_lane_offset(j: usize) -> usize {
+    (j >> 1) * 65536 + (j & 1) * 2048
+}
+/// tc2: storage row of octa row `b` (bits 10 and 11 exchanged; bit 10 of an
+/// octa's first row is clear).
+#[inline(always)]
+pub(crate) const fn tc2_octa_row(b: usize) -> usize {
+    debug_assert!(b & 1024 == 0);
+    (b & !2048) | ((b >> 1) & 1024)
 }
 pub(crate) static SB1_DEFER_ON: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SB1_DEFER").is_none());
 /// Stream one pending ab_inner line `j` (caller checked `live`).
 #[cfg(target_feature = "avx512f")]
 #[inline(always)]
-pub(crate) unsafe fn ab_pend_one(p: *mut AbPend, j: usize) {
+pub(crate) unsafe fn ab_pend_one<const TC2: bool>(p: *mut AbPend, j: usize) {
     unsafe {
         let v = _mm512_load_si512((*p).v.as_ptr().add(j).cast());
-        _mm512_stream_si512((*p).base.add(compression_lane_offset(j, (*p).cq) * (*p).stride).cast(), v);
+        let rows = if TC2 { tc2_lane_offset(j) } else { compression_lane_offset(j, (*p).cq) };
+        _mm512_stream_si512((*p).base.add(rows * (*p).stride).cast(), v);
     }
 }
 /// Stream every pending line (end of an octa); a no-op when nothing is pending.
@@ -2068,7 +2122,11 @@ pub(crate) unsafe fn ab_pend_one(p: *mut AbPend, j: usize) {
 pub(crate) unsafe fn flush_ab_pend(p: *mut AbPend) {
     unsafe {
         if !p.is_null() && (*p).live {
-            for j in 0..8 { ab_pend_one(p, j); }
+            if (*p).tc2 {
+                for j in 0..8 { ab_pend_one::<true>(p, j); }
+            } else {
+                for j in 0..8 { ab_pend_one::<false>(p, j); }
+            }
             (*p).live = false;
         }
     }
@@ -3205,8 +3263,8 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool,
         ];
 
         let zero = dup_u32(0);
-        let mut ast = core::mem::MaybeUninit::<[V8; RING_WORDS]>::uninit();
-        let mut bs = core::mem::MaybeUninit::<[V8; RING_WORDS]>::uninit();
+        let mut ast = core::mem::MaybeUninit::<Ring64>::uninit();
+        let mut bs = core::mem::MaybeUninit::<Ring64>::uninit();
         let ast = ast.as_mut_ptr().cast::<V8>();
         let bs = bs.as_mut_ptr().cast::<V8>();
 
