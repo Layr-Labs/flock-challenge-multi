@@ -92,13 +92,34 @@ pub(super) fn butterfly_fused_2layer(
     t_inner_a: F128,
     t_inner_b: F128,
 ) {
+    butterfly_fused_2layer_with_off(a, b, c, d, t_outer, t_inner_a, t_inner_b, low_twiddle_disabled());
+}
+
+/// `FLOCK_NO_LOW_TWIDDLE`, for callers that read it once per block and pass it
+/// to [`butterfly_fused_2layer_with_off`].
+#[inline]
+pub(super) fn low_twiddle_off() -> bool {
+    low_twiddle_disabled()
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) fn butterfly_fused_2layer_with_off(
+    a: &mut [F128],
+    b: &mut [F128],
+    c: &mut [F128],
+    d: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+    off: bool,
+) {
     debug_assert_eq!(a.len(), b.len());
     debug_assert_eq!(a.len(), c.len());
     debug_assert_eq!(a.len(), d.len());
 
     // The two layers carry independent twiddles, so specialize them
     // independently: the pair is dispatched once here, never per lane.
-    let off = low_twiddle_disabled();
     let outer_low = t_outer.hi == 0 && !off;
     let inner_low = t_inner_a.hi == 0 && t_inner_b.hi == 0 && !off;
 
@@ -218,6 +239,88 @@ pub(super) unsafe fn butterfly_fused_2layer_publish_nt<const ALIGNED_ZMM: bool>(
             }
             (true, true) => {
                 x86_64::butterfly_fused_2layer_publish_nt_gen::<true, true, ALIGNED_ZMM>(
+                    src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+                )
+            }
+        }
+    }
+}
+
+/// Hoisted publish2 dispatch: `true` when both process-cached switches read by
+/// [`butterfly_fused_2layer_publish_nt`] on every quad (`FLOCK_NO_LOW_TWIDDLE`
+/// and the x86 leaf's `FLOCK_NO_NTT_MUL_DIET`) are unset, i.e. the ranked
+/// default. Callers read it once per publish block and then use
+/// [`butterfly_fused_2layer_publish_nt_hot`] for every quad; otherwise they keep
+/// the per-quad dispatch unchanged.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) fn publish_nt_hot_enabled() -> bool {
+    !low_twiddle_disabled() && !x86_64::mul_diet_disabled()
+}
+
+/// [`butterfly_fused_2layer_publish_nt`] with its two process-cached switch
+/// reads hoisted to the caller (see [`publish_nt_hot_enabled`]).
+///
+/// With both switches unset, the per-quad wrapper computes
+/// `outer_low = t_outer.hi == 0`, `inner_low = t_inner_a.hi == 0 &&
+/// t_inner_b.hi == 0`, and its leaf `publish_nt_gen` then takes
+/// `publish_nt_impl::<outer_low, inner_low, DIET = true, ALIGNED_ZMM>` with the
+/// same ten arguments. This calls exactly that instantiation with exactly those
+/// arguments, so the arithmetic, the lane count, the `ZT_SKIP` / `ZT_POISON`
+/// tail flags carried above it, and every store are unchanged.
+///
+/// # Safety
+/// [`butterfly_fused_2layer_publish_nt`]'s contract, and the caller observed
+/// [`publish_nt_hot_enabled`] returning `true`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_publish_nt_hot<const ALIGNED_ZMM: bool>(
+    src: *const F128,
+    src_step: usize,
+    dst_a: *mut F128,
+    dst_b: *mut F128,
+    dst_c: *mut F128,
+    dst_d: *mut F128,
+    lanes: usize,
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    debug_assert!(publish_nt_hot_enabled());
+    debug_assert!(lanes & 0xff == 60 || lanes == 64);
+    debug_assert!(!ALIGNED_ZMM || dst_a as usize % 64 == 0);
+    let outer_low = t_outer.hi == 0;
+    let inner_low = t_inner_a.hi == 0 && t_inner_b.hi == 0;
+    // SAFETY: forwarded caller contract; the flags are exactly the
+    // zero-high-limb preconditions of the selected specializations.
+    unsafe {
+        match (outer_low, inner_low) {
+            (false, false) => {
+                x86_64::butterfly_fused_2layer_publish_nt_impl::<false, false, true, ALIGNED_ZMM>(
+                    src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+                )
+            }
+            (false, true) => {
+                x86_64::butterfly_fused_2layer_publish_nt_impl::<false, true, true, ALIGNED_ZMM>(
+                    src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+                )
+            }
+            (true, false) => {
+                x86_64::butterfly_fused_2layer_publish_nt_impl::<true, false, true, ALIGNED_ZMM>(
+                    src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+                )
+            }
+            (true, true) => {
+                x86_64::butterfly_fused_2layer_publish_nt_impl::<true, true, true, ALIGNED_ZMM>(
                     src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
                 )
             }

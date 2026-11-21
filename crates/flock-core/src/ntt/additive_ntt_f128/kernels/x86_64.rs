@@ -5,7 +5,7 @@ use crate::field::F128;
 /// The independent fused-three high-one specialization has its own rollback
 /// switches. Read once, outside every lane loop.
 #[inline]
-fn mul_diet_disabled() -> bool {
+pub(super) fn mul_diet_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_MUL_DIET").is_some())
 }
@@ -627,7 +627,7 @@ unsafe fn butterfly_fused_2layer_publish_nt_cold<
 #[allow(clippy::too_many_arguments)]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn butterfly_fused_2layer_publish_nt_impl<
+pub(super) unsafe fn butterfly_fused_2layer_publish_nt_impl<
     const OUTER_LOW: bool,
     const INNER_LOW: bool,
     const DIET: bool,

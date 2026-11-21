@@ -1129,6 +1129,197 @@ pub(crate) unsafe fn generate_tile16_inline(init: u64, tile: usize, out: *mut u8
     }
 }
 
+// c5: shift-free root tiles for the root fold only (round one's C arm and
+// the lincheck). Each BLAKE3 carry word is stored raw (31 roots in bits
+// 0..30) instead of being bit-packed with VPSHLDD/VPSLLD; the fold's
+// reduction maps the columns back to root order (flock_core
+// SHIFT_FREE_BLOCKS). FLOCK_NO_ROOT_SHIFT_FREE=1 keeps the dense tiles.
+const SF_BLOCKS: usize = flock_core::lincheck::SHIFT_FREE_BLOCKS;
+
+pub(crate) fn shift_free_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ROOT_SHIFT_FREE").is_none());
+    *ON
+}
+
+#[inline(always)]
+unsafe fn recompute_pair_tile_sf(prepared: &Prepared16, out: *mut u8) {
+    unsafe {
+        let cv_v = &prepared.cv;
+        let m = &prepared.message;
+        let tlo = prepared.counter_lo;
+        let thi = prepared.counter_hi;
+        let blen = prepared.block_len;
+        let flags = prepared.flags;
+
+        let mut state: [V16; 16] = [
+            cv_v[0],
+            cv_v[1],
+            cv_v[2],
+            cv_v[3],
+            cv_v[4],
+            cv_v[5],
+            cv_v[6],
+            cv_v[7],
+            dup16(BLAKE3_IV[0]),
+            dup16(BLAKE3_IV[1]),
+            dup16(BLAKE3_IV[2]),
+            dup16(BLAKE3_IV[3]),
+            tlo,
+            thi,
+            blen,
+            flags,
+        ];
+
+        let wa = RootW16::new(out, dup16(0));
+        wa.publish(0, cv_v[0], cv_v[1]);
+        wa.publish(1, cv_v[2], cv_v[3]);
+        wa.publish(2, cv_v[4], cv_v[5]);
+        wa.publish(3, cv_v[6], cv_v[7]);
+        let one = dup16(1);
+        let chain: [V16; 18] = [
+            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13],
+            m[14], m[15], tlo, thi,
+        ];
+        // Words 16..33 (wires 512..1087) exactly as the dense stream.
+        let pw = |k: usize| -> V16 {
+            if k == 0 {
+                or16(one, shl16::<1>(chain[0]))
+            } else {
+                or16(shr16::<31>(chain[k - 1]), shl16::<1>(chain[k]))
+            }
+        };
+        wa.publish(4, pw(0), pw(1));
+        wa.publish(5, pw(2), pw(3));
+        wa.publish(6, pw(4), pw(5));
+        wa.publish(7, pw(6), pw(7));
+        wa.publish(8, pw(8), pw(9));
+        wa.publish(9, pw(10), pw(11));
+        wa.publish(10, pw(12), pw(13));
+        wa.publish(11, pw(14), pw(15));
+        wa.publish(12, pw(16), pw(17));
+        core::arch::asm!("", options(nostack, preserves_flags));
+
+        macro_rules! g {
+            ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
+             $mx:literal, $my:literal) => {{
+                let grp = 13 + 3 * ($g);
+                let (t0, p0) = add_root16(state[$la], state[$lb]);
+                let (a1, p1) = add_root16(t0, m[$mx]);
+                // Group 13's spare bit 31 carries the counter wire 1088
+                // (bit 31 of the high counter word).
+                let p0 = if ($g) == 0 { RootW16::select(0x8000_0000, thi, p0) } else { p0 };
+                wa.publish(grp, p0, p1);
+                let d1 = xor_rotr16::<16, 16>(state[$ld], a1);
+                let (c1s, p2) = add_root16(state[$lc], d1);
+                let b1 = xor_rotr16::<12, 20>(state[$lb], c1s);
+                let (t1, p3) = add_root16(a1, b1);
+                wa.publish(grp + 1, p2, p3);
+                let (a2, p4) = add_root16(t1, m[$my]);
+                let d2 = xor_rotr16::<8, 24>(d1, a2);
+                let (c2s, p5) = add_root16(c1s, d2);
+                wa.publish(grp + 2, p4, p5);
+                // Keep this G's stores in place: without a barrier LLVM sinks
+                // all 181 publishes to the end and spills every carry word.
+                core::arch::asm!("", options(nostack, preserves_flags));
+                let bn = xor_rotr16::<7, 25>(b1, c2s);
+                state[$la] = a2;
+                state[$lb] = bn;
+                state[$lc] = c2s;
+                state[$ld] = d2;
+            }};
+        }
+        macro_rules! round {
+            ($gb:literal, $m0:literal, $m1:literal, $m2:literal, $m3:literal,
+             $m4:literal, $m5:literal, $m6:literal, $m7:literal,
+             $m8:literal, $m9:literal, $m10:literal, $m11:literal,
+             $m12:literal, $m13:literal, $m14:literal, $m15:literal) => {{
+                g!($gb, 0, 4, 8, 12, $m0, $m1);
+                g!($gb + 1, 1, 5, 9, 13, $m2, $m3);
+                g!($gb + 2, 2, 6, 10, 14, $m4, $m5);
+                g!($gb + 3, 3, 7, 11, 15, $m6, $m7);
+                g!($gb + 4, 0, 5, 10, 15, $m8, $m9);
+                g!($gb + 5, 1, 6, 11, 12, $m10, $m11);
+                g!($gb + 6, 2, 7, 8, 13, $m12, $m13);
+                g!($gb + 7, 3, 4, 9, 14, $m14, $m15);
+            }};
+        }
+        round!(0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        round!(8, 2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8);
+        round!(16, 3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1);
+        round!(24, 10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6);
+        round!(32, 12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4);
+        round!(40, 9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7);
+        round!(48, 11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13);
+        let _ = (blen, flags, state);
+    }
+}
+
+/// # Safety
+/// `out` exclusively owns one 64-byte-aligned SF_BLOCKS*512-byte tile.
+pub(crate) unsafe fn generate_tile16_sf(init: u64, tile: usize, out: *mut u8) {
+    #[repr(C,align(64))] struct StackAnchor([u8;64]);
+    let mut aligned=core::mem::MaybeUninit::<StackAnchor>::uninit();
+    core::hint::black_box(aligned.as_mut_ptr());
+    assert!(tile < 4096);
+    unsafe {
+        for pair in 0..4 {
+            let physical = tile * 64 + pair * 16;
+            let base = physical / 256 + ((physical % 256) / 8) * 2048;
+            let input = prepare16(init, base);
+            recompute_pair_tile_sf(&input, out.add(pair * 128));
+        }
+    }
+}
+
+#[cfg(test)]
+mod shift_free_validation {
+    use super::*;
+    #[repr(C, align(64))]
+    struct SfTile([u8; SF_BLOCKS * 512]);
+    fn bits(tile: &[u8], group: usize, c: usize) -> u64 {
+        let pair = c / 16;
+        let l = c % 16;
+        let off = group * 512 + pair * 128 + (l / 8) * 64 + (l % 8) * 4;
+        let lo = u32::from_le_bytes(tile[off..off + 4].try_into().unwrap());
+        let hi = u32::from_le_bytes(tile[off + 32..off + 36].try_into().unwrap());
+        u64::from(lo) | (u64::from(hi) << 32)
+    }
+    fn sf_pos(r: usize) -> (usize, usize) {
+        if r < 832 {
+            (r / 64, r % 64)
+        } else if r == 832 {
+            (13, 31)
+        } else {
+            let q = r - 833;
+            let (g, k, i) = (q / 186, (q % 186) / 31, q % 31);
+            (13 + 3 * g + k / 2, 32 * (k % 2) + i)
+        }
+    }
+    #[test]
+    fn shift_free_tile_matches_dense_roots() {
+        assert_eq!(SF_BLOCKS, 181);
+        let mut dense = Box::new(Tile([0xa5; 176 * 512]));
+        let mut sf = Box::new(SfTile([0x5a; SF_BLOCKS * 512]));
+        for seed in [0u64, 0x1234_5678_9abc_def0, u64::MAX] {
+            for tile in [0usize, 1, 3, 4, 31, 127, 1024, 2047, 4095] {
+                unsafe {
+                    generate_tile16_inline(seed, tile, dense.0.as_mut_ptr());
+                    generate_tile16_sf(seed, tile, sf.0.as_mut_ptr());
+                }
+                for c in 0..64 {
+                    for r in 0..DIRECT_BITS {
+                        let d = (bits(&dense.0, r / 64, c) >> (r % 64)) & 1;
+                        let (g, b) = sf_pos(r);
+                        let x = (bits(&sf.0, g, c) >> b) & 1;
+                        assert_eq!(d, x, "seed {seed:x} tile {tile} c {c} root {r}");
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn selected_generator() -> Option<(
     unsafe fn(u64, usize, *mut u8),
     Option<flock_core::lincheck::RootPairGenerator>,

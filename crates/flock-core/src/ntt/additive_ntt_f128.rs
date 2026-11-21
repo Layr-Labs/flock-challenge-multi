@@ -3927,6 +3927,77 @@ impl AdditiveNttF128 {
         tw2_block: &[[F128; 3]; 16],
         blocked: bool,
     ) {
+        // The per-quad wrapper reads two process-cached switches (low
+        // twiddle, mul diet) on every one of the sixteen quads. Read them once
+        // per block instead. Ranked default (both unset): the loop below calls
+        // the same leaf instantiation with the same arguments as the wrapper
+        // would. Otherwise the record's per-quad loop runs, unchanged and out
+        // of line, so this body keeps a single leaf family.
+        if !kernels::publish_nt_hot_enabled() {
+            // SAFETY: forwarded unchanged.
+            unsafe {
+                self.seed_top_publish2_block_rec::<ALIGNED_ZMM>(
+                    region, base, block, row_len, block_size, sub_stride, r, lanes2, stage_perm,
+                    tw2_block, blocked,
+                );
+            }
+            return;
+        }
+        let g2_stride: usize = if stage_perm { 16 } else { 1 };
+        // SAFETY: forwarded exact-ranked-shape contract. Each m quad is the
+        // final consumer of its four staging rows, and the 16 quads partition
+        // this block's 64 logical rows.
+        unsafe {
+            for (m, &[t_outer, t_inner_a, t_inner_b]) in tw2_block.iter().enumerate() {
+                let k = 4 * m;
+                let p = region.add(seed_top_stage_row(k, stage_perm) * row_len);
+                let step = g2_stride * row_len;
+                let dst = |k: usize| {
+                    base.add(
+                        codeword_row(seed_top_codeword_row(block, r, k, block_size, sub_stride), blocked)
+                            * row_len,
+                    )
+                };
+                kernels::butterfly_fused_2layer_publish_nt_hot::<ALIGNED_ZMM>(
+                    p,
+                    step,
+                    dst(k),
+                    dst(k + 1),
+                    dst(k + 2),
+                    dst(k + 3),
+                    lanes2,
+                    t_outer,
+                    t_inner_a,
+                    t_inner_b,
+                );
+            }
+        }
+    }
+
+    /// Record path of [`Self::seed_top_publish2_block`]: per-quad switch reads,
+    /// taken only when `FLOCK_NO_LOW_TWIDDLE` or `FLOCK_NO_NTT_MUL_DIET` is set.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    #[cold]
+    #[inline(never)]
+    unsafe fn seed_top_publish2_block_rec<const ALIGNED_ZMM: bool>(
+        &self,
+        region: *mut F128,
+        base: *mut F128,
+        block: usize,
+        row_len: usize,
+        block_size: usize,
+        sub_stride: usize,
+        r: usize,
+        lanes2: usize,
+        stage_perm: bool,
+        tw2_block: &[[F128; 3]; 16],
+        blocked: bool,
+    ) {
         let g2_stride: usize = if stage_perm { 16 } else { 1 };
         // SAFETY: forwarded exact-ranked-shape contract. Each m quad is the
         // final consumer of its four staging rows, and the 16 quads partition
@@ -7022,6 +7093,13 @@ impl Seed6Plan {
                 // reload pass. Same butterflies, twiddles and per-element
                 // order. The zero-chain group keeps its dedicated kernel.
                 let direct = NT && nn == 64 && dst as usize % 64 == 0 && !s6_publish_fuse_disabled();
+                // Read the publish leaf's two process-cached switches once per
+                // block instead of once per quad (see `publish_nt_hot_enabled`).
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                let hot = kernels::publish_nt_hot_enabled();
+                #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+                let hot = false;
+                let lt_off = kernels::low_twiddle_off();
                 for j in 0..4 {
                     let tw = &tw4[4 * b + j];
                     let zero_chain = tw[0] == F128::ZERO
@@ -7036,12 +7114,28 @@ impl Seed6Plan {
                     let grp = cur.add(16 * j * nn);
                     let row = |i: usize| core::slice::from_raw_parts_mut(grp.add(i * nn), nn);
                     for m in 0..4 {
-                        kernels::butterfly_fused_2layer(
-                            row(m), row(m + 4), row(m + 8), row(m + 12), tw[0], tw[1], tw[2],
+                        kernels::butterfly_fused_2layer_with_off(
+                            row(m), row(m + 4), row(m + 8), row(m + 12), tw[0], tw[1], tw[2], lt_off,
                         );
                     }
                     let to = |i: usize| dst.add((b * 4 * q + j * q + i * s16 + r) * num_ntts);
                     for p in 0..4 {
+                        if hot {
+                            #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                            kernels::butterfly_fused_2layer_publish_nt_hot::<true>(
+                                grp.add(4 * p * nn),
+                                nn,
+                                to(4 * p),
+                                to(4 * p + 1),
+                                to(4 * p + 2),
+                                to(4 * p + 3),
+                                nn,
+                                tw[3 + p],
+                                tw[7 + 2 * p],
+                                tw[8 + 2 * p],
+                            );
+                            continue;
+                        }
                         kernels::butterfly_fused_2layer_publish_nt::<true>(
                             grp.add(4 * p * nn),
                             nn,
