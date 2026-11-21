@@ -5,7 +5,7 @@
 // Clobbers: RAX, flags, ZMM0..11. Preserves every other GPR and ZMM12..31.
 // Called ONLY by the matching inline-asm wrapper, never through the C ABI.
 // No vzeroupper: the upper lanes of ZMM12..15 belong to the caller.
-.text
+.section .text.r345,"ax",@progbits
 .p2align 6
 .globl flock_gfni_c4_lm_register_result_m
 .hidden flock_gfni_c4_lm_register_result_m
