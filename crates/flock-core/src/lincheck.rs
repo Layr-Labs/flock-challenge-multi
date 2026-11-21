@@ -764,7 +764,7 @@ pub use root_tile_cache::RootTileCache as WitnessRootTiles;
     target_feature = "gfni",
     target_feature = "vpclmulqdq"
 ))]
-pub use root_tile_cache::{WitnessTileView, RootPairGenerator};
+pub use root_tile_cache::{WitnessTileView, RootPairGenerator, SHIFT_FREE_BLOCKS};
 
 pub struct RootFoldSource {
     plan: &'static LinearFoldPlan,
@@ -2078,8 +2078,22 @@ pub enum VerifyError {
 /// Standard "doubling-in-half" construction: `O(2^d)` F128 muls, no
 /// inversions. Indexing is LSB-first — `bit_j(i)` is the `j`-th LSB of `i`.
 pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
+    let mut out = crate::alloc_uninit_vec::<F128>(1usize << point.len());
+    build_eq_table_fill(point, &mut out);
+    out
+}
+
+pub(crate) fn build_eq_table_into(point: &[F128], out: &mut Vec<F128>) {
+    let n = 1usize << point.len();
+    out.clear();
+    out.resize(n, F128::ZERO);
+    build_eq_table_fill(point, out);
+}
+
+#[inline]
+fn build_eq_table_fill(point: &[F128], out: &mut [F128]) {
     let d = point.len();
-    let mut out = crate::alloc_uninit_vec::<F128>(1usize << d);
+    debug_assert_eq!(out.len(), 1usize << d);
     out[0] = F128::ONE;
     for (j, &r_j) in point.iter().enumerate() {
         let len = 1usize << j;
@@ -2106,7 +2120,6 @@ pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
             out[i] = v + hi;
         }
     }
-    out
 }
 
 /// Expand four adjacent entries of an eq table with one four-lane GHASH
@@ -4815,6 +4828,51 @@ fn gl1_lc_team_min() -> usize {
 
 const GL1_LC_CHUNKS: usize = 16;
 
+fn lc_capture_move_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_CAPTURE_MOVE").is_none());
+    *ON
+}
+
+fn gl1_bind_both_and_eval_next_team_zout(
+    comb: &mut Vec<F128>,
+    z: &[F128],
+    r: F128,
+) -> ((F128, F128), Vec<F128>) {
+    let len = comb.len();
+    debug_assert_eq!(z.len(), len);
+    let half = len / 2;
+    let half2 = half / 2;
+    let ch = half2 / GL1_LC_CHUNKS;
+    let mut z_next: Vec<F128> = Vec::with_capacity(half);
+    let (cp, zp, op) = (comb.as_mut_ptr() as usize, z.as_ptr() as usize, z_next.as_mut_ptr() as usize);
+    let out = crate::flat_par::team_map_reduce(
+        GL1_LC_CHUNKS,
+        |i| {
+            let s = i * ch;
+            // SAFETY: chunk `i` writes only slots [s, s+ch) of the two low
+            unsafe {
+                let c = cp as *mut F128;
+                let zz = zp as *const F128;
+                let o = op as *mut F128;
+                let m = |p: *mut F128, o: usize| core::slice::from_raw_parts_mut(p.add(o), ch);
+                let r_ = |p: *const F128, o: usize| core::slice::from_raw_parts(p.add(o), ch);
+                crate::field::f128_slice::bind_both_and_msg_split_zout(
+                    m(c, s), m(c, half2 + s), r_(c as *const F128, half + s), r_(c as *const F128, half + half2 + s),
+                    r_(zz, s), r_(zz, half2 + s), r_(zz, half + s), r_(zz, half + half2 + s),
+                    m(o, s), m(o, half2 + s),
+                    r, ch,
+                )
+            }
+        },
+        || (F128::ZERO, F128::ZERO),
+        |a, b| (a.0 + b.0, a.1 + b.1),
+    );
+    unsafe { z_next.set_len(half) };
+    comb.truncate(half);
+    (out, z_next)
+}
+
 /// [`sumcheck_round_eval_par`] on the spinning team (x4 leaves).
 fn gl1_round_eval_team(c: &[F128], z: &[F128]) -> (F128, F128) {
     let half = c.len() / 2;
@@ -5739,6 +5797,11 @@ fn prove_padded_inner<Ch: Challenger>(
             sumcheck_round_eval_par(&comb_vec, &z_vec)
         };
         crate::rstrace::ev("lc:sc:r0", 0);
+        let oop_t1 = fold8_ready
+            && lc_capture_move_enabled()
+            && inner_rest_len > 2
+            && z_vec.len() == comb_vec.len()
+            && gl1_ok(z_vec.len() / 2);
         for t in 0..inner_rest_len {
             challenger.observe_f128(e1);
             challenger.observe_f128(einf);
@@ -5747,7 +5810,11 @@ fn prove_padded_inner<Ch: Challenger>(
             r_rounds.push(r);
             if t + 1 < inner_rest_len {
                 // Fused: bind both tables at r AND compute round (t+1)'s message.
-                let (ne1, neinf) = if gl1_ok(comb_vec.len()) && comb_vec.len() == z_vec.len() {
+                let (ne1, neinf) = if oop_t1 && t == 1 {
+                    let (m, z_next) = gl1_bind_both_and_eval_next_team_zout(&mut comb_vec, &z_vec, r);
+                    captured_z_vec = Some(std::mem::replace(&mut z_vec, z_next));
+                    m
+                } else if gl1_ok(comb_vec.len()) && comb_vec.len() == z_vec.len() {
                     gl1_bind_both_and_eval_next_team(&mut comb_vec, &mut z_vec, r)
                 } else {
                     sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r)
@@ -5759,7 +5826,7 @@ fn prove_padded_inner<Ch: Challenger>(
                 sumcheck_bind_top_in_place_par(&mut comb_vec, r);
                 sumcheck_bind_top_in_place_par(&mut z_vec, r);
             }
-            if fold8_ready && t == 0 {
+            if fold8_ready && t == 0 && !oop_t1 {
                 debug_assert_eq!(z_vec.len(), 64usize << crate::pcs::LOG_PACKING);
                 captured_z_vec = Some(z_vec.clone());
             }

@@ -1154,3 +1154,68 @@ pub(crate) fn bind_both_and_msg_split(
         (e1, einf)
     }
 }
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bind_both_and_msg_split_zout(
+    cq0: &mut [F128],
+    cq1: &mut [F128],
+    cq2: &[F128],
+    cq3: &[F128],
+    zq0: &[F128],
+    zq1: &[F128],
+    zq2: &[F128],
+    zq3: &[F128],
+    zo0: &mut [F128],
+    zo1: &mut [F128],
+    r: F128,
+    n: usize,
+) -> (F128, F128) {
+    assert!(
+        cq0.len() >= n
+            && cq1.len() >= n
+            && cq2.len() >= n
+            && cq3.len() >= n
+            && zq0.len() >= n
+            && zq1.len() >= n
+            && zq2.len() >= n
+            && zq3.len() >= n
+            && zo0.len() >= n
+            && zo1.len() >= n,
+        "fused split bind needs all ten runs"
+    );
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: the cfg gate guarantees the required target features and the
+    // assertion guarantees every quarter covers `n`.
+    return unsafe {
+        x86_64::bind_both_and_msg_split_zout(cq0, cq1, cq2, cq3, zq0, zq1, zq2, zq3, zo0, zo1, r, n)
+    };
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        let mut e1 = F128::ZERO;
+        let mut einf = F128::ZERO;
+        for i in 0..n {
+            let lo = cq0[i] + r * (cq2[i] + cq0[i]);
+            let hi = cq1[i] + r * (cq3[i] + cq1[i]);
+            let zlo = zq0[i] + r * (zq2[i] + zq0[i]);
+            let zhi = zq1[i] + r * (zq3[i] + zq1[i]);
+            cq0[i] = lo;
+            cq1[i] = hi;
+            zo0[i] = zlo;
+            zo1[i] = zhi;
+            e1 += hi * zhi;
+            einf += (hi + lo) * (zhi + zlo);
+        }
+        (e1, einf)
+    }
+}

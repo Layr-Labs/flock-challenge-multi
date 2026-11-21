@@ -283,10 +283,319 @@ pub fn prewarm_prover(m: usize) {
     bufs.par_iter_mut().for_each(|b| {
         crate::collapse_hugepages(b.as_mut_ptr().cast::<u8>(), b.len() * 16);
     });
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let ranges: Vec<(usize, usize)> =
+            bufs.iter_mut().map(|b| (b.as_mut_ptr() as usize, b.len() * 16)).collect();
+        let diag = std::env::var_os("FLOCK_NV_PAGE_DIAG").is_some();
+        if hostfix::enabled() {
+            let found = unsafe { hostfix::repair(&ranges, true) };
+            if diag {
+                eprintln!("[nv-page] hostfix slow-translation regions: {found}");
+            }
+        }
+        if hostlat::enabled() {
+            let spread = unsafe { hostlat::repair(&ranges, true) };
+            if diag {
+                eprintln!("[nv-page] hostlat latency spread p90/p25-1: {spread:.3}");
+            }
+        }
+    }
     for b in bufs {
         give_f128(b);
     }
 }
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod hostlat {
+    const HUGE: usize = 1 << 21;
+    const N: usize = 64;
+
+    pub(super) fn enabled() -> bool {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_XINT_HOSTLAT").is_none());
+        *ON
+    }
+
+    #[inline(always)]
+    fn line(base: usize, x: usize) -> usize {
+        base + x * 32768 + ((x * 13) % 64) * 64
+    }
+
+    ///
+    unsafe fn probe(base: usize) -> u64 {
+        use core::arch::x86_64::{_mm_clflush, _mm_lfence, _mm_mfence, _rdtsc};
+        unsafe {
+            let mut x = 0usize;
+            for _ in 0..N {
+                let next = (5 * x + 1) % N;
+                *(line(base, x) as *mut usize) = line(base, next);
+                x = next;
+            }
+            let mut best = u64::MAX;
+            for _ in 0..2 {
+                for x in 0..N {
+                    _mm_clflush(line(base, x) as *const u8);
+                }
+                _mm_mfence();
+                let mut p = line(base, 0);
+                _mm_lfence();
+                let t0 = _rdtsc();
+                _mm_lfence();
+                for _ in 0..N {
+                    p = core::ptr::read_volatile(p as *const usize);
+                }
+                _mm_lfence();
+                let t1 = _rdtsc();
+                core::hint::black_box(p);
+                best = best.min(t1.wrapping_sub(t0));
+            }
+            for x in 0..N {
+                *(line(base, x) as *mut usize) = 0;
+            }
+            best
+        }
+    }
+
+    unsafe extern "C" {
+        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+        fn munmap(addr: *mut u8, len: usize) -> i32;
+        fn mremap(old: *mut u8, old_len: usize, new_len: usize, flags: i32, new_addr: *mut u8) -> *mut u8;
+        fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    }
+
+    unsafe fn fresh_fast_page(limit: u64, keep: &mut Vec<(usize, usize)>) -> Option<usize> {
+        unsafe {
+            for _ in 0..8 {
+                let m = mmap(core::ptr::null_mut(), 2 * HUGE, 0x1 | 0x2, 0x02 | 0x20, -1, 0);
+                if m as isize == -1 {
+                    return None;
+                }
+                let m = m as usize;
+                let a = m.next_multiple_of(HUGE);
+                let _ = madvise(a as *mut u8, HUGE, 14);
+                std::ptr::write_bytes(a as *mut u8, 0, HUGE);
+                crate::collapse_hugepages(a as *mut u8, HUGE);
+                if probe(a) <= limit {
+                    if a > m {
+                        let _ = munmap(m as *mut u8, a - m);
+                    }
+                    let end = m + 2 * HUGE;
+                    if a + HUGE < end {
+                        let _ = munmap((a + HUGE) as *mut u8, end - a - HUGE);
+                    }
+                    return Some(a);
+                }
+                keep.push((m, 2 * HUGE));
+            }
+            None
+        }
+    }
+
+    ///
+    pub(super) unsafe fn repair(ranges: &[(usize, usize)], fix: bool) -> f64 {
+        let mut regions: Vec<usize> = Vec::new();
+        for &(p, n) in ranges {
+            let mut a = p.next_multiple_of(HUGE);
+            while a + HUGE <= p + n {
+                regions.push(a);
+                a += HUGE;
+            }
+        }
+        if regions.len() < 16 {
+            return 0.0;
+        }
+        let mut ticks = vec![0u64; regions.len()];
+        std::thread::scope(|sc| {
+            for (t, chunk) in ticks.chunks_mut(regions.len().div_ceil(4)).enumerate() {
+                let start = t * regions.len().div_ceil(4);
+                let regs = &regions;
+                sc.spawn(move || {
+                    for (i, slot) in chunk.iter_mut().enumerate() {
+                        *slot = unsafe { probe(regs[start + i]) };
+                    }
+                });
+            }
+        });
+        let mut sorted = ticks.clone();
+        sorted.sort_unstable();
+        let p25 = sorted[sorted.len() / 4].max(1);
+        let p90 = sorted[sorted.len() * 9 / 10];
+        let spread = p90 as f64 / p25 as f64 - 1.0;
+        if !fix {
+            return spread;
+        }
+        let slow = p25 + p25 * 3 / 20;
+        let accept = p25 + p25 / 20;
+        let mut keep: Vec<(usize, usize)> = Vec::new();
+        for (i, &a) in regions.iter().enumerate() {
+            if ticks[i] < slow {
+                continue;
+            }
+            unsafe {
+                if probe(a) < slow {
+                    continue;
+                }
+                let Some(f) = fresh_fast_page(accept, &mut keep) else { break };
+                let r = mremap(f as *mut u8, HUGE, HUGE, 1 | 2, a as *mut u8);
+                if r as usize != a {
+                    keep.push((f, HUGE));
+                    break;
+                }
+            }
+        }
+        for (m, n) in keep {
+            unsafe {
+                let _ = munmap(m as *mut u8, n);
+            }
+        }
+        spread
+    }
+}
+
+///
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod hostfix {
+    use rayon::prelude::*;
+
+    const HUGE: usize = 1 << 21;
+    const LINES: usize = 256;
+    const REPS: usize = 4;
+
+    unsafe extern "C" {
+        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+        fn munmap(addr: *mut u8, len: usize) -> i32;
+        fn mremap(old: *mut u8, old_len: usize, new_len: usize, flags: i32, new_addr: *mut u8) -> *mut u8;
+        fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    }
+    const PROT_READ_WRITE: i32 = 0x1 | 0x2;
+    const MAP_PRIVATE_ANON: i32 = 0x02 | 0x20;
+    const MREMAP_MAYMOVE_FIXED: i32 = 1 | 2;
+    const MADV_HUGEPAGE: i32 = 14;
+
+    pub(super) fn enabled() -> bool {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_XINT_HOSTFIX").is_none());
+        *ON
+    }
+
+    #[inline(always)]
+    fn line(base: usize, x: usize) -> usize {
+        base + 2 * x * 4096 + (x % 64) * 64
+    }
+
+    ///
+    unsafe fn probe(base: usize) -> u64 {
+        use core::arch::x86_64::{_mm_lfence, _rdtsc};
+        unsafe {
+            let mut x = 0usize;
+            for _ in 0..LINES {
+                let next = (5 * x + 1) % LINES;
+                *(line(base, x) as *mut usize) = line(base, next);
+                x = next;
+            }
+            let mut p = line(base, 0);
+            for _ in 0..LINES {
+                p = core::ptr::read_volatile(p as *const usize);
+            }
+            _mm_lfence();
+            let t0 = _rdtsc();
+            _mm_lfence();
+            for _ in 0..REPS * LINES {
+                p = core::ptr::read_volatile(p as *const usize);
+            }
+            _mm_lfence();
+            let t1 = _rdtsc();
+            core::hint::black_box(p);
+            for x in 0..LINES {
+                *(line(base, x) as *mut usize) = 0;
+            }
+            t1.wrapping_sub(t0)
+        }
+    }
+
+    unsafe fn probe2(base: usize) -> u64 {
+        unsafe { probe(base).min(probe(base)) }
+    }
+
+    unsafe fn fresh_fast_page(limit: u64, keep: &mut Vec<(usize, usize)>) -> Option<usize> {
+        unsafe {
+            for _ in 0..8 {
+                let m = mmap(core::ptr::null_mut(), 2 * HUGE, PROT_READ_WRITE, MAP_PRIVATE_ANON, -1, 0);
+                if m as isize == -1 {
+                    return None;
+                }
+                let m = m as usize;
+                let a = m.next_multiple_of(HUGE);
+                let _ = madvise(a as *mut u8, HUGE, MADV_HUGEPAGE);
+                std::ptr::write_bytes(a as *mut u8, 0, HUGE);
+                crate::collapse_hugepages(a as *mut u8, HUGE);
+                if probe2(a) <= limit {
+                    if a > m {
+                        let _ = munmap(m as *mut u8, a - m);
+                    }
+                    let end = m + 2 * HUGE;
+                    if a + HUGE < end {
+                        let _ = munmap((a + HUGE) as *mut u8, end - a - HUGE);
+                    }
+                    return Some(a);
+                }
+                keep.push((m, 2 * HUGE));
+            }
+            None
+        }
+    }
+
+    pub(super) unsafe fn repair(ranges: &[(usize, usize)], fix: bool) -> usize {
+        let mut regions: Vec<usize> = Vec::new();
+        for &(p, n) in ranges {
+            let mut a = p.next_multiple_of(HUGE);
+            while a + HUGE <= p + n {
+                regions.push(a);
+                a += HUGE;
+            }
+        }
+        if regions.len() < 16 {
+            return 0;
+        }
+        let ticks: Vec<u64> = regions.par_iter().map(|&a| unsafe { probe2(a) }).collect();
+        let mut sorted = ticks.clone();
+        sorted.sort_unstable();
+        let p25 = sorted[sorted.len() / 4].max(1);
+        let slow = p25 + p25 * 3 / 5;
+        let accept = p25 + p25 / 4;
+        let mut keep: Vec<(usize, usize)> = Vec::new();
+        let mut found = 0usize;
+        let mut failed = false;
+        for (i, &a) in regions.iter().enumerate() {
+            if ticks[i] < slow {
+                continue;
+            }
+            unsafe {
+                if probe2(a) < slow {
+                    continue;
+                }
+                found += 1;
+                if !fix || failed {
+                    continue;
+                }
+                let Some(f) = fresh_fast_page(accept, &mut keep) else { failed = true; continue };
+                let r = mremap(f as *mut u8, HUGE, HUGE, MREMAP_MAYMOVE_FIXED, a as *mut u8);
+                if r as usize != a {
+                    keep.push((f, HUGE));
+                    failed = true;
+                }
+            }
+        }
+        for (m, n) in keep {
+            unsafe {
+                let _ = munmap(m as *mut u8, n);
+            }
+        }
+        found
+    }
+}
+
 
 /// Release every pooled buffer back to the OS. The per-thread free lists
 /// behind [`LocalBuf`] are unreachable from here and are unaffected; they

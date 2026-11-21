@@ -92,13 +92,32 @@ pub(super) fn butterfly_fused_2layer(
     t_inner_a: F128,
     t_inner_b: F128,
 ) {
+    butterfly_fused_2layer_with_off(a, b, c, d, t_outer, t_inner_a, t_inner_b, low_twiddle_disabled());
+}
+
+#[inline]
+pub(super) fn low_twiddle_off() -> bool {
+    low_twiddle_disabled()
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) fn butterfly_fused_2layer_with_off(
+    a: &mut [F128],
+    b: &mut [F128],
+    c: &mut [F128],
+    d: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+    off: bool,
+) {
     debug_assert_eq!(a.len(), b.len());
     debug_assert_eq!(a.len(), c.len());
     debug_assert_eq!(a.len(), d.len());
 
     // The two layers carry independent twiddles, so specialize them
     // independently: the pair is dispatched once here, never per lane.
-    let off = low_twiddle_disabled();
     let outer_low = t_outer.hi == 0 && !off;
     let inner_low = t_inner_a.hi == 0 && t_inner_b.hi == 0 && !off;
 
@@ -161,6 +180,9 @@ pub(super) fn butterfly_fused_2layer(
 /// or 64. When `ALIGNED_ZMM`, every destination must be 64-byte aligned; the
 /// fallback only requires 16-byte alignment. The cfg gate guarantees the
 /// required target features.
+pub(super) const ZT_SKIP: usize = 1 << 16;
+pub(super) const ZT_POISON: usize = 1 << 17;
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -180,7 +202,7 @@ pub(super) unsafe fn butterfly_fused_2layer_publish_nt<const ALIGNED_ZMM: bool>(
     t_inner_a: F128,
     t_inner_b: F128,
 ) {
-    debug_assert!(lanes == 60 || lanes == 64);
+    debug_assert!(lanes & 0xff == 60 || lanes == 64);
     debug_assert_eq!(dst_a as usize % 16, 0);
     debug_assert_eq!(dst_b as usize % 16, 0);
     debug_assert_eq!(dst_c as usize % 16, 0);
@@ -218,6 +240,71 @@ pub(super) unsafe fn butterfly_fused_2layer_publish_nt<const ALIGNED_ZMM: bool>(
             }
             (true, true) => {
                 x86_64::butterfly_fused_2layer_publish_nt_gen::<true, true, ALIGNED_ZMM>(
+                    src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+                )
+            }
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) fn publish_nt_hot_enabled() -> bool {
+    !low_twiddle_disabled() && !x86_64::mul_diet_disabled()
+}
+
+///
+///
+/// # Safety
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_publish_nt_hot<const ALIGNED_ZMM: bool>(
+    src: *const F128,
+    src_step: usize,
+    dst_a: *mut F128,
+    dst_b: *mut F128,
+    dst_c: *mut F128,
+    dst_d: *mut F128,
+    lanes: usize,
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    debug_assert!(publish_nt_hot_enabled());
+    debug_assert!(lanes & 0xff == 60 || lanes == 64);
+    debug_assert!(!ALIGNED_ZMM || dst_a as usize % 64 == 0);
+    let outer_low = t_outer.hi == 0;
+    let inner_low = t_inner_a.hi == 0 && t_inner_b.hi == 0;
+    // SAFETY: forwarded caller contract; the flags are exactly the
+    // zero-high-limb preconditions of the selected specializations.
+    unsafe {
+        match (outer_low, inner_low) {
+            (false, false) => {
+                x86_64::butterfly_fused_2layer_publish_nt_impl::<false, false, true, ALIGNED_ZMM>(
+                    src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+                )
+            }
+            (false, true) => {
+                x86_64::butterfly_fused_2layer_publish_nt_impl::<false, true, true, ALIGNED_ZMM>(
+                    src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+                )
+            }
+            (true, false) => {
+                x86_64::butterfly_fused_2layer_publish_nt_impl::<true, false, true, ALIGNED_ZMM>(
+                    src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+                )
+            }
+            (true, true) => {
+                x86_64::butterfly_fused_2layer_publish_nt_impl::<true, true, true, ALIGNED_ZMM>(
                     src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
                 )
             }

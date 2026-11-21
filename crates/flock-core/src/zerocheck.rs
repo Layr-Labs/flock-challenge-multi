@@ -621,11 +621,13 @@ fn prove_packed_padded_inner<C: Challenger>(
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL1_R345_PRE").is_none());
     let gl1_r345_pre = *GL1_R345_PRE;
     let r345_pre_slot: std::sync::OnceLock<(Vec<F128>, Option<Vec<F128>>)> = std::sync::OnceLock::new();
+    let teq_slot: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     let peq_idle = || {
         let peq = peq_slot.get_or_init(|| packed_round2_split_eq(&mlv_pre));
         if gl1_r345_pre && peq.n_lo >= 4 {
             r345_pre_slot.get_or_init(|| multilinear::three_var::r345_pre_tables(&peq.lo));
         }
+        teq_slot.get_or_init(|| multilinear::z3_teq_prebuild(&mlv_pre[1..]));
     };
     let peq_idle_arg: Option<&(dyn Fn() + Sync)> = if *V1_PEQ_EARLY { Some(&peq_idle) } else { None };
     // Keep-warm guard taken right after the round-one join instead of after z
@@ -1195,8 +1197,10 @@ fn prove_packed_padded_inner<C: Challenger>(
     // outputs over the start of each input chunk it has just read, and the
     // plain level 2 reads them piece by piece (`multilinear::TlPieces`).
     let tl = c3_r345 && n_levels > 3 && multilinear::tl_route_ok((1usize << n_mlv) / 8);
+    let a31 = b7 && tl && multilinear::z3_a31_enabled();
     // Level 2 also writes in place and level 3 reads its pieces.
     let tl2 = tl && n_levels > 4 && multilinear::tl2_route_ok((1usize << n_mlv) / 8);
+    let tl3 = tl2 && n_levels > 5 && multilinear::tl3_route_ok((1usize << n_mlv) / 8);
     let mut tl_pieces: Option<multilinear::TlPieces> = None;
 
     // `loop_start` is the first tail iteration this route has not already
@@ -1226,11 +1230,11 @@ fn prove_packed_padded_inner<C: Challenger>(
         let casc_level = c3_tail && level + 1 == c3_at;
         assert!(
             tl_pieces.is_none()
-                || ((level == 2 || (tl2 && level == 3))
+                || ((level == 2 || (tl2 && level == 3) || (tl3 && level == 4))
                     && level + 1 < n_levels
                     && !c3_level
                     && !casc_level),
-            "the in-place handoff feeds plain levels 2 and 3 only"
+            "the in-place handoff feeds plain levels 2 to 4 only"
         );
         // Round 2L+3: evaluate the deferred quadratic at ρ_{2L+1}. No pass.
         let (m_odd_1, m_odd_inf) = eval_round3_lookahead(&la_cur, mlv_rhos[2 * level + lo_off]);
@@ -1331,6 +1335,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     c3_r345,
                     pre_wtab,
                     b7,
+                    a31,
                 );
             assert_eq!(la7_next.is_some(), c3_r345, "deeper cascade route did not run");
             if b7 {
@@ -1392,7 +1397,12 @@ fn prove_packed_padded_inner<C: Challenger>(
                     &r_next,
                     lm_out,
                     b7_canon.as_ref(),
+                    a31,
                 );
+            if a31 {
+                let len = a_mlv.len() / 32 * 31;
+                a_mlv.truncate(len);
+            }
             debug_assert_eq!(pieces.n, quarter);
             tl_pieces = Some(pieces);
             if level + 1 < n_levels {
@@ -1415,7 +1425,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 la = Some(la_next);
             }
             (m1, mi, lm_out)
-        } else if tl2 && level == 2 {
+        } else if tl2 && (level == 2 || (tl3 && level == 3)) {
             let lm_out = lm_reader_ok && plain_cascade_lo_size(n_cur) % 8 == 0 && !casc_level;
             let (m1, mi, la_next, next) = multilinear::fold2_plain_tl_inplace(
                 &mut a_mlv,

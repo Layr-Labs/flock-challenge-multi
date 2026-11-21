@@ -84,18 +84,15 @@ fn c0_is_identity_cached(r1cs: &BlockR1cs) -> bool {
     if !*ON {
         return r1cs.c0_is_identity();
     }
-    static CACHE: std::sync::Mutex<Option<([u8; 32], bool)>> = std::sync::Mutex::new(None);
+    static CACHE: std::sync::OnceLock<([u8; 32], bool)> = std::sync::OnceLock::new();
     let digest = r1cs.statement_digest();
-    let mut slot = CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((cached_digest, value)) = *slot
-        && cached_digest == digest
-    {
-        return value;
+    if let Some(&(cached_digest, value)) = CACHE.get() {
+        if cached_digest == digest {
+            return value;
+        }
     }
     let value = r1cs.c0_is_identity();
-    *slot = Some((digest, value));
+    let _ = CACHE.set((digest, value));
     value
 }
 
@@ -672,6 +669,10 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     // five parameters; the warm-up proves leave it cached (no clone of the
     // parsed config's eleven vectors inside the timed prove).
     type CfgKey = (usize, usize, usize, pcs::ligerito::LigeritoProfile, flock_core::hash::HashKind);
+    static FAST_CFG: std::sync::OnceLock<(CfgKey, &'static pcs::ligerito::ProverConfig)> =
+        std::sync::OnceLock::new();
+    static NO_LOCKFREE: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NV_LOCKFREE").is_some());
     static CFG: std::sync::Mutex<Option<(CfgKey, &'static pcs::ligerito::ProverConfig)>> =
         std::sync::Mutex::new(None);
     static CFG_ON: std::sync::LazyLock<bool> =
@@ -685,17 +686,41 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
             pcs_params.profile,
             pcs_params.merkle_hash,
         );
-        let mut slot = CFG.lock().unwrap_or_else(|e| e.into_inner());
-        match *slot {
-            Some((k, c)) if k == key => c,
-            _ => {
-                let c: &'static pcs::ligerito::ProverConfig = Box::leak(Box::new(
-                    pcs_params
-                        .ligerito_prover_config()
-                        .expect("Ligerito default config; bump m for tiny instances"),
-                ));
-                *slot = Some((key, c));
+        if let Some((k, c)) = FAST_CFG.get().filter(|_| !*NO_LOCKFREE) {
+            if *k == key {
                 c
+            } else {
+                let mut slot = CFG.lock().unwrap_or_else(|e| e.into_inner());
+                match *slot {
+                    Some((k, c)) if k == key => c,
+                    _ => {
+                        let c: &'static pcs::ligerito::ProverConfig = Box::leak(Box::new(
+                            pcs_params
+                                .ligerito_prover_config()
+                                .expect("Ligerito default config; bump m for tiny instances"),
+                        ));
+                        *slot = Some((key, c));
+                        c
+                    }
+                }
+            }
+        } else {
+            let mut slot = CFG.lock().unwrap_or_else(|e| e.into_inner());
+            match *slot {
+                Some((k, c)) if k == key => {
+                    let _ = FAST_CFG.set((key, c));
+                    c
+                }
+                _ => {
+                    let c: &'static pcs::ligerito::ProverConfig = Box::leak(Box::new(
+                        pcs_params
+                            .ligerito_prover_config()
+                            .expect("Ligerito default config; bump m for tiny instances"),
+                    ));
+                    *slot = Some((key, c));
+                    let _ = FAST_CFG.set((key, c));
+                    c
+                }
             }
         }
     } else {
