@@ -4315,15 +4315,15 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     //        already has γ_k baked in — pcs combine just adds.
     let t = std::time::Instant::now();
 
-    struct ClaimWork {
+    struct ClaimWork<'p> {
         s_hat_v: Vec<F128>,
-        s_hat_v_quad: Option<Vec<F128>>,
-        s_hat_v_fold4: Option<Vec<F128>>,
+        s_hat_v_quad: Option<&'p [F128]>,
+        s_hat_v_fold4: Option<&'p [F128]>,
         s_hat_v_fold8: Option<Vec<F128>>,
         sumcheck_claim: F128,
         eq_r_dprime: Vec<F128>,
     }
-    let mut work: Vec<ClaimWork> = Vec::with_capacity(n);
+    let mut work: Vec<ClaimWork<'_>> = Vec::with_capacity(n);
     let f8late = sl2_f8late_enabled();
     for i in 0..n {
         challenger.observe_label(b"flock-ring-switch-v0");
@@ -4335,14 +4335,12 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
             .get(i)
             .copied()
             .flatten()
-            .filter(|precomputed| precomputed.len() == 4 * n_packed)
-            .map(<[F128]>::to_vec);
+            .filter(|precomputed| precomputed.len() == 4 * n_packed);
         let s_hat_v_fold4 = precomputed_s_hat_v
             .get(i)
             .copied()
             .flatten()
-            .filter(|precomputed| precomputed.len() == 16 * n_packed)
-            .map(<[F128]>::to_vec);
+            .filter(|precomputed| precomputed.len() == 16 * n_packed);
         // Lane sl2 (`FLOCK_NO_SL2_F8LATE`): the 128 KiB copy is made inside
         // the claim's own (parallel) tail instead of on this serial chain.
         let s_hat_v_fold8 = if f8late {
@@ -4403,7 +4401,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     let pre_a_cells: Vec<std::sync::Mutex<Option<PreParts>>> =
         pre_a.into_iter().map(std::sync::Mutex::new).collect();
     let claim_output =
-        |i: usize, mut w: ClaimWork, g: F128| -> (RingSwitchProof, RingSwitchBatchOutput) {
+        |i: usize, mut w: ClaimWork<'_>, g: F128| -> (RingSwitchProof, RingSwitchBatchOutput) {
             crate::rstrace::ev("rs:c0", i as u32);
             let mut scaled_eq_r_dprime = crate::alloc_uninit_vec::<F128>(w.eq_r_dprime.len());
             crate::field::f128_slice::scale_slice(&mut scaled_eq_r_dprime, &w.eq_r_dprime, g);
