@@ -4291,8 +4291,8 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
             .map(|&d| dense_tensors[d].as_slice())
             .collect();
         let out = fold_1b_rows_multi_padded(packed_witness, &dense_refs, padding);
-        for (i, &d) in dense_needs_fold.iter().enumerate() {
-            dense_s_hat_v[d] = out[i].clone();
+        for (&d, folded) in dense_needs_fold.iter().zip(out) {
+            dense_s_hat_v[d] = folded;
         }
     }
     for &s in &sparse_needs_fold {

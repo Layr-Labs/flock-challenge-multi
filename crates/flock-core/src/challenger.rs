@@ -270,10 +270,13 @@ impl FsChallenger {
         self.n_absorbed = self.n_absorbed.wrapping_add(bytes.len() as u64);
     }
 
+    #[cfg(not(target_endian = "little"))]
     #[inline]
     fn absorb_f128(&mut self, v: F128) {
-        self.absorb(&v.lo.to_le_bytes());
-        self.absorb(&v.hi.to_le_bytes());
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&v.lo.to_le_bytes());
+        b[8..].copy_from_slice(&v.hi.to_le_bytes());
+        self.absorb(&b);
     }
 
     /// Squeeze `out.len()` pseudorandom bytes from the current transcript
@@ -332,13 +335,29 @@ impl Challenger for FsChallenger {
     }
 
     fn observe_f128(&mut self, value: F128) {
-        self.absorb(&[OP_OBSERVE, KIND_SCALAR]);
-        self.absorb_f128(value);
+        let mut b = [0u8; 18];
+        b[0] = OP_OBSERVE;
+        b[1] = KIND_SCALAR;
+        b[2..10].copy_from_slice(&value.lo.to_le_bytes());
+        b[10..].copy_from_slice(&value.hi.to_le_bytes());
+        self.absorb(&b);
     }
 
     fn observe_f128_slice(&mut self, values: &[F128]) {
-        self.absorb(&[OP_OBSERVE, KIND_SLICE]);
-        self.absorb(&(values.len() as u64).to_le_bytes());
+        let mut head = [0u8; 10];
+        head[0] = OP_OBSERVE;
+        head[1] = KIND_SLICE;
+        head[2..].copy_from_slice(&(values.len() as u64).to_le_bytes());
+        self.absorb(&head);
+        #[cfg(target_endian = "little")]
+        {
+            const _: () = assert!(core::mem::size_of::<F128>() == 16);
+            let bytes = unsafe {
+                std::slice::from_raw_parts(values.as_ptr() as *const u8, std::mem::size_of_val(values))
+            };
+            self.absorb(bytes);
+        }
+        #[cfg(not(target_endian = "little"))]
         for v in values {
             self.absorb_f128(*v);
         }
