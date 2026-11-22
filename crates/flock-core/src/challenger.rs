@@ -2915,12 +2915,6 @@ fn grind_team_avx512_any_valid(state_digest: &[u8; 32], bits: u32, k: &TeamKnobs
             rayon::spawn(move || team_helper(h, hold_us));
         }
         sh.work();
-        // The answer is final once no chunk below the best is in flight.
-        for sl in &sh.slots {
-            while sl.0.load(Ordering::SeqCst) != u64::MAX {
-                std::hint::spin_loop();
-            }
-        }
     } else {
         let shr = &*sh;
         rayon::in_place_scope(|s| {
