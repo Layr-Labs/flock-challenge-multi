@@ -706,8 +706,11 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
     let b_out = &mut b_out[..b_len];
     let a_len = a_out.len() / chunk_out * chunk_a;
     let a_out = &mut a_out[..a_len];
+    let flat = crate::flat_par::enabled() && rayon::current_thread_index().is_some();
     let (sum1_even, sum_inf_even, agg, la7_acc) =
-        if crate::flat_par::enabled() && rayon::current_thread_index().is_some() {
+        if flat && super::c4_tail_team() && crate::flat_par::team_ready() {
+            super::team_chunks2(a_out, chunk_a, b_out, chunk_b, leaf, id, op)
+        } else if flat {
             super::flat_chunks2(a_out, chunk_a, b_out, chunk_b, leaf, id, op)
         } else {
             a_out

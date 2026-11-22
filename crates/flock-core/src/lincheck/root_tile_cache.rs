@@ -652,7 +652,7 @@ impl RootTileCache {
         if shift_free {
             debug_assert!(self.fixed_roots && n_out == 177 * 64);
             let out_addr = out.as_mut_ptr() as usize;
-            (0..fold_blocks).into_par_iter().for_each(|block| {
+            let leaf = |block: usize| {
                 crate::rstrace::evd("rf:rb", block as u32);
                 let mut buf = [F128::ZERO; 64];
                 unsafe {
@@ -673,7 +673,12 @@ impl RootTileCache {
                         }
                     }
                 }
-            });
+            };
+            if *C4_RED_TEAM && crate::flat_par::team_enabled() && crate::flat_par::team_ready() {
+                crate::flat_par::team_map_reduce(fold_blocks, leaf, || (), |_, _| ());
+            } else {
+                (0..fold_blocks).into_par_iter().for_each(leaf);
+            }
             crate::rstrace::ev("lcf:reduced", 0);
             out[833..897].fill(F128::ZERO);
             out[897 + 186 * 56..].fill(F128::ZERO);
@@ -1179,3 +1184,5 @@ mod indexed_weight_tests {
         println!("INDEXED_ROOT_WEIGHTS labels=262144 arithmetic_octa_cases={weight_cases} full_reader_equalities={reader_equalities} wrong_weight_mutants_detected={mutants} original_expansions_per_reader=2048 indexed_expansions_per_reader=256 threads=7,9 reader_modes=2 bases=2 actual_production_consumer=true x4_enabled={}",super::super::lc_eq8_x4_enabled());
     }
 }
+#[allow(dead_code)]
+const GAUNTLET_REDRAW_0d865de7_20261122T214718Z: u8 = 0;
