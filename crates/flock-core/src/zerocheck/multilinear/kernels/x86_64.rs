@@ -1802,6 +1802,7 @@ pub(crate) unsafe fn fold3_oct_and_message_lookahead_wtab_x86<
                 let x = $x_lo;
                 let output = 2 * x;
                 let input = 8 * output;
+                // A31 groups of four blocks are 124 inputs instead of 128.
                 let a_src = if A31 { a_in.add(31 * input / 32) } else { a_in.add(input) };
                 // B7 blocks are 28 inputs (seven lines) instead of 32.
                 let b_src = if B7 { b_in.add(7 * input / 8) } else { b_in.add(input) };
@@ -2536,6 +2537,8 @@ pub(crate) fn zc_pkt_pf_enabled() -> bool {
     *ON
 }
 
+/// Lane r5: shared packed-row prefetch lead 3 -> 2 tiles (r2 and the other
+/// packed sweeps); build-time env `NO_ZC_PKT_PF2=1` restores 3. Prefetch only.
 const ZC_PKT_PF_TILES: usize = match option_env!("NO_ZC_PKT_PF2") {
     Some(_) => 3,
     None => 2,
@@ -4443,7 +4446,7 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast(
     out: *mut F128,
     dead_lines: u8,
 ) {
-    unsafe { gfni_fold64_rows_masked_tr_bcast_y::<false>(rows, mats, out, dead_lines, core::ptr::null()) }
+    unsafe { gfni_fold64_rows_masked_tr_bcast_y::<false>(rows, mats, out, dead_lines) }
 }
 
 #[cfg(all(target_feature = "avx512vbmi", target_feature = "vpclmulqdq"))]
@@ -4460,7 +4463,6 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast_y<const YS: bool>(
     mats: &[u64; 128],
     out: *mut F128,
     dead_lines: u8,
-    sp: *const R4SplitDst,
 ) {
     use core::arch::x86_64::*;
     unsafe {
@@ -4476,7 +4478,7 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast_y<const YS: bool>(
                 }
             }
         }
-        gfni_fold64_regs_sigma_bcast_gen::<false, YS>(z, mats.as_ptr(), out, sp);
+        gfni_fold64_regs_sigma_bcast_gen::<false, YS>(z, mats.as_ptr(), out);
     }
 }
 
@@ -4495,7 +4497,7 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast4(
     out: *mut F128,
     dead_lines: u8,
 ) {
-    unsafe { gfni_fold64_rows_masked_tr_bcast4_y::<false>(rows, mats4, out, dead_lines, core::ptr::null()) }
+    unsafe { gfni_fold64_rows_masked_tr_bcast4_y::<false>(rows, mats4, out, dead_lines) }
 }
 
 #[cfg(all(target_feature = "avx512vbmi", target_feature = "vpclmulqdq"))]
@@ -4512,7 +4514,6 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast4_y<const YS: bool>(
     mats4: *const u64,
     out: *mut F128,
     dead_lines: u8,
-    sp: *const R4SplitDst,
 ) {
     use core::arch::x86_64::*;
     unsafe {
@@ -4528,47 +4529,12 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast4_y<const YS: bool>(
                 }
             }
         }
-        gfni_fold64_regs_sigma_bcast_gen::<true, YS>(z, mats4, out, sp);
+        gfni_fold64_regs_sigma_bcast_gen::<true, YS>(z, mats4, out);
     }
 }
 
 #[repr(C, align(64))]
 struct FoldCache([F128; 64]);
-
-#[repr(C, align(64))]
-struct R4SplitBuf([F128; 32]);
-
-#[repr(C)]
-struct R4Side {
-    f_e: R4SplitBuf, f_o: R4SplitBuf,
-    m_e: R4SplitBuf, m_o: R4SplitBuf,
-    l_e: R4SplitBuf, l_o: R4SplitBuf,
-    t_e: R4SplitBuf, t_o: R4SplitBuf,
-}
-
-#[derive(Clone, Copy)]
-struct R4SplitDst {
-    ev: [*mut F128; 4],
-    od: [*mut F128; 4],
-}
-
-#[inline(always)]
-unsafe fn r4_split_emit(sp: *const R4SplitDst, g: usize, k: usize, v: core::arch::x86_64::__m512i) {
-    use core::arch::x86_64::*;
-    if sp.is_null() { return; }
-    unsafe {
-        let e = (*sp).ev[g];
-        if e.is_null() { return; }
-        _mm256_storeu_si256(e.add(8 * k).cast::<__m256i>(), _mm512_castsi512_si256(v));
-        _mm256_storeu_si256((*sp).od[g].add(8 * k).cast::<__m256i>(), _mm512_extracti64x4_epi64::<1>(v));
-    }
-}
-
-pub(crate) fn zc_r4_split_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_C1").is_none() && std::env::var_os("FLOCK_NO_ZC_R4_SPLIT").is_none());
-    *ON
-}
 
 /// lo1 item 1 kill switch (`FLOCK_NO_LO1_YS`), read once per round-two pass:
 /// the round-two GFNI fold producers gather rows {k, k+1, k+4, k+5} of both
@@ -5116,6 +5082,12 @@ core::arch::global_asm!(
     include_str!("gfni_c4_lm_m.S"),
 );
 
+// Lane la1: the r345 hot cluster. The two GFNI kernels the casc kernel calls
+// and the hot casc instances (`fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86`) share one 4 KiB-aligned
+// section, so their addresses mod 4 KiB (64 B windows, uop-cache sets) are
+// fixed by this code alone, not by whatever else the binary links before it.
+// Build env R345_PADA / R345_PADC (bytes) shift the kernels / the casc
+// instance inside the cluster (layout sweep knobs).
 const fn la1_env_usize(s: Option<&str>, d: usize) -> usize {
     match s {
         None => d,
@@ -5131,16 +5103,15 @@ const fn la1_env_usize(s: Option<&str>, d: usize) -> usize {
         }
     }
 }
-const R2_PAD: usize = la1_env_usize(option_env!("R2_PAD"), 3072);
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-core::arch::global_asm!(
-    ".section .text.r2hot,\"ax\",@progbits",
-    ".p2align 12",
-    ".skip {pr}, 0xcc",
-    ".text",
-    pr = const R2_PAD,
-);
+// Defaults (measured best on rig A, c7i/SPR, r345 -0.215 ms vs record): the
+// register-result kernel at 0xa80 mod 4 KiB, pass4 at 0x500, and the hot casc
+// instance <true,true,true,true,1,1> at 0xb20 (the relative 4 KiB placement
+// of these three loci is what moves r345; the other placements tried read
+// -0.05..-0.16 ms).
 const R345_PADA: usize = la1_env_usize(option_env!("R345_PADA"), 2688);
+// fs4a: with z3a A31 the hot instance is <true,true,true,true,1,1,true>;
+// PADC 1584 puts it at 0xda0 mod 4 KiB (its asm call block then sits where
+// la1's did; best measured with 0xaf0..0xb50).
 const R345_PADC: usize = la1_env_usize(option_env!("R345_PADC"), 1584);
 
 #[cfg(all(
@@ -5276,6 +5247,12 @@ unsafe fn gfni_fold32_rows_c4_lm_registers_k<const MAH: bool>(
     [lo, hi]
 }
 
+/// Lane r5 (`FLOCK_NO_R5_PF1`): the r345 casc kernel prefetches its packed
+/// rows ONE half-block ahead instead of `ZC_PKT_PF_TILES` (3). On SPR one
+/// half-block (~1300 cycles per thread) already covers DRAM latency, and the
+/// shorter lead keeps less of L1 (shared by both hyperthreads) in flight:
+/// r345 -0.09..-0.11 ms; leads 4/6 and L2 hints were slower, no prefetch +3.3 ms.
+/// `FLOCK_NO_R5_PF1=1` restores lead 3; `FLOCK_R5_PFD=1|2|3` picks a lead (A/B sweeps).
 pub(crate) fn zc_r5_pfd() -> u8 {
     static PFD: std::sync::LazyLock<u8> = std::sync::LazyLock::new(|| {
         if std::env::var_os("FLOCK_NO_R5_PF1").is_some() {
@@ -5290,6 +5267,9 @@ pub(crate) fn zc_r5_pfd() -> u8 {
     *PFD
 }
 
+/// Lane r5 (`FLOCK_NO_R5_MAHK`): the rounds 3+4+5 casc kernel picks its GFNI
+/// asm variant at compile time (const generic) instead of a `LazyLock` check
+/// per call; halves the hot loop's code.
 pub(crate) fn zc_r5_mahk_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         cfg!(target_os = "linux") && std::env::var_os("FLOCK_NO_R5_MAHK").is_none()
@@ -5777,7 +5757,7 @@ unsafe fn gfni_fold64_regs_sigma_bcast(
     mats: &[u64; 128],
     out: *mut F128,
 ) {
-    unsafe { gfni_fold64_regs_sigma_bcast_gen::<false, false>(z, mats.as_ptr(), out, core::ptr::null()) }
+    unsafe { gfni_fold64_regs_sigma_bcast_gen::<false, false>(z, mats.as_ptr(), out) }
 }
 
 #[cfg(all(
@@ -5799,7 +5779,6 @@ unsafe fn gfni_fold64_regs_sigma_bcast_gen<const MULTI: bool, const YS: bool>(
     z: [core::arch::x86_64::__m512i; 8],
     mats: *const u64,
     out: *mut F128,
-    sp: *const R4SplitDst,
 ) {
     use core::arch::x86_64::*;
     unsafe {
@@ -5836,12 +5815,9 @@ unsafe fn gfni_fold64_regs_sigma_bcast_gen<const MULTI: bool, const YS: bool>(
         let mp = mats;
         // lo1 (YS): each 8-row set holds rows {k, k+1, k+4, k+5} of both
         // halves, so its two outputs are already FoldCache ZMMs.
-        let split = YS && !sp.is_null();
-        let p01 = if split { _mm512_setr_epi64(0, 8, 4, 12, 2, 10, 6, 14) }
-                  else if YS { _mm512_setr_epi64(0, 8, 2, 10, 4, 12, 6, 14) }
+        let p01 = if YS { _mm512_setr_epi64(0, 8, 2, 10, 4, 12, 6, 14) }
                   else { _mm512_setr_epi64(0, 8, 4, 12, 1, 9, 5, 13) };
-        let p23 = if split { _mm512_setr_epi64(1, 9, 5, 13, 3, 11, 7, 15) }
-                  else if YS { _mm512_setr_epi64(1, 9, 3, 11, 5, 13, 7, 15) }
+        let p23 = if YS { _mm512_setr_epi64(1, 9, 3, 11, 5, 13, 7, 15) }
                   else { _mm512_setr_epi64(2, 10, 6, 14, 3, 11, 7, 15) };
         for g in 0..4 {
             let mut a01 = [_mm512_setzero_si512(); 2];
@@ -5874,10 +5850,6 @@ unsafe fn gfni_fold64_regs_sigma_bcast_gen<const MULTI: bool, const YS: bool>(
                 _mm512_storeu_si512(dst.add(4), a23[0]);
                 _mm512_storeu_si512(dst.add(8), a01[1]);
                 _mm512_storeu_si512(dst.add(12), a23[1]);
-                r4_split_emit(sp, g, 0, a01[0]);
-                r4_split_emit(sp, g, 1, a23[0]);
-                r4_split_emit(sp, g, 2, a01[1]);
-                r4_split_emit(sp, g, 3, a23[1]);
             } else {
                 _mm512_storeu_si512(dst, _mm512_shuffle_i64x2::<0x44>(a01[0], a01[1]));
                 _mm512_storeu_si512(dst.add(4), _mm512_shuffle_i64x2::<0xEE>(a01[0], a01[1]));
@@ -5965,7 +5937,6 @@ unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_impl<const WRITE_CANONICAL: bool
             out,
             group,
             folded,
-            core::ptr::null(),
         );
         true
     }
@@ -5993,7 +5964,6 @@ unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_readonly_leaf<const WRITE_CANONI
     out: *mut F128,
     group: u8,
     folded: F128,
-    sp: *const R4SplitDst,
 ) {
     use core::arch::x86_64::*;
     debug_assert!(group == 0 || group == 3);
@@ -6038,12 +6008,9 @@ unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_readonly_leaf<const WRITE_CANONI
         let mp = mats.as_ptr();
         // lo1 (YS): each 8-row set holds rows {k, k+1, k+4, k+5} of both
         // halves, so its two outputs are already FoldCache ZMMs.
-        let split = YS && !sp.is_null();
-        let p01 = if split { _mm512_setr_epi64(0, 8, 4, 12, 2, 10, 6, 14) }
-                  else if YS { _mm512_setr_epi64(0, 8, 2, 10, 4, 12, 6, 14) }
+        let p01 = if YS { _mm512_setr_epi64(0, 8, 2, 10, 4, 12, 6, 14) }
                   else { _mm512_setr_epi64(0, 8, 4, 12, 1, 9, 5, 13) };
-        let p23 = if split { _mm512_setr_epi64(1, 9, 5, 13, 3, 11, 7, 15) }
-                  else if YS { _mm512_setr_epi64(1, 9, 3, 11, 5, 13, 7, 15) }
+        let p23 = if YS { _mm512_setr_epi64(1, 9, 3, 11, 5, 13, 7, 15) }
                   else { _mm512_setr_epi64(2, 10, 6, 14, 3, 11, 7, 15) };
         for relative in 0..3 {
             let g = first_g + relative;
@@ -6077,10 +6044,6 @@ unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_readonly_leaf<const WRITE_CANONI
                 _mm512_storeu_si512(dst.add(4), a23[0]);
                 _mm512_storeu_si512(dst.add(8), a01[1]);
                 _mm512_storeu_si512(dst.add(12), a23[1]);
-                r4_split_emit(sp, g, 0, a01[0]);
-                r4_split_emit(sp, g, 1, a23[0]);
-                r4_split_emit(sp, g, 2, a01[1]);
-                r4_split_emit(sp, g, 3, a23[1]);
             } else {
                 _mm512_storeu_si512(dst, _mm512_shuffle_i64x2::<0x44>(a01[0], a01[1]));
                 _mm512_storeu_si512(dst.add(4), _mm512_shuffle_i64x2::<0xEE>(a01[0], a01[1]));
@@ -6134,7 +6097,6 @@ unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_leaf<
     out: *mut F128,
     group: u8,
     folded: F128,
-    sp: *const R4SplitDst,
 ) {
     use core::arch::x86_64::*;
     debug_assert!(group == 0 || group == 3);
@@ -6179,12 +6141,9 @@ unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_leaf<
         let mp = mats;
         // lo1 (YS): each 8-row set holds rows {k, k+1, k+4, k+5} of both
         // halves, so its two outputs are already FoldCache ZMMs.
-        let split = YS && !sp.is_null();
-        let p01 = if split { _mm512_setr_epi64(0, 8, 4, 12, 2, 10, 6, 14) }
-                  else if YS { _mm512_setr_epi64(0, 8, 2, 10, 4, 12, 6, 14) }
+        let p01 = if YS { _mm512_setr_epi64(0, 8, 2, 10, 4, 12, 6, 14) }
                   else { _mm512_setr_epi64(0, 8, 4, 12, 1, 9, 5, 13) };
-        let p23 = if split { _mm512_setr_epi64(1, 9, 5, 13, 3, 11, 7, 15) }
-                  else if YS { _mm512_setr_epi64(1, 9, 3, 11, 5, 13, 7, 15) }
+        let p23 = if YS { _mm512_setr_epi64(1, 9, 3, 11, 5, 13, 7, 15) }
                   else { _mm512_setr_epi64(2, 10, 6, 14, 3, 11, 7, 15) };
         for relative in 0..3 {
             let g = first_g + relative;
@@ -6218,10 +6177,6 @@ unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_leaf<
                 _mm512_storeu_si512(dst.add(4), a23[0]);
                 _mm512_storeu_si512(dst.add(8), a01[1]);
                 _mm512_storeu_si512(dst.add(12), a23[1]);
-                r4_split_emit(sp, g, 0, a01[0]);
-                r4_split_emit(sp, g, 1, a23[0]);
-                r4_split_emit(sp, g, 2, a01[1]);
-                r4_split_emit(sp, g, 3, a23[1]);
             } else {
                 _mm512_storeu_si512(dst, _mm512_shuffle_i64x2::<0x44>(a01[0], a01[1]));
                 _mm512_storeu_si512(dst.add(4), _mm512_shuffle_i64x2::<0xEE>(a01[0], a01[1]));
@@ -6271,7 +6226,7 @@ pub(crate) unsafe fn gfni_fold64_rows_tr_bcast_skip_group<const MULTI: bool>(
     out: *mut F128,
     group: u8,
 ) {
-    unsafe { gfni_fold64_rows_tr_bcast_skip_group_y::<MULTI, false>(rows, mats, out, group, core::ptr::null()) }
+    unsafe { gfni_fold64_rows_tr_bcast_skip_group_y::<MULTI, false>(rows, mats, out, group) }
 }
 
 #[cfg(all(
@@ -6294,7 +6249,6 @@ pub(crate) unsafe fn gfni_fold64_rows_tr_bcast_skip_group_y<const MULTI: bool, c
     mats: *const u64,
     out: *mut F128,
     group: u8,
-    sp: *const R4SplitDst,
 ) {
     debug_assert!(group == 0 || group == 3);
     unsafe {
@@ -6305,7 +6259,6 @@ pub(crate) unsafe fn gfni_fold64_rows_tr_bcast_skip_group_y<const MULTI: bool, c
                 out,
                 group,
                 F128::ZERO,
-                sp,
             );
         } else {
             let b_mats = &*mats.cast::<[u64; 128]>();
@@ -6315,7 +6268,6 @@ pub(crate) unsafe fn gfni_fold64_rows_tr_bcast_skip_group_y<const MULTI: bool, c
                 out,
                 group,
                 F128::ZERO,
-                sp,
             );
         }
     }
@@ -6741,185 +6693,6 @@ unsafe fn r4_canonical_set2(
     }
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "gfni",
-    target_feature = "vpclmulqdq"
-))]
-#[cfg_attr(
-    target_feature = "avx512bw",
-    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
-)]
-#[cfg_attr(
-    not(target_feature = "avx512bw"),
-    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
-)]
-#[inline(never)]
-unsafe fn r4_round4_batch_split(
-    ea: *const F128, oa: *const F128, eb: *const F128, ob: *const F128,
-    acc4: &mut [WideGhashX4; 10],
-) {
-    use core::arch::x86_64::*;
-    unsafe {
-        let ld = |p: *const F128, off: usize| _mm512_loadu_si512(p.add(off).cast::<__m512i>());
-        macro_rules! corner {
-            ($k:literal) => {{
-                let a = ld(oa, 8 * $k);
-                let b = ld(ob, 8 * $k);
-                let c = ld(oa, 8 * $k + 4);
-                let d = ld(ob, 8 * $k + 4);
-                if $k == 0 { acc4[0].mul_acc2(a, b, c, d); }
-                (
-                    _mm512_xor_si512(ld(ea, 8 * $k), a),
-                    _mm512_xor_si512(ld(eb, 8 * $k), b),
-                    _mm512_xor_si512(ld(ea, 8 * $k + 4), c),
-                    _mm512_xor_si512(ld(eb, 8 * $k + 4), d),
-                )
-            }};
-        }
-        macro_rules! product {
-            ($i:literal, $q:expr) => {{ let (a,b,c,d)=$q; acc4[$i].mul_acc2(a,b,c,d); }};
-        }
-        macro_rules! plus {
-            ($x:expr, $y:expr) => {{
-                let (a,b,c,d)=$x; let (e,f,g,h)=$y;
-                (_mm512_xor_si512(a,e), _mm512_xor_si512(b,f),
-                 _mm512_xor_si512(c,g), _mm512_xor_si512(d,h))
-            }};
-        }
-        let q0=corner!(0); product!(1,q0);
-        let q1=corner!(1); product!(2,q1);
-        let q2=corner!(2); product!(4,q2);
-        let q3=corner!(3); product!(5,q3);
-        let e=plus!(q0,q1); product!(3,e);
-        let f=plus!(q2,q3); product!(6,f);
-        product!(7,plus!(q0,q2));
-        product!(8,plus!(q1,q3));
-        product!(9,plus!(e,f));
-    }
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "gfni",
-    target_feature = "vpclmulqdq"
-))]
-#[cfg_attr(
-    target_feature = "avx512bw",
-    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
-)]
-#[cfg_attr(
-    not(target_feature = "avx512bw"),
-    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
-)]
-#[inline(never)]
-unsafe fn r4_split_set(
-    ea: *const F128, oa: *const F128, eb: *const F128, ob: *const F128,
-    acc: &mut [WideGhashX4; 10],
-) {
-    use core::arch::x86_64::*;
-    unsafe {
-        let ld = |p: *const F128, off: usize| _mm512_loadu_si512(p.add(off).cast::<__m512i>());
-        macro_rules! product {
-            ($i:literal,$q:expr) => {{
-                let (a,b)=$q; let dst=&mut acc[$i];
-                dst.lo=_mm512_xor_si512(dst.lo,_mm512_clmulepi64_epi128::<0x00>(a,b));
-                dst.hi=_mm512_xor_si512(dst.hi,_mm512_clmulepi64_epi128::<0x11>(a,b));
-                dst.mid=_mm512_ternarylogic_epi64::<0x96>(dst.mid,
-                    _mm512_clmulepi64_epi128::<0x01>(a,b),
-                    _mm512_clmulepi64_epi128::<0x10>(a,b));
-            }};
-        }
-        macro_rules! corner {
-            ($k:literal) => {{
-                let a = ld(oa, 8 * $k);
-                let b = ld(ob, 8 * $k);
-                if $k == 0 { product!(0,(a,b)); }
-                (_mm512_xor_si512(ld(ea, 8 * $k), a), _mm512_xor_si512(ld(eb, 8 * $k), b))
-            }};
-        }
-        macro_rules! plus {
-            ($x:expr,$y:expr) => {{ let (a,b)=$x;let (c,d)=$y;
-                (_mm512_xor_si512(a,c),_mm512_xor_si512(b,d)) }};
-        }
-        let q0=corner!(0);product!(1,q0);
-        let q1=corner!(1);product!(2,q1);
-        let q2=corner!(2);product!(4,q2);
-        let q3=corner!(3);product!(5,q3);
-        let e=plus!(q0,q1);product!(3,e);
-        let f=plus!(q2,q3);product!(6,f);
-        product!(7,plus!(q0,q2));product!(8,plus!(q1,q3));product!(9,plus!(e,f));
-    }
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "gfni",
-    target_feature = "vpclmulqdq"
-))]
-#[cfg_attr(
-    target_feature = "avx512bw",
-    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
-)]
-#[cfg_attr(
-    not(target_feature = "avx512bw"),
-    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
-)]
-#[inline(never)]
-#[allow(clippy::too_many_arguments)]
-unsafe fn r4_split_set2(
-    sea: *const F128, soa: *const F128, seb: *const F128, sob: *const F128,
-    tea: *const F128, toa: *const F128, teb: *const F128, tob: *const F128,
-    acc: &mut [WideGhashX4; 10],
-) {
-    use core::arch::x86_64::*;
-    unsafe {
-        let ld = |p: *const F128, off: usize| _mm512_loadu_si512(p.add(off).cast::<__m512i>());
-        macro_rules! corner {
-            ($ea:expr,$oa:expr,$eb:expr,$ob:expr,$k:literal) => {{
-                let a = ld($oa, 8 * $k);
-                let b = ld($ob, 8 * $k);
-                ((a, b), (_mm512_xor_si512(ld($ea, 8 * $k), a), _mm512_xor_si512(ld($eb, 8 * $k), b)))
-            }};
-        }
-        macro_rules! cs { ($k:literal) => { corner!(sea,soa,seb,sob,$k) } }
-        macro_rules! ct { ($k:literal) => { corner!(tea,toa,teb,tob,$k) } }
-        macro_rules! plus {
-            ($x:expr,$y:expr) => {{ let (a,b)=$x;let (c,d)=$y;
-                (_mm512_xor_si512(a,c),_mm512_xor_si512(b,d)) }};
-        }
-        macro_rules! product2 {
-            ($i:literal,$p:expr,$q:expr) => {{ let (a,b)=$p; let (c,d)=$q; acc[$i].mul_acc2(a,b,c,d); }};
-        }
-        let (o_s, q0s) = cs!(0);
-        let (o_t, q0t) = ct!(0);
-        product2!(0, o_s, o_t);
-        product2!(1, q0s, q0t);
-        let (_, q1s) = cs!(1);
-        let (_, q1t) = ct!(1);
-        product2!(2, q1s, q1t);
-        let (es, et) = (plus!(q0s, q1s), plus!(q0t, q1t));
-        product2!(3, es, et);
-        let (_, q2s) = cs!(2);
-        let (_, q2t) = ct!(2);
-        product2!(4, q2s, q2t);
-        let (_, q3s) = cs!(3);
-        let (_, q3t) = ct!(3);
-        product2!(5, q3s, q3t);
-        let (fs, ft) = (plus!(q2s, q3s), plus!(q2t, q3t));
-        product2!(6, fs, ft);
-        product2!(7, plus!(q0s, q2s), plus!(q0t, q2t));
-        product2!(8, plus!(q1s, q3s), plus!(q1t, q3t));
-        product2!(9, plus!(es, fs), plus!(et, ft));
-    }
-}
-
 /// [`round2_lookahead_chunk_baked_elide_x86`] plus the deferred round-four
 /// biquadratic: returns the incumbent eight sums and the 18 round-four sums
 /// `[v1; 9] ++ [vinf; 9]` (on `S·Etop·f_{r3}` weights; the driver applies
@@ -6957,13 +6730,9 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_red_x86(
     let pair = !*OFF && lw.lv4[0] == lw.lv4[2] && lw.lv4[1] == lw.lv4[3];
     unsafe {
         macro_rules! go { ($p:literal,$a:literal,$b:literal) => {
-            round2_lookahead_chunk_baked_elide_r4_impl::<$p, $a, $b, false, false>(a_pkt,b_pkt,row_base,lo_size,bk,lw) } }
+            round2_lookahead_chunk_baked_elide_r4_impl::<$p, $a, $b, false>(a_pkt,b_pkt,row_base,lo_size,bk,lw) } }
         macro_rules! go_m { ($a:literal,$b:literal) => {
-            if $a && $b && zc_r4_split_enabled() {
-                round2_lookahead_chunk_baked_elide_r4_impl::<true, true, true, true, true>(a_pkt,b_pkt,row_base,lo_size,bk,lw)
-            } else {
-                round2_lookahead_chunk_baked_elide_r4_impl::<true, $a, $b, true, false>(a_pkt,b_pkt,row_base,lo_size,bk,lw)
-            } } }
+            round2_lookahead_chunk_baked_elide_r4_impl::<true, $a, $b, true>(a_pkt,b_pkt,row_base,lo_size,bk,lw) } }
         match (pair, ys) {
             (true, true) if zc_r2_merge_enabled() => go_m!(true, true),
             (true, false) if zc_r2_merge_enabled() => go_m!(false, false),
@@ -7066,13 +6835,9 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
     let pair = !*OFF && lw.lv4[0] == lw.lv4[2] && lw.lv4[1] == lw.lv4[3];
     unsafe {
         macro_rules! go { ($p:literal,$a:literal,$b:literal) => {
-            round2_lookahead_chunk_baked_elide_r4_impl::<$p, $a, $b, false, false>(a_pkt,b_pkt,row_base,lo_size,bk,lw) } }
+            round2_lookahead_chunk_baked_elide_r4_impl::<$p, $a, $b, false>(a_pkt,b_pkt,row_base,lo_size,bk,lw) } }
         macro_rules! go_m { ($a:literal,$b:literal) => {
-            if $a && $b && zc_r4_split_enabled() {
-                round2_lookahead_chunk_baked_elide_r4_impl::<true, true, true, true, true>(a_pkt,b_pkt,row_base,lo_size,bk,lw)
-            } else {
-                round2_lookahead_chunk_baked_elide_r4_impl::<true, $a, $b, true, false>(a_pkt,b_pkt,row_base,lo_size,bk,lw)
-            } } }
+            round2_lookahead_chunk_baked_elide_r4_impl::<true, $a, $b, true>(a_pkt,b_pkt,row_base,lo_size,bk,lw) } }
         let (red, red4) = match (pair, ys) {
             (true, true) if zc_r2_merge_enabled() => go_m!(true, true),
             (true, false) if zc_r2_merge_enabled() => go_m!(false, false),
@@ -7101,8 +6866,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
     target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
 )]
 #[inline(never)]
-#[unsafe(link_section = ".text.r2hot")]
-unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA: bool, const YB: bool, const MERGE: bool, const SPLIT: bool>(
+unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA: bool, const YB: bool, const MERGE: bool>(
     a_pkt: *const u8,
     b_pkt: *const u8,
     row_base: usize,
@@ -7129,45 +6893,6 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
         let fb_first = core::ptr::addr_of_mut!((*fb_first_store.as_mut_ptr()).0).cast::<F128>();
         let mut fa = fa_work;
         let mut fb = fb_work;
-        let mut sides = core::mem::MaybeUninit::<[R4Side; 2]>::uninit();
-        let nul = core::ptr::null_mut::<F128>();
-        let (mut dst_a, mut dst_b) = ([R4SplitDst { ev: [nul; 4], od: [nul; 4] }; 3], [R4SplitDst { ev: [nul; 4], od: [nul; 4] }; 3]);
-        let (sa_p, sb_p);
-        if SPLIT {
-            let base = sides.as_mut_ptr().cast::<R4Side>();
-            sa_p = base;
-            sb_p = base.add(1);
-            for (side, dst) in [(sa_p, &mut dst_a), (sb_p, &mut dst_b)] {
-                let (fe, fo) = ((*side).f_e.0.as_mut_ptr(), (*side).f_o.0.as_mut_ptr());
-                let (me, mo) = ((*side).m_e.0.as_mut_ptr(), (*side).m_o.0.as_mut_ptr());
-                let (le, lo) = ((*side).l_e.0.as_mut_ptr(), (*side).l_o.0.as_mut_ptr());
-                let (te, to) = ((*side).t_e.0.as_mut_ptr(), (*side).t_o.0.as_mut_ptr());
-                dst[0].ev[1] = te;
-                dst[0].od[1] = to;
-                dst[0].ev[2] = fe.add(4);
-                dst[0].od[2] = fo.add(4);
-                dst[0].ev[3] = fe.add(6);
-                dst[0].od[3] = fo.add(6);
-                for g in 0..4usize {
-                    dst[1].ev[g] = me.add(4 * (g >> 1) + 2 * (g & 1));
-                    dst[1].od[g] = mo.add(4 * (g >> 1) + 2 * (g & 1));
-                }
-                dst[2].ev[0] = le;
-                dst[2].od[0] = lo;
-                dst[2].ev[1] = le.add(2);
-                dst[2].od[1] = lo.add(2);
-                dst[2].ev[2] = te.add(2);
-                dst[2].od[2] = to.add(2);
-            }
-        } else {
-            sa_p = core::ptr::null_mut();
-            sb_p = core::ptr::null_mut();
-        }
-        let nsp = core::ptr::null::<R4SplitDst>();
-        let (pa0, pa1, pa2, pb0, pb1, pb2) = if SPLIT {
-            (&dst_a[0] as *const R4SplitDst, &dst_a[1] as *const R4SplitDst, &dst_a[2] as *const R4SplitDst,
-             &dst_b[0] as *const R4SplitDst, &dst_b[1] as *const R4SplitDst, &dst_b[2] as *const R4SplitDst)
-        } else { (nsp, nsp, nsp, nsp, nsp, nsp) };
         let a_mats_ptr = bk.a_mats.as_ptr().cast::<u64>();
         let b_mats_slice = bk.b_mats.as_ptr();
 
@@ -7327,8 +7052,8 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
             {
                 let g0 = row_base + 2 * x_lo;
                 let bm = &(*b_mats_slice.add(batch_base)).0;
-                gfni_fold64_rows_tr_bcast_skip_group_y::<true, YA>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0, pa0);
-                gfni_fold64_rows_tr_bcast_skip_group_y::<false, YB>(b_pkt.add(g0 * 8), bm.as_ptr(), fb, 0, pb0);
+                gfni_fold64_rows_tr_bcast_skip_group_y::<true, YA>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
+                gfni_fold64_rows_tr_bcast_skip_group_y::<false, YB>(b_pkt.add(g0 * 8), bm.as_ptr(), fb, 0);
                 pf_quarter!(g0, 0);
                 #[cfg(test)]
                 R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -7342,30 +7067,26 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
             {
                 let g0 = row_base + 2 * (x_lo + 32);
                 let bm = &(*b_mats_slice.add(batch_base + 1)).0;
-                gfni_fold64_rows_masked_tr_bcast4_y::<YA>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0, pa1);
-                gfni_fold64_rows_masked_tr_bcast_y::<YB>(b_pkt.add(g0 * 8), bm, fb, 0, pb1);
+                gfni_fold64_rows_masked_tr_bcast4_y::<YA>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
+                gfni_fold64_rows_masked_tr_bcast_y::<YB>(b_pkt.add(g0 * 8), bm, fb, 0);
                 accum2!(g0, 0, 1);
                 accum2!(g0, 2, 3);
-                if SPLIT {
-                    r4_round4_batch_split((*sa_p).m_e.0.as_ptr(), (*sa_p).m_o.0.as_ptr().wrapping_add(0), (*sb_p).m_e.0.as_ptr(), (*sb_p).m_o.0.as_ptr(), &mut acc4);
-                } else { r4_round4_batch(fa, fb, &mut acc4, 255); }
+                r4_round4_batch(fa, fb, &mut acc4, 255);
             }
             {
                 let g0 = row_base + 2 * (x_lo + 64);
                 let bm = &(*b_mats_slice.add(batch_base + 2)).0;
-                gfni_fold64_rows_masked_tr_bcast4_y::<YA>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0, pa1);
-                gfni_fold64_rows_masked_tr_bcast_y::<YB>(b_pkt.add(g0 * 8), bm, fb, 0, pb1);
+                gfni_fold64_rows_masked_tr_bcast4_y::<YA>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
+                gfni_fold64_rows_masked_tr_bcast_y::<YB>(b_pkt.add(g0 * 8), bm, fb, 0);
                 accum2!(g0, 0, 1);
                 accum2!(g0, 2, 3);
-                if SPLIT {
-                    r4_round4_batch_split((*sa_p).m_e.0.as_ptr(), (*sa_p).m_o.0.as_ptr().wrapping_add(0), (*sb_p).m_e.0.as_ptr(), (*sb_p).m_o.0.as_ptr(), &mut acc4);
-                } else { r4_round4_batch(fa, fb, &mut acc4, 255); }
+                r4_round4_batch(fa, fb, &mut acc4, 255);
             }
             {
                 let g0 = row_base + 2 * (x_lo + 96);
                 let bm = &(*b_mats_slice.add(batch_base + 3)).0;
-                gfni_fold64_rows_tr_bcast_skip_group_y::<true, YA>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 3, pa2);
-                gfni_fold64_rows_tr_bcast_skip_group_y::<false, YB>(b_pkt.add(g0 * 8), bm.as_ptr(), fb, 3, pb2);
+                gfni_fold64_rows_tr_bcast_skip_group_y::<true, YA>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 3);
+                gfni_fold64_rows_tr_bcast_skip_group_y::<false, YB>(b_pkt.add(g0 * 8), bm.as_ptr(), fb, 3);
                 accum2!(g0, 0, 1);
                 if PAIR && MERGE {
                     pf_quarter!(g0, 2);
@@ -7379,20 +7100,13 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
                     // initialized groups: the two full sets plus one set
                     // combining the two surviving partial halves.
                     // This replaces four sets of ten products with three.
-                    if SPLIT {
-                        let (a, b) = (&*sa_p, &*sb_p);
-                        r4_split_set2(
-                            a.f_e.0.as_ptr().add(4), a.f_o.0.as_ptr().add(4), b.f_e.0.as_ptr().add(4), b.f_o.0.as_ptr().add(4),
-                            a.t_e.0.as_ptr(), a.t_o.0.as_ptr(), b.t_e.0.as_ptr(), b.t_o.0.as_ptr(),
-                            &mut acc4);
-                        r4_split_set(a.l_e.0.as_ptr(), a.l_o.0.as_ptr(), b.l_e.0.as_ptr(), b.l_o.0.as_ptr(), &mut acc4);
-                    } else if MERGE {
+                    if MERGE {
                         r4_canonical_set2(fa_first,fb_first,2,fa_first,fb_first,3,fa_first,fb_first,1,fa,fb,2,&mut acc4);
                     } else {
                         r4_canonical_set(fa_first,fb_first,2,fa_first,fb_first,3,&mut acc4);
                         r4_canonical_set(fa_first,fb_first,1,fa,fb,2,&mut acc4);
                     }
-                    if !SPLIT { r4_canonical_set(fa,fb,0,fa,fb,1,&mut acc4); }
+                    r4_canonical_set(fa,fb,0,fa,fb,1,&mut acc4);
                 } else { r4_round4_batch(fa, fb, &mut acc4, 3); }
                 pf_quarter!(g0, 3);
                 #[cfg(test)]
@@ -7401,9 +7115,7 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
             x_lo += 128;
         }
 
-        let red: [__m512i; 8] = if SPLIT {
-            core::array::from_fn(|i| { let v = acc[i].reduce_lanes(); _mm512_shuffle_i64x2::<0xD8>(v, v) })
-        } else { core::array::from_fn(|i| acc[i].reduce_lanes()) };
+        let red: [__m512i; 8] = core::array::from_fn(|i| acc[i].reduce_lanes());
         let red4: [__m512i; 10] = core::array::from_fn(|i| acc4[i].reduce_lanes());
         (red, red4)
     }
@@ -7763,6 +7475,8 @@ unsafe fn casc_block<const NT_OUT: bool, const B7: bool, const A31: bool>(
         let od = |p: __m512i, q: __m512i| _mm512_shuffle_i64x2::<0xDD>(p, q);
         let eb: [__m512i; 4] = core::array::from_fn(|k| ev(b_t0[k], b_t1[k]));
         let ob: [__m512i; 4] = core::array::from_fn(|k| od(b_t0[k], b_t1[k]));
+        // A31 (lane z3a): A's ZMM 7 (lines 7, 15, 23, 31; line 31 is zero) is
+        // returned for the caller's four-block group pack instead of stored.
         let a_z7 = od(a_t0[3], a_t1[3]);
         if A31 {
             if NT_OUT {
@@ -7814,6 +7528,7 @@ unsafe fn casc_block<const NT_OUT: bool, const B7: bool, const A31: bool>(
                 _mm512_storeu_si512(ap.add(16 + 4 * k).cast::<__m512i>(), od(a_t0[k], a_t1[k]));
             }
         }
+        // The A31 layout is only produced together with the B7 B table.
         const { assert!(!A31 || B7) };
         if !A31 && !NT_OUT {
             for k in 0..4 {
@@ -7869,6 +7584,9 @@ unsafe fn casc_block<const NT_OUT: bool, const B7: bool, const A31: bool>(
     }
 }
 
+/// A31 (lane z3a, `FLOCK_NO_Z3_A31`): pack the live lanes 0..3 of the four
+/// A ZMM 7s of a four-block group (lane 3 = line 31 is zero) into three ZMMs:
+/// `[z0.0 z0.1 z0.2 z1.0] [z1.1 z1.2 z2.0 z2.1] [z2.2 z3.0 z3.1 z3.2]`.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -7891,6 +7609,8 @@ unsafe fn a31_pack(z: [core::arch::x86_64::__m512i; 4]) -> [core::arch::x86_64::
     }
 }
 
+/// Inverse of [`a31_pack`] from the three packed ZMMs at `src`: the four
+/// ZMM 7s with lane 3 zero.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -7899,6 +7619,9 @@ unsafe fn a31_pack(z: [core::arch::x86_64::__m512i; 4]) -> [core::arch::x86_64::
 #[inline(always)]
 unsafe fn a31_unpack(src: *const F128) -> [core::arch::x86_64::__m512i; 4] {
     use core::arch::x86_64::*;
+    // The packed lanes are the four ZMM 7s' lanes 0..3 back to back, so ZMM
+    // 7 of block k is three F128s at `src + 3k` with lane 3 masked to zero:
+    // four masked loads, no shuffles.
     unsafe {
         core::array::from_fn(|k| _mm512_maskz_loadu_epi64(0x3F, src.add(3 * k).cast::<i64>()))
     }
@@ -8001,6 +7724,7 @@ pub(crate) fn zc_c3_enabled() -> bool {
     target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
 )]
 #[inline(never)]
+// Lane la1: r345 hot cluster (see the `.text.r345` global_asm above).
 #[unsafe(link_section = ".text.r345")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
@@ -8048,6 +7772,7 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
     const A0_A2_B1_B1: [u64; 8] = lane_select([(0, 0), (0, 2), (1, 1), (1, 1)]);
     // Prefetch targets sit `ZC_PKT_PF_TILES` half-blocks ahead, so an odd
     // lead makes a block's first half prefetch a second half and vice versa.
+    // Lane r5: `PFD` (FLOCK_R5_PFD) is the lead in half-blocks, 0 = none.
     let pf_flips_half: bool = PFD % 2 == 1;
 
     unsafe {
@@ -8068,6 +7793,7 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
         let i_a02_b0 = ix(&A0_A2_B0_B0);
         let i_a02_b1 = ix(&A0_A2_B1_B1);
 
+        // Lane r5: MAHK 1 = Mahmoud asm, 2 = original asm, 0 = runtime check per call.
         macro_rules! g64 {
             ($p:expr) => {{
                 #[cfg(target_os = "linux")]
@@ -8187,6 +7913,7 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
         // Round-seven accumulators (CASC only): [0] = A(0,0,1)·B(0,0,1) on
         // packed odd lanes, [1..10] = the t = ∞ corner products.
         let mut acc7 = [WideGhashX4::zero(); 10];
+        // A31: the current four-block group's A ZMM 7s.
         let mut a7s = [_mm512_setzero_si512(); 4];
 
         let mut x_lo = 0;
@@ -8248,6 +7975,7 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
 
             if CASC {
                 let _ = (wa, wa64, wc, wc64);
+                // A31: a four-block group is 4 x 7 ZMMs, then the 3 packed ZMM 7s.
                 let j = (x_lo / 16) % 4;
                 let group = a_out_ptr.add(124 * (x_lo / 64));
                 let z7 = casc_block::<NT_OUT, B7, A31>(
@@ -8379,11 +8107,11 @@ mod r4_canonical_pair_tests {
             let bm=(0..lo/32).map(|_|R2FoldMats(std::array::from_fn(|_|next(&mut s)))).collect();
             let bk=R2EqBake { a_mats:am,b_mats:bm,b_scale:vec![F128::ONE;lo/32],lane,canonical_elide:true };
             unsafe {
-                let want=round2_lookahead_chunk_baked_elide_r4_impl::<false, false, false, false, false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw);
-                let got=round2_lookahead_chunk_baked_elide_r4_impl::<true, false, false, false, false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw);
+                let want=round2_lookahead_chunk_baked_elide_r4_impl::<false, false, false, false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw);
+                let got=round2_lookahead_chunk_baked_elide_r4_impl::<true, false, false, false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw);
                 assert_eq!(r2_r4_finish(&got.0,&got.1,&bk,&lw),r2_r4_finish(&want.0,&want.1,&bk,&lw),"lo={lo} row_base={row_base}");
                 let other=R4LaneWeights { lv4:[even,odd,even+F128::ONE,odd],lv4_odd:lw.lv4_odd };
-                let want=round2_lookahead_chunk_baked_elide_r4_impl::<false, false, false, false, false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&other);
+                let want=round2_lookahead_chunk_baked_elide_r4_impl::<false, false, false, false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&other);
                 let want=r2_r4_finish(&want.0,&want.1,&bk,&other);
                 let got=round2_lookahead_chunk_baked_elide_r4_x86(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&other,false);
                 assert_eq!(got,want,"non-periodic lane weights must retain the original route");
@@ -8456,13 +8184,11 @@ mod r4_canonical_pair_tests {
             let bk=R2EqBake { a_mats:am,b_mats:bm,b_scale:vec![F128::ONE;lo/32],lane,canonical_elide:true };
             unsafe {
                 let (ap, bp) = (a.as_ptr(), b.as_ptr());
-                let want = flat(round2_lookahead_chunk_baked_elide_r4_impl::<true, true, true, false, false>(ap,bp,row_base,lo,&bk,&lw));
-                let got = flat(round2_lookahead_chunk_baked_elide_r4_impl::<true, true, true, true, false>(ap,bp,row_base,lo,&bk,&lw));
+                let want = flat(round2_lookahead_chunk_baked_elide_r4_impl::<true, true, true, false>(ap,bp,row_base,lo,&bk,&lw));
+                let got = flat(round2_lookahead_chunk_baked_elide_r4_impl::<true, true, true, true>(ap,bp,row_base,lo,&bk,&lw));
                 assert_eq!(got, want, "merge ys lo={lo} row_base={row_base}");
-                let got = flat(round2_lookahead_chunk_baked_elide_r4_impl::<true, true, true, true, true>(ap,bp,row_base,lo,&bk,&lw));
-                assert_eq!(got, want, "c1 split lo={lo} row_base={row_base}");
-                let want = flat(round2_lookahead_chunk_baked_elide_r4_impl::<true, false, false, false, false>(ap,bp,row_base,lo,&bk,&lw));
-                let got = flat(round2_lookahead_chunk_baked_elide_r4_impl::<true, false, false, true, false>(ap,bp,row_base,lo,&bk,&lw));
+                let want = flat(round2_lookahead_chunk_baked_elide_r4_impl::<true, false, false, false>(ap,bp,row_base,lo,&bk,&lw));
+                let got = flat(round2_lookahead_chunk_baked_elide_r4_impl::<true, false, false, true>(ap,bp,row_base,lo,&bk,&lw));
                 assert_eq!(got, want, "merge lo={lo} row_base={row_base}");
             }
         }}}

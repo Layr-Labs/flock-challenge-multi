@@ -2606,6 +2606,12 @@ unsafe fn accumulate_transposed_banks_half_tc_x86_avx512(
     }
 }
 
+/// tc2: [`fold_ab_plane_banks_x86_avx512`] for a band of the tc2 ab_inner
+/// layout (`Round1AbInner::set_tc2_layout`). Band `x` holds raw slot `j`, so
+/// reduced lane `4(2y + h) + k` is lane `8j + y` of storage band
+/// `(x & 30) | h | k << 5`. Each lane takes that band's eq_hi (`eq8[4h + k]`)
+/// and the eight lanes of each `y` are summed into `local_res_ab[8j + y]`:
+/// the same field products as the per-band fold, XOR-combined in another
 /// order.
 #[cfg(all(
     target_arch = "x86_64",
@@ -2630,7 +2636,9 @@ pub(crate) unsafe fn fold_ab_plane_banks_tc2_x86_avx512(
     }
 }
 
+/// tc2 twin of [`accumulate_transposed_banks_half_x86_avx512`]: same eq_bot
 /// accumulation; only the band-end eq_hi fold differs (see
+/// [`fold_ab_plane_banks_tc2_x86_avx512`]).
 #[inline(never)]
 #[cfg(all(
     target_arch = "x86_64",
@@ -2695,6 +2703,9 @@ unsafe fn accumulate_transposed_banks_half_tc2_x86_avx512(
             u += 1;
         }
 
+        // tc2: zmm m holds dword m = 2y + h of the raw line, its 128-bit
+        // lane k is lane 2k + h at Horner byte 8j + y, and carries the
+        // eq_hi of storage band (x & 30) | h | k << 5 (eq8[4h + k]).
         let tv_of = |h: usize| {
             let e = &eq8[4 * h..4 * h + 4];
             _mm512_set_epi64(
@@ -2705,6 +2716,7 @@ unsafe fn accumulate_transposed_banks_half_tc2_x86_avx512(
         let tv = [tv_of(0), tv_of(1)];
         let tv_x64 = [ghash_shift64_x4(tv[0]), ghash_shift64_x4(tv[1])];
         let accs = [acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7];
+        // half_offset is even, so zmm parity is the index parity here.
         let scaled: [__m512i; 8] =
             core::array::from_fn(|m| ghash_mul_x4_split(accs[m].reduce_lanes(), tv[m & 1], tv_x64[m & 1]));
         let s: [__m512i; 4] = core::array::from_fn(|y| _mm512_xor_si512(scaled[2 * y], scaled[2 * y + 1]));
@@ -2725,6 +2737,7 @@ unsafe fn accumulate_transposed_banks_half_tc2_x86_avx512(
             _mm512_permutex2var_epi64(t0, s2_lo, t1),
             _mm512_permutex2var_epi64(t0, s2_hi, t1),
         );
+        // Outputs 8j + half_offset/2 + (0..4).
         let dst = (local_res_ab.as_mut_ptr() as *mut __m512i).add(2 * j + half_offset / 8);
         let cur = _mm512_loadu_si512(dst as *const __m512i);
         _mm512_storeu_si512(dst, _mm512_xor_si512(cur, folded));

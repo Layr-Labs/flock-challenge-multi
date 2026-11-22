@@ -1988,6 +1988,9 @@ pub fn fold_b128_elems(suffix_tensor: &[F128], eq_r_dprime: &[F128]) -> Vec<F128
 
     // Build the 16 byte-tables. `tables[byte_idx * 256 + value]` = the F128
     // sum of `eq_r_dprime[byte_idx*8 + bit]` over set bits in `value`.
+    // Every entry is written by the loop below before any read, so the
+    // table starts uninitialised (no 64 KiB zero fill; spariev's
+    // fold-table zero-fill removal on the Apple track, `a408b770`).
     let mut tables = if fold_table_uninit_enabled() {
         crate::alloc_uninit_vec::<F128>(N_BYTES * TABLE_SIZE)
     } else {
@@ -2076,6 +2079,10 @@ const FOLD_N_BYTES: usize = 16;
 /// Entries per byte-lookup table.
 const FOLD_TABLE_SIZE: usize = 256;
 
+/// Ported from Meganpark980320's submission 1cd0dc51-7c29-4c24-840c-1b822cc02738
+/// (piece 8).
+/// `FLOCK_NO_XP_FOLD_TABLE_UNINIT=1` restores the zero-filled allocation of
+/// the ring-switch byte-lookup fold tables. Read once.
 fn fold_table_uninit_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_XP_FOLD_TABLE_UNINIT").is_none());
@@ -2087,6 +2094,7 @@ fn fold_table_uninit_enabled() -> bool {
 /// `eq_r_dprime` already has γ_k baked in, so the table carries γ too.
 pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
     assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
+    // All 16 x 256 entries are written below before any read.
     let mut tables = if fold_table_uninit_enabled() {
         crate::alloc_uninit_vec::<F128>(FOLD_N_BYTES * FOLD_TABLE_SIZE)
     } else {
@@ -2359,6 +2367,8 @@ fn build_direct_fold_table<const N: usize>(
     base: &[F128],
 ) -> Vec<F128> {
     debug_assert_eq!(base.len(), FOLD_TABLE_TOTAL);
+    // Each byte table sets entry 0 and fills 1..256 by doubling below, so
+    // every entry is written before any read.
     let mut out = if fold_table_uninit_enabled() {
         crate::alloc_uninit_vec::<F128>(FOLD_TABLE_TOTAL)
     } else {
@@ -2456,6 +2466,8 @@ pub(crate) fn build_direct_fold8_table(
 /// six retained bank coordinates online.
 pub(crate) fn build_direct_fold8_table_from_generators(generators: &[F128]) -> Vec<F128> {
     assert_eq!(generators.len(), 1 << LOG_PACKING);
+    // Entry 0 of each byte table is set explicitly and the doubling below
+    // writes entries 1..256, so the table starts uninitialised.
     let mut out = if fold_table_uninit_enabled() {
         crate::alloc_uninit_vec::<F128>(FOLD_TABLE_TOTAL)
     } else {

@@ -95,6 +95,8 @@ pub(super) fn butterfly_fused_2layer(
     butterfly_fused_2layer_with_off(a, b, c, d, t_outer, t_inner_a, t_inner_b, low_twiddle_disabled());
 }
 
+/// `FLOCK_NO_LOW_TWIDDLE`, for callers that read it once per block and pass it
+/// to [`butterfly_fused_2layer_with_off`].
 #[inline]
 pub(super) fn low_twiddle_off() -> bool {
     low_twiddle_disabled()
@@ -180,7 +182,12 @@ pub(super) fn butterfly_fused_2layer_with_off(
 /// or 64. When `ALIGNED_ZMM`, every destination must be 64-byte aligned; the
 /// fallback only requires 16-byte alignment. The cfg gate guarantees the
 /// required target features.
+/// st2 ZTAIL: `lanes` flag for [`butterfly_fused_2layer_publish_nt`] at
+/// `lanes == 60`: do not store the four contractually zero tail fields
+/// (60..64). Only the seed+top publish sets it; its sole reader, the deep pass,
+/// never loads those fields of an odd row (see `st2_ztail_enabled`).
 pub(super) const ZT_SKIP: usize = 1 << 16;
+/// st2 ZTAIL diagnostics: store all-ones there instead (proves no reader).
 pub(super) const ZT_POISON: usize = 1 << 17;
 
 #[cfg(all(
@@ -247,6 +254,12 @@ pub(super) unsafe fn butterfly_fused_2layer_publish_nt<const ALIGNED_ZMM: bool>(
     }
 }
 
+/// Hoisted publish2 dispatch: `true` when both process-cached switches read by
+/// [`butterfly_fused_2layer_publish_nt`] on every quad (`FLOCK_NO_LOW_TWIDDLE`
+/// and the x86 leaf's `FLOCK_NO_NTT_MUL_DIET`) are unset, i.e. the ranked
+/// default. Callers read it once per publish block and then use
+/// [`butterfly_fused_2layer_publish_nt_hot`] for every quad; otherwise they keep
+/// the per-quad dispatch unchanged.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -257,9 +270,20 @@ pub(super) fn publish_nt_hot_enabled() -> bool {
     !low_twiddle_disabled() && !x86_64::mul_diet_disabled()
 }
 
+/// [`butterfly_fused_2layer_publish_nt`] with its two process-cached switch
+/// reads hoisted to the caller (see [`publish_nt_hot_enabled`]).
 ///
+/// With both switches unset, the per-quad wrapper computes
+/// `outer_low = t_outer.hi == 0`, `inner_low = t_inner_a.hi == 0 &&
+/// t_inner_b.hi == 0`, and its leaf `publish_nt_gen` then takes
+/// `publish_nt_impl::<outer_low, inner_low, DIET = true, ALIGNED_ZMM>` with the
+/// same ten arguments. This calls exactly that instantiation with exactly those
+/// arguments, so the arithmetic, the lane count, the `ZT_SKIP` / `ZT_POISON`
+/// tail flags carried above it, and every store are unchanged.
 ///
 /// # Safety
+/// [`butterfly_fused_2layer_publish_nt`]'s contract, and the caller observed
+/// [`publish_nt_hot_enabled`] returning `true`.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",

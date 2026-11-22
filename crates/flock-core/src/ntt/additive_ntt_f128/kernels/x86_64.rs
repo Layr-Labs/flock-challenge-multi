@@ -649,6 +649,7 @@ pub(super) unsafe fn butterfly_fused_2layer_publish_nt_impl<
     // SAFETY: the caller guarantees four readable scratch rows, four disjoint
     // 16-byte-aligned destinations, target features, and lanes in {60, 64}.
     unsafe {
+        // st2 ZTAIL flags ride above the lane count (`super::ZT_SKIP`).
         let zt = lanes & !0xff;
         let lanes = lanes & 0xff;
         debug_assert!(lanes == 60 || lanes == 64);

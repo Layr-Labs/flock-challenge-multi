@@ -2765,6 +2765,9 @@ impl Iterator for OctaOrder<'_> {
             }
             // Atomicity alone gives each value to one caller. The octa's
             // writes reach the fold through the encoder's existing join.
+            // st2 HELP: acquire/release claims order a helping pair's
+            // registration (before its claim) before the owner's exhausted
+            // claim, so the owner's join observes it. Same x86 instructions.
             Self::Shared(claim) => claim.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel),
             Self::Epoch(claim, epoch) => loop {
                 use std::sync::atomic::Ordering::{AcqRel, Acquire};
@@ -2778,6 +2781,8 @@ impl Iterator for OctaOrder<'_> {
                 }
             },
         };
+        // st2 HALF: claims run the even kpairs first (a bijection, so every
+        // octa still runs exactly once); see `st2_half_enabled`.
         let kpair = if !matches!(self, Self::Parity(_))
             && kpair < OCTAS_PER_GROUP
             && OCTAS_PER_GROUP == 32
@@ -3161,6 +3166,8 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                 // sb1: per-producer deferred ab_inner window (flushed after every octa).
                 let ab_pend_on = cfg!(all(target_feature="avx512f",target_feature="avx512bw",target_feature="avx512vbmi",target_feature="gfni")) && *blake3_witgen8::SB1_DEFER_ON;
                 let mut ab_pend = core::mem::MaybeUninit::new(blake3_witgen8::AbPend::new());
+                // tc2: raw projection lines at the bit-swapped rows; the brand
+                // below requires the same hole-free compact geometry.
                 let tc2_on = ab_pend_on && ab1_hole && ab_block_bytes == 29 * 64 && blake3_witgen8::tc2_layout_active();
                 // Group g owns r=2g and r=2g+1 across every q/k input.
                 // Each octa spans four quarters and adjacent k values. Root
@@ -3235,6 +3242,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                         if windows.is_none() && let Some(target) = target {
                             target.seed_octa(input_base, kpair);
                         }
+                        // st2 HALF: this octa's staging rows are complete.
                         if let Some(target) = target {
                             target.octa_done(kpair);
                         }
@@ -3338,10 +3346,6 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                 // Some z lines were never stored: these tiles are now the
                 // only complete source of z for this proof.
                 tiles.mark_z_elided();
-            }
-            #[cfg(all(target_feature = "avx512vl", target_feature = "avx512vbmi2", target_feature = "avx512dq"))]
-            if root_generator.is_some() && pipelined && blake3_witgen8::root_recompute::shift_free_enabled() {
-                unsafe { tiles.set_shift_free_fold_generator(blake3_witgen8::root_recompute::generate_tile16_sf); }
             }
             #[cfg(all(target_feature = "avx512vl", target_feature = "avx512vbmi2", target_feature = "avx512dq"))]
             if root_generator.is_some() && pipelined && (blake3_witgen8::root_recompute::stage_recompute::enabled() || blake3_zregen::fused_fold_enabled()) {

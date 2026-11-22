@@ -84,6 +84,7 @@ fn c0_is_identity_cached(r1cs: &BlockR1cs) -> bool {
     if !*ON {
         return r1cs.c0_is_identity();
     }
+    // Lock-free cache (Mahmoud514 98848648-ed89-4431-a277-2c91d383b16a).
     static CACHE: std::sync::OnceLock<([u8; 32], bool)> = std::sync::OnceLock::new();
     let digest = r1cs.statement_digest();
     if let Some(&(cached_digest, value)) = CACHE.get() {
@@ -669,6 +670,8 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     // five parameters; the warm-up proves leave it cached (no clone of the
     // parsed config's eleven vectors inside the timed prove).
     type CfgKey = (usize, usize, usize, pcs::ligerito::LigeritoProfile, flock_core::hash::HashKind);
+    // Lock-free fast path (Mahmoud514 98848648-ed89-4431-a277-2c91d383b16a);
+    // `FLOCK_NO_NV_LOCKFREE=1` takes the Mutex path on every prove.
     static FAST_CFG: std::sync::OnceLock<(CfgKey, &'static pcs::ligerito::ProverConfig)> =
         std::sync::OnceLock::new();
     static NO_LOCKFREE: std::sync::LazyLock<bool> =

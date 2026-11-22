@@ -711,8 +711,13 @@ const BYTE_TR: [u8; 64] = [
 // `FLOCK_NO_TC=1` keeps the incumbent layout and fold.
 static TC_ON: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_TC").is_none());
+// tc2: the projection stores its raw accumulators (no output shuffle) at
+// rows with bits 10 and 11 exchanged, so lane 2k+h of every line lands in its
+// own round-one band (flock_core::zerocheck::univariate_skip_optimized,
+// `Round1AbInner::set_tc2_layout`). `FLOCK_NO_TC2=1` keeps the tc layout.
 static TC2_ON: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_TC2").is_none());
+/// True when every tc projection also takes the tc2 layout.
 pub(super) fn tc2_layout_active() -> bool {
     tc_layout_active() && *TC2_ON
 }
@@ -1262,6 +1267,8 @@ _ => unreachable!(),
         core::arch::asm!("/* Horner NT publication boundary */", options(readonly, nostack, preserves_flags));
 
         let out = if TC2 {
+            // tc2: raw accumulators; the bit-swapped storage rows put every
+            // lane where round one's tc2 band fold reads it (no shuffle).
             *acc
         } else if TC {
             // tc layout: byte tc_byte(c) of every accumulator qword holds lane
@@ -1392,6 +1399,8 @@ pub(super) unsafe fn project<const COMPACT_COLS:usize>(
             if *PROJ_PIPE_ON {
                 // tc: the transpose-contract layout (see `tc_layout_active`).
                 if *TC_ON {
+                    // tc2: raw accumulators at the bit-swapped rows (see
+                    // `tc2_layout_active`); the octa's producer set the base.
                     if *TC2_ON && !(*proj.ab_pend).tc2_base.is_null() {
                         if rows.cached_z {
                             return project_policy::<true, true, COMPACT_COLS, true, true, true, true, true>(proj, blk, rows, ar, br, rw, t);

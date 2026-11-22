@@ -830,13 +830,18 @@ pub(super) unsafe fn bind_both_and_msg_split(
     }
 }
 
+/// [`bind_both_and_msg_split`] with the `z` bound values written to separate
+/// output runs `zo0/zo1` instead of over `zq0/zq1` (same per-slot values and
+/// message). Per slot `i`:
 /// `lo = c0[i] + r·(c2[i]+c0[i])`, `hi = c1[i] + r·(c3[i]+c1[i])`, likewise
+/// for `z`; `c0[i]/c1[i]/zo0[i]/zo1[i]` take the bound values, and the message
 /// accumulates `hi·zhi` and `(hi+lo)·(zhi+zlo)`.
 ///
 /// Quarters are separate contiguous runs, so no lane permute is needed; the
 /// four binds share one broadcast `r`.
 ///
 /// # Safety
+/// Requires `avx512f` and `vpclmulqdq`; all ten slices at least `n` long.
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 #[allow(clippy::too_many_arguments)]

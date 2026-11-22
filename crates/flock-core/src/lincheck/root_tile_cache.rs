@@ -37,10 +37,7 @@ pub struct RootTileCache {
     generator: Option<(u64, unsafe fn(u64, usize, *mut u8))>,
     pair_generator: Option<RootPairGenerator>,
     stage_generator: Option<unsafe fn(u64, usize, usize, *mut u8, *mut u8, *const u8)>,
-    fold_generator: Option<unsafe fn(u64, usize, *mut u8)>,
 }
-
-pub const SHIFT_FREE_BLOCKS: usize = 13 + 3 * 56;
 
 /// Raw read-only view of witness-produced word-major root tiles: `tiles`
 /// tiles of 176 groups x 512 bytes; group `g` of tile `t` starts at
@@ -56,7 +53,7 @@ pub struct WitnessTileView {
 }
 
 #[repr(align(64))]
-struct GeneratedTiles([core::mem::MaybeUninit<u8>; 4 * SHIFT_FREE_BLOCKS * 512]);
+struct GeneratedTiles([core::mem::MaybeUninit<u8>; 4 * 176 * 512]);
 
 #[derive(Clone, Copy)]
 pub(super) struct Capture {
@@ -175,7 +172,7 @@ fn prepare(
             cross_quarter: false,
             z_elided: false,
             generator: None,
-            pair_generator: None, stage_generator: None, fold_generator: None,
+            pair_generator: None, stage_generator: None,
         },
         folded,
     )
@@ -223,7 +220,7 @@ impl RootTileCache {
         let fields = tiles.checked_mul(blocks).unwrap().checked_mul(32).unwrap();
         let offset = storage.0.as_ptr().align_offset(64);
         assert!(offset <= 3 && offset.checked_add(fields).unwrap() <= storage.0.len());
-        Self { storage, offset, tiles, blocks, word_major: true, fixed_roots: true, cross_quarter: false, z_elided: false, generator: None, pair_generator: None, stage_generator: None, fold_generator: None }
+        Self { storage, offset, tiles, blocks, word_major: true, fixed_roots: true, cross_quarter: false, z_elided: false, generator: None, pair_generator: None, stage_generator: None }
     }
 
     /// Exact ranked root tiles generated into consumer-local scratch.
@@ -243,7 +240,7 @@ impl RootTileCache {
         Self {
             storage: PooledStorage(Vec::new()), offset: 0, tiles: 4096,
             blocks: 176, word_major: true, fixed_roots: true,
-            cross_quarter: true, z_elided: false, generator: Some((seed, generate)), pair_generator, stage_generator: None, fold_generator: None,
+            cross_quarter: true, z_elided: false, generator: Some((seed, generate)), pair_generator, stage_generator: None,
         }
     }
 
@@ -261,13 +258,6 @@ impl RootTileCache {
     pub unsafe fn set_stage_generator(&mut self, generate: unsafe fn(u64,usize,usize,*mut u8,*mut u8,*const u8)) {
         assert!(self.generator.is_some() && self.cross_quarter);
         self.stage_generator=Some(generate);
-    }
-
-    ///
-    /// # Safety
-    pub unsafe fn set_shift_free_fold_generator(&mut self, generate: unsafe fn(u64, usize, *mut u8)) {
-        assert!(self.generator.is_some() && self.cross_quarter && self.fixed_roots && self.blocks == 176);
-        self.fold_generator = Some(generate);
     }
 
     /// Record that the producer skipped z stores for some covered compressions.
@@ -434,6 +424,8 @@ impl RootTileCache {
             std::env::var_os("FLOCK_NO_ROOT_CACHE_PREFETCH").is_none()
         });
         let prefetch_blocks = BATCH_WORD_TILES && *PREFETCH;
+        // Schedule-only leaf (patternrecognition9-del 0cde1b93, runner in-run reads
+        // -0.15% and -0.35%): four GFNI pairs before their XORs. FLOCK_NO_ROOT_PIPELINED=1 restores.
         static PIPELINED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
             std::env::var_os("FLOCK_NO_ROOT_PIPELINED").is_none()
         });
@@ -455,12 +447,7 @@ impl RootTileCache {
         let tail1 = TAIL1.map_or(0, |m| m * word_batch * rayon::current_num_threads().max(1));
         let tiles_per_worker = self.tiles.div_ceil(rayon::current_num_threads().max(1));
         let workers = self.tiles.div_ceil(tiles_per_worker);
-        let shift_free = self.fold_generator.is_some();
-        let (fold_blocks, fold_gen) = match (self.fold_generator, self.generator) {
-            (Some(g), Some((seed, _))) => (SHIFT_FREE_BLOCKS, Some((seed, g))),
-            _ => (self.blocks, self.generator),
-        };
-        let stride = fold_blocks * 1024;
+        let stride = self.blocks * 1024;
         #[cfg(not(test))]
         let mut planes = crate::alloc_uninit_vec::<core::mem::MaybeUninit<u8>>(workers * stride);
         // The ranked prover's global recycler aligns allocations >=32 KiB to
@@ -487,7 +474,7 @@ impl RootTileCache {
                 crate::rstrace::evd("rf:w0", worker as u32);
                 // MaybeUninit bytes require no initialization; each live tile
                 // is fully overwritten by the checked generator before read.
-                let mut generated = fold_gen.map(|_| unsafe {
+                let mut generated = self.generator.map(|_| unsafe {
                     Box::<GeneratedTiles>::new_uninit().assume_init()
                 });
                 let mut mats = [0u64; 128];
@@ -532,10 +519,10 @@ impl RootTileCache {
                         let tile = lo;
                         let count = (hi - lo).min(word_batch);
                         lo += count;
-                        let source = if let Some((seed, generate)) = fold_gen {
+                        let source = if let Some((seed, generate)) = self.generator {
                             let base = generated.as_mut().unwrap().0.as_mut_ptr().cast::<u8>();
                             for slot in 0..count {
-                                unsafe { generate(seed, tile + slot, base.add(slot * fold_blocks * 512)); }
+                                unsafe { generate(seed, tile + slot, base.add(slot * self.blocks * 512)); }
                             }
                             base.cast_const()
                         } else {
@@ -550,14 +537,14 @@ impl RootTileCache {
                                     &mut matrix[t * 16..(t + 1) * 16]);
                             }
                         }
-                        for block in 0..fold_blocks {
+                        for block in 0..self.blocks {
                             if pipelined {
                                 unsafe {
                                     kernels::gfni_fold_word_tiles4_pipelined(
                                         source.add(block * 512), matrices.as_ptr().cast::<u64>(),
                                         dst.as_mut_ptr().cast::<u8>().add(block * 1024),
-                                        fold_blocks * 512, count, first, WORD_TO_COLUMNS.as_ptr(),
-                                        prefetch_blocks && block + 1 < fold_blocks);
+                                        self.blocks * 512, count, first, WORD_TO_COLUMNS.as_ptr(),
+                                        prefetch_blocks && block + 1 < self.blocks);
                                 }
                                 continue;
                             }
@@ -575,9 +562,9 @@ impl RootTileCache {
                                     source.add(block * 512),
                                     matrices.as_ptr().cast::<u64>(),
                                     dst.as_mut_ptr().cast::<u8>().add(block * 1024),
-                                    fold_blocks * 512, count, first,
+                                    self.blocks * 512, count, first,
                                     WORD_TO_COLUMNS.as_ptr(),
-                                    prefetch_blocks && block + 1 < fold_blocks);
+                                    prefetch_blocks && block + 1 < self.blocks);
                             }
                         }
                         first = false;
@@ -585,7 +572,7 @@ impl RootTileCache {
                     }
                     let tile = lo;
                     lo += 1;
-                    let generated_base = fold_gen.map(|(seed, generate)| {
+                    let generated_base = self.generator.map(|(seed, generate)| {
                         let base = generated.as_mut().unwrap().0.as_mut_ptr().cast::<u8>();
                         unsafe { generate(seed, tile, base); }
                         base
@@ -594,7 +581,7 @@ impl RootTileCache {
                         let eq8 = logical_eq8(8 * (tile * DIRECT_FOLD_TILE_STRIPES + t));
                         kernels::fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
                     }
-                    for block in 0..fold_blocks {
+                    for block in 0..self.blocks {
                         // SAFETY: the fully initialized immutable cache is
                         // 64-byte aligned; this worker owns every dst plane.
                         // Its first tile initializes all live planes before
@@ -649,40 +636,7 @@ impl RootTileCache {
         } else {
             vec![F128::ZERO; n_out]
         };
-        if shift_free {
-            debug_assert!(self.fixed_roots && n_out == 177 * 64);
-            let out_addr = out.as_mut_ptr() as usize;
-            (0..fold_blocks).into_par_iter().for_each(|block| {
-                crate::rstrace::evd("rf:rb", block as u32);
-                let mut buf = [F128::ZERO; 64];
-                unsafe {
-                    reduce_worker_plane_block(&planes, stride, &active_workers, block, &mut buf);
-                }
-                let out = out_addr as *mut F128;
-                unsafe {
-                    if block < 13 {
-                        core::ptr::copy_nonoverlapping(buf.as_ptr(), out.add(block * 64), 64);
-                    } else {
-                        let g = (block - 13) / 3;
-                        let j = (block - 13) % 3;
-                        let base = 897 + 186 * g + 62 * j;
-                        core::ptr::copy_nonoverlapping(buf.as_ptr(), out.add(base), 31);
-                        core::ptr::copy_nonoverlapping(buf.as_ptr().add(32), out.add(base + 31), 31);
-                        if block == 13 {
-                            *out.add(832) = buf[31];
-                        }
-                    }
-                }
-            });
-            crate::rstrace::ev("lcf:reduced", 0);
-            out[833..897].fill(F128::ZERO);
-            out[897 + 186 * 56..].fill(F128::ZERO);
-            let one = out[256];
-            for column in [839, 865, 866, 868] { out[column] = one; }
-            crate::rstrace::ev("rf:red1", 0);
-            return out;
-        }
-        let reduce_block = |block: usize, dst: &mut [F128]| {
+        out.par_chunks_mut(64).enumerate().for_each(|(block, dst)| {
             crate::rstrace::evd("rf:rb", block as u32);
             // Leave the omitted group clear. The boundary group's surviving
             // bits are moved into it after the parallel reduction joins.
@@ -693,23 +647,7 @@ impl RootTileCache {
             unsafe {
                 reduce_worker_plane_block(&planes, stride, &active_workers, source, dst);
             }
-        };
-        static C4_RED_TEAM: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_C4_NO_REDTEAM").is_none());
-        if *C4_RED_TEAM && crate::flat_par::team_enabled() && crate::flat_par::team_ready() {
-            let oa = out.as_mut_ptr() as usize;
-            crate::flat_par::team_map_reduce(
-                output_blocks,
-                |block| {
-                    let dst = unsafe { core::slice::from_raw_parts_mut((oa as *mut F128).add(64 * block), 64) };
-                    reduce_block(block, dst)
-                },
-                || (),
-                |_, _| (),
-            );
-        } else {
-            out.par_chunks_mut(64).enumerate().for_each(|(block, dst)| reduce_block(block, dst));
-        }
+        });
         crate::rstrace::ev("lcf:reduced", 0);
         if self.fixed_roots {
             out.copy_within(833..896, 897);

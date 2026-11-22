@@ -764,7 +764,7 @@ pub use root_tile_cache::RootTileCache as WitnessRootTiles;
     target_feature = "gfni",
     target_feature = "vpclmulqdq"
 ))]
-pub use root_tile_cache::{WitnessTileView, RootPairGenerator, SHIFT_FREE_BLOCKS};
+pub use root_tile_cache::{WitnessTileView, RootPairGenerator};
 
 pub struct RootFoldSource {
     plan: &'static LinearFoldPlan,
@@ -2078,22 +2078,8 @@ pub enum VerifyError {
 /// Standard "doubling-in-half" construction: `O(2^d)` F128 muls, no
 /// inversions. Indexing is LSB-first — `bit_j(i)` is the `j`-th LSB of `i`.
 pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
-    let mut out = crate::alloc_uninit_vec::<F128>(1usize << point.len());
-    build_eq_table_fill(point, &mut out);
-    out
-}
-
-pub(crate) fn build_eq_table_into(point: &[F128], out: &mut Vec<F128>) {
-    let n = 1usize << point.len();
-    out.clear();
-    out.resize(n, F128::ZERO);
-    build_eq_table_fill(point, out);
-}
-
-#[inline]
-fn build_eq_table_fill(point: &[F128], out: &mut [F128]) {
     let d = point.len();
-    debug_assert_eq!(out.len(), 1usize << d);
+    let mut out = crate::alloc_uninit_vec::<F128>(1usize << d);
     out[0] = F128::ONE;
     for (j, &r_j) in point.iter().enumerate() {
         let len = 1usize << j;
@@ -2120,6 +2106,7 @@ fn build_eq_table_fill(point: &[F128], out: &mut [F128]) {
             out[i] = v + hi;
         }
     }
+    out
 }
 
 /// Expand four adjacent entries of an eq table with one four-lane GHASH
@@ -4828,12 +4815,18 @@ fn gl1_lc_team_min() -> usize {
 
 const GL1_LC_CHUNKS: usize = 16;
 
+/// Lincheck capture by move: leech1996's submission
+/// 56d40be1-e5d6-456d-baff-3bbe8ac9cc51 (change 7).
+/// `FLOCK_NO_LC_CAPTURE_MOVE=1` restores the clone of the post-round-0 Fold8
+/// capture. Read once per process; default ON.
 fn lc_capture_move_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_CAPTURE_MOVE").is_none());
     *ON
 }
 
+/// [`gl1_bind_both_and_eval_next_team`] with `z` bound out of place: `z` is
+/// only read, and the bound table (length `z.len() / 2`) is returned.
 fn gl1_bind_both_and_eval_next_team_zout(
     comb: &mut Vec<F128>,
     z: &[F128],
@@ -4851,6 +4844,10 @@ fn gl1_bind_both_and_eval_next_team_zout(
         |i| {
             let s = i * ch;
             // SAFETY: chunk `i` writes only slots [s, s+ch) of the two low
+            // quarters of `comb` and of `z_next`, and reads [s, s+ch) of the
+            // four quarters of `z` / two high quarters of `comb`; chunks are
+            // disjoint, `z` is never written, and all buffers outlive
+            // `team_map_reduce`.
             unsafe {
                 let c = cp as *mut F128;
                 let zz = zp as *const F128;
@@ -4868,6 +4865,7 @@ fn gl1_bind_both_and_eval_next_team_zout(
         || (F128::ZERO, F128::ZERO),
         |a, b| (a.0 + b.0, a.1 + b.1),
     );
+    // SAFETY: the `half` slots were all written above (2 quarters x 16 chunks x ch).
     unsafe { z_next.set_len(half) };
     comb.truncate(half);
     (out, z_next)
@@ -5797,6 +5795,8 @@ fn prove_padded_inner<Ch: Challenger>(
             sumcheck_round_eval_par(&comb_vec, &z_vec)
         };
         crate::rstrace::ev("lc:sc:r0", 0);
+        // Round 1 binds the post-round-0 table (half the current length) on the
+        // team out of place when it would take the team path anyway.
         let oop_t1 = fold8_ready
             && lc_capture_move_enabled()
             && inner_rest_len > 2
@@ -5811,6 +5811,8 @@ fn prove_padded_inner<Ch: Challenger>(
             if t + 1 < inner_rest_len {
                 // Fused: bind both tables at r AND compute round (t+1)'s message.
                 let (ne1, neinf) = if oop_t1 && t == 1 {
+                    // Bind z out of place so the post-round-0 capture is moved,
+                    // not cloned; the capture is never written.
                     let (m, z_next) = gl1_bind_both_and_eval_next_team_zout(&mut comb_vec, &z_vec, r);
                     captured_z_vec = Some(std::mem::replace(&mut z_vec, z_next));
                     m

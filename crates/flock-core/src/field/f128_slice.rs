@@ -1155,6 +1155,8 @@ pub(crate) fn bind_both_and_msg_split(
     }
 }
 
+/// [`bind_both_and_msg_split`] writing the bound `z` values to `zo0/zo1`
+/// instead of over `zq0/zq1`; identical values and message.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn bind_both_and_msg_split_zout(

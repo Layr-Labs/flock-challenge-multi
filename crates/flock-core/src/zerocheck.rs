@@ -621,6 +621,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL1_R345_PRE").is_none());
     let gl1_r345_pre = *GL1_R345_PRE;
     let r345_pre_slot: std::sync::OnceLock<(Vec<F128>, Option<Vec<F128>>)> = std::sync::OnceLock::new();
+    // Lane z3a TEQ (`FLOCK_NO_Z3_TEQ`): then every tail level's split eq.
     let teq_slot: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     let peq_idle = || {
         let peq = peq_slot.get_or_init(|| packed_round2_split_eq(&mlv_pre));
@@ -1197,9 +1198,13 @@ fn prove_packed_padded_inner<C: Challenger>(
     // outputs over the start of each input chunk it has just read, and the
     // plain level 2 reads them piece by piece (`multilinear::TlPieces`).
     let tl = c3_r345 && n_levels > 3 && multilinear::tl_route_ok((1usize << n_mlv) / 8);
+    // Lane z3a A31 (`FLOCK_NO_Z3_A31`): the A table drops its zero line 31;
+    // its only reader is the in-place level 1 below.
     let a31 = b7 && tl && multilinear::z3_a31_enabled();
     // Level 2 also writes in place and level 3 reads its pieces.
     let tl2 = tl && n_levels > 4 && multilinear::tl2_route_ok((1usize << n_mlv) / 8);
+    // Lane sc1 (`FLOCK_NO_SC_TL3`): level 3 also writes in place and level 4
+    // reads its pieces (level 4 is not the last level, which reads tables).
     let tl3 = tl2 && n_levels > 5 && multilinear::tl3_route_ok((1usize << n_mlv) / 8);
     let mut tl_pieces: Option<multilinear::TlPieces> = None;
 
@@ -1400,6 +1405,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     a31,
                 );
             if a31 {
+                // The A31 table and its in-place pieces fill 31/32 of the buffer.
                 let len = a_mlv.len() / 32 * 31;
                 a_mlv.truncate(len);
             }

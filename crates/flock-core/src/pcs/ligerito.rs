@@ -2692,6 +2692,8 @@ fn inverse_ntt_final_layers_local(
 /// workers WHILE the owner is still drawing the later queries; after alpha
 /// only the alpha-weighted sums and the move into sorted order remain.
 /// Read once.
+/// Lane od1 (`FLOCK_NO_OD_DUALTEAM=1`): [`SparseDualL0::from_stream`]'s
+/// snapshot gather on the hot-pool team when the caller owns a live team.
 fn od_dual_team(chunks: usize) -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OD_DUALTEAM").is_none());
@@ -3081,12 +3083,18 @@ impl SparseDualL0 {
         };
         let n_chunks = n_queries.div_ceil(CH);
         let (enf_acc, u0_acc, u2_acc) = if od_dual_team(n_chunks) {
+            // Lane od1 (`FLOCK_NO_OD_DUALTEAM=1`: rayon route): the snapshot
+            // gather (<= 16 chunks) as a hot-pool team region; the owner spins
+            // on the done count instead of a rayon join tail. Same chunk
+            // bodies; XOR sums in another grouping: identical.
             let (rp, wp) = (rows.as_mut_ptr() as usize, w2_pows.as_mut_ptr() as usize);
             crate::flat_par::team_map_reduce(
                 n_chunks,
                 |c| {
                     let lo = c * CH;
                     let len = CH.min(n_queries - lo);
+                    // SAFETY: chunk `c` is claimed once and owns query slots
+                    // [lo, lo + len) of `rows` (stride rows each) and `w2_pows`.
                     let (rows_c, w2_c) = unsafe {
                         (
                             std::slice::from_raw_parts_mut((rp as *mut [F128; 16]).add(lo * stride), len * stride),
@@ -5612,83 +5620,6 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
-fn c4_eq_reuse_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_C4_NO_EQREUSE").is_none());
-    *ON
-}
-
-thread_local! {
-    static C4_EQ_SPARE: std::cell::RefCell<Vec<Vec<F128>>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-fn c4_eq_spare_put(v: Vec<F128>) {
-    if c4_eq_reuse_enabled() && v.capacity() >= 64 {
-        C4_EQ_SPARE.with(|s| {
-            let mut s = s.borrow_mut();
-            if s.len() < 2 {
-                s.push(v);
-            }
-        });
-    }
-}
-
-fn c4_build_eq_table(point: &[F128]) -> Vec<F128> {
-    let n = 1usize << point.len();
-    if c4_eq_reuse_enabled() {
-        let spare = C4_EQ_SPARE.with(|s| {
-            let mut s = s.borrow_mut();
-            let i = s.iter().position(|v| v.capacity() >= n)?;
-            Some(s.swap_remove(i))
-        });
-        if let Some(mut v) = spare {
-            crate::lincheck::build_eq_table_into(point, &mut v);
-            return v;
-        }
-    }
-    build_eq_table(point)
-}
-
-fn c4_fold_team_max() -> usize {
-    static MAX: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        std::env::var("FLOCK_C4_FOLDTEAM_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(16)
-    });
-    *MAX
-}
-
-fn c4_small_sub() -> usize {
-    static SUB: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        std::env::var("FLOCK_C4_SMALL_SUB").ok().and_then(|v| v.parse().ok()).unwrap_or(512)
-    });
-    *SUB
-}
-
-#[inline]
-fn c4_fold_team(n_chunks: usize) -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_C4_NO_FOLDTEAM").is_none());
-    *ON && n_chunks >= 2
-        && n_chunks <= c4_fold_team_max()
-        && crate::flat_par::team_enabled()
-        && crate::flat_par::team_ready()
-}
-
-fn c4_fold_wants_team(f_len: usize) -> bool {
-    let half = f_len / 2;
-    if half >= 4096 {
-        half.div_ceil(2048) <= c4_fold_team_max()
-    } else {
-        let sub = c4_small_sub();
-        sub >= 2 && half.is_multiple_of(sub) && half / sub >= 2
-    }
-}
-
-fn c4_join_swap_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_C4_NO_JOINSWAP").is_none());
-    *ON
-}
-
 fn open_nt_min_half_x86() -> usize {
     static MIN: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         if std::env::var_os("FLOCK_OPEN_NT_17").is_some() {
@@ -5746,31 +5677,6 @@ fn fold_and_msg_lsb_inner(
         if half >= 2 && lazy_ood.is_none_or(|(eq_lo, eq_hi, _)| eq_hi.len() == 1 && eq_lo.len() >= half) {
             let mut nf = crate::alloc_uninit_f128_vec(half);
             let mut nb = crate::alloc_uninit_f128_vec(half);
-            let sub = c4_small_sub();
-            if sub >= 2 && sub.is_multiple_of(2) && half.is_multiple_of(sub) && half / sub >= 2 && c4_fold_team(half / sub) {
-                let (nf_addr, nb_addr) = (nf.as_mut_ptr() as usize, nb.as_mut_ptr() as usize);
-                let (u_0, u_2) = crate::flat_par::team_map_reduce(
-                    half / sub,
-                    |ci| unsafe {
-                        use crate::field::gf2_128::x86_64::ghash_shift64_x4;
-                        use core::arch::x86_64::*;
-                        let base = ci * sub;
-                        let fc = core::slice::from_raw_parts_mut((nf_addr as *mut F128).add(base), sub);
-                        let bc = core::slice::from_raw_parts_mut((nb_addr as *mut F128).add(base), sub);
-                        let r_x4 = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
-                        let r_x64 = ghash_shift64_x4(r_x4);
-                        if lazy_ood.is_none() && deferred_basis.is_none() {
-                            fold_and_msg_chunk_x86::<false>(f, b, base, fc, bc, r, r_x4, r_x64, false, None, None)
-                        } else {
-                            let ood = lazy_ood.map(|(eq_lo, eq_hi, gamma)| (&eq_lo[base..], gamma * eq_hi[0]));
-                            fold_and_msg_chunk_x86::<true>(f, b, base, fc, bc, r, r_x4, r_x64, false, deferred_basis, ood)
-                        }
-                    },
-                    || (F128::ZERO, F128::ZERO),
-                    |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
-                );
-                return (FoldBuf::Owned(nf), FoldBuf::Owned(nb), SumcheckMessage { u_0, u_2 });
-            }
             let (u_0, u_2) = unsafe {
                 use crate::field::gf2_128::x86_64::ghash_shift64_x4;
                 use core::arch::x86_64::*;
@@ -5915,45 +5821,6 @@ fn fold_and_msg_lsb_inner(
     let (nf_s, nb_s): (&mut [F128], &mut [F128]) = (&mut nf, &mut nb);
     if let Some((eq_lo, _, _)) = lazy_ood {
         assert_eq!(eq_lo.len(), CHUNK, "ranked lazy OOD chunk width changed");
-    }
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    {
-        let n_chunks = half.div_ceil(CHUNK);
-        if c4_fold_team(n_chunks) {
-            let (nf_addr, nb_addr) = (nf_s.as_mut_ptr() as usize, nb_s.as_mut_ptr() as usize);
-            let (u_0, u_2) = crate::flat_par::team_map_reduce(
-                n_chunks,
-                |ci| {
-                    let base = ci * CHUNK;
-                    let len = CHUNK.min(half - base);
-                    let (fc, bc) = unsafe {
-                        (
-                            core::slice::from_raw_parts_mut((nf_addr as *mut F128).add(base), len),
-                            core::slice::from_raw_parts_mut((nb_addr as *mut F128).add(base), len),
-                        )
-                    };
-                    unsafe {
-                        if lazy_ood.is_none() && deferred_basis.is_none() {
-                            fold_and_msg_chunk_x86::<false>(
-                                f, b, base, fc, bc, r, r_x4, r_x64, use_nt, None, None,
-                            )
-                        } else {
-                            let ood = lazy_ood.map(|(eq_lo, eq_hi, gamma)| (eq_lo, gamma * eq_hi[ci]));
-                            fold_and_msg_chunk_x86::<true>(
-                                f, b, base, fc, bc, r, r_x4, r_x64, false, deferred_basis, ood,
-                            )
-                        }
-                    }
-                },
-                || (F128::ZERO, F128::ZERO),
-                |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
-            );
-            return (nf, nb, SumcheckMessage { u_0, u_2 });
-        }
     }
     let (u_0, u_2) = nf_s
         .par_chunks_mut(CHUNK)
@@ -7505,6 +7372,8 @@ fn ranked_sparse_dual_l0_depth(
 #[inline]
 fn ranked_sparse_dual_deep_depth_for_level(n_level: usize) -> Option<usize> {
     match n_level {
+        // Lane od1: depth 3 ends the dual with its level's last fold, so its
+        // basis can materialize in the background (`od_deep_bg_enabled`).
         16 | 13 | 10 if od_deep_bg_enabled() => Some(3),
         16 | 13 | 10 => Some(SPARSE_DUAL_MAX_DEPTH),
         7 => Some(3),
@@ -7772,6 +7641,14 @@ pub fn bench_direct_fold8_f_dense(
         });
 }
 
+/// Lane od1 (`FLOCK_NO_OD_BTAIL=1`): workers of the fold64 / seed6
+/// pipeline that find its claim list exhausted while its last tasks still
+/// run fold blocks of the level-one GFNI basis (b only) instead of idling at
+/// the region's end. The commit-phase basis pass then folds only the other
+/// blocks and, for blocks folded here, adds the round message with the
+/// two-pass `msg_reduce_avx512(f, b)`, which sees the same accumulation
+/// sequence as the fused strip form. Same b, same per-block (u0, u2), XOR
+/// sums: identical.
 fn od_btail_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OD_BTAIL").is_none());
@@ -7790,6 +7667,7 @@ type F8BasisSetup = (
     [(Vec<u64>, Vec<u64>); 2],
 );
 
+/// Lane od1: shared state of the level-one basis blocks folded early.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -7815,6 +7693,8 @@ struct F8BasisTail<'a> {
     target_feature = "vpclmulqdq",
     target_feature = "gfni"
 ))]
+// SAFETY: `b_addr` is the base of `folded_b`, which outlives the tail; each
+// block of it is written by the one worker that claimed it from `next`.
 unsafe impl Sync for F8BasisTail<'_> {}
 
 #[cfg(all(
@@ -7848,6 +7728,7 @@ impl<'a> F8BasisTail<'a> {
         self.setup.get_or_init(|| f8_basis_setup(self.claims, self.challenges))
     }
 
+    /// Claim and fold one basis block (b only); false once none is left.
     fn run_one(&self, gfni_tmp: &mut Option<crate::scratch::LocalBuf>) -> bool {
         use std::sync::atomic::Ordering;
         let x = self.next.fetch_add(1, Ordering::Relaxed);
@@ -7860,6 +7741,7 @@ impl<'a> F8BasisTail<'a> {
         });
         let (mats, rows) = self.setup();
         crate::rstrace::evd("bt:s", x as u32);
+        // SAFETY: block `x` is claimed once; its slots lie inside `folded_b`.
         unsafe {
             let b_out = std::slice::from_raw_parts_mut((self.b_addr as *mut F128).add(x * self.block_len), self.block_len);
             materialize_direct_fold8_b_gfni_block_x86(
@@ -7900,6 +7782,8 @@ fn f8_basis_setup(claims: &[super::ring_switch::DirectFold8Factors], challenges:
     )
 }
 
+/// Lane od1: the pipeline's view of an [`F8BasisTail`] (type-erased so the
+/// non-GFNI build keeps one signature).
 pub(crate) trait H3Tail: Sync {
     fn run_one(&self, gfni_tmp: &mut Option<crate::scratch::LocalBuf>) -> bool;
 }
@@ -8036,6 +7920,7 @@ fn h3_fold64_seed_pipeline(
     }
     let done: Vec<AtomicU32> = (0..groups).map(|_| AtomicU32::new(0)).collect();
     let next = AtomicUsize::new(0);
+    // Lane od1: finished claim-list items (the basis tail runs while < len).
     let fin = AtomicUsize::new(0);
     let out = folded_f.as_mut_ptr() as usize;
     let cw = mat.as_mut_ptr() as usize;
@@ -8372,6 +8257,8 @@ fn materialize_direct_fold8_b_gfni_impl(
             },
             |gfni_tmp, (block, b_out)| unsafe {
                 let f_out = folded_f.map(|f| &f[block * block_len..(block + 1) * block_len]);
+                // Lane od1: a block the pipeline tail already folded needs
+                // only its message (two-pass form, same sums).
                 if tail.is_some_and(|t| t.done[block].load(std::sync::atomic::Ordering::Acquire)) {
                     return match f_out {
                         Some(f_out) => msg_reduce_avx512(f_out, b_out),
@@ -8563,6 +8450,8 @@ fn materialize_direct_fold8(
             crate::rstrace::ev("f8s:start", 0);
             let mut folded_f = crate::scratch::take_f128(out_len);
             let t_f8a = t_f8.elapsed();
+            // Lane od1: the basis buffer is taken before the pipeline so its
+            // idle tail can fold basis blocks into it.
             let mut folded_b = crate::scratch::take_f128(out_len);
             let btail = od_btail_enabled().then(|| F8BasisTail::new(claims, challenges, block_len, &mut folded_b));
             // Lane h3: fold64 and the L1 commit's seed pass in one region
@@ -9024,7 +8913,7 @@ impl SumcheckProver {
                 deferred_basis,
             ) => {
                 let gamma = beta * (F128::ONE + z_0 + r);
-                let out = fold_and_msg_lsb_inner(
+                fold_and_msg_lsb_inner(
                     &self.f,
                     &self.combined_basis,
                     r,
@@ -9033,9 +8922,7 @@ impl SumcheckProver {
                     deferred_basis
                         .as_ref()
                         .map(|(basis, alpha)| (basis.as_slice(), *alpha)),
-                );
-                c4_eq_spare_put(eq_lo);
-                out
+                )
             }
             (Some(PendingOodEq::Introduced { .. }), _) => {
                 panic!("fold before factorized OOD glue")
@@ -9165,7 +9052,7 @@ impl SumcheckProver {
         }
         let tail = &z[1..];
         let split = tail.len().min(LAZY_OOD_EQ_SPLIT_LOW_LOG);
-        let eq_lo = c4_build_eq_table(&tail[..split]);
+        let eq_lo = build_eq_table(&tail[..split]);
         let eq_hi = build_eq_table(&tail[split..]);
         let z_0 = z[0];
         let (msg, h_new) = round_msg_and_eval_lsb_factorized_eq(&self.f, &eq_lo, &eq_hi, z_0);
@@ -9283,6 +9170,14 @@ impl SumcheckProver {
 }
 
 
+/// Lane od1 (`FLOCK_NO_OD_DEEPBG=1`: depth 4, materialized inside the next
+/// level's first fold): piece 8's background materialization for the deep
+/// levels' sparse duals. Their depth goes from 4 to 3, so each basis is
+/// complete with its level's last fold; it then materializes as a detached
+/// job (gated like the level-0 dual's) during the next commit, OOD and query
+/// draws, and the next level's first fold folds `b + basis`. Every depth
+/// yields the same basis and the round deltas are linear in it, so messages
+/// and transcript are unchanged.
 fn od_deep_bg_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OD_DEEPBG").is_none());
@@ -9321,6 +9216,8 @@ struct SparseDualFoldWork {
     /// sum equals adding them one by one; no per-round Vec).
     deep_delta: Option<SumcheckMessage>,
     deep_basis: Option<Vec<F128>>,
+    /// Lane od1: index of the deep dual that reached its depth but whose
+    /// materialization was left to the caller (`defer_deep`).
     deep_left: Option<usize>,
 }
 
@@ -10375,7 +10272,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let _tg = std::time::Instant::now();
         let bits = fold_bits(0).saturating_sub(j as u32);
         if bits > 0 {
-            fold_grinding_nonces.push(challenger.grind_pow_any_valid(bits));
+            fold_grinding_nonces.push(challenger.grind_pow(bits));
         }
         let grind_ms = _tg.elapsed().as_secs_f64() * 1e3;
         crate::rstrace::ev("r:grind", j as u32);
@@ -10603,7 +10500,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let mut gl2_l1_job: Option<std::sync::Arc<Gl2Deferred>> = None;
     let mut gl2_level_jobs: Vec<(usize, std::sync::Arc<Gl2Deferred>)> = Vec::new();
     let mut gl2_side_done: Vec<crate::hot_pool::side::Task> = Vec::new();
-    let pow_nonce_0 = challenger.grind_pow_any_valid(config.grinding_bits[0] as u32);
+    let pow_nonce_0 = challenger.grind_pow(config.grinding_bits[0] as u32);
     crate::rstrace::ev("L1:qgrind", 0);
     let mut grinding_nonces: Vec<u64> = vec![pow_nonce_0];
 
@@ -10823,7 +10720,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         for j in 0..k_i {
             let bits = fold_bits(i + 1).saturating_sub(j as u32);
             if bits > 0 {
-                fold_grinding_nonces.push(challenger.grind_pow_any_valid(bits));
+                fold_grinding_nonces.push(challenger.grind_pow(bits));
             }
             crate::rstrace::ev("lv:fgrind", (i * 16 + j) as u32);
             let ri = challenger.sample_f128();
@@ -10845,6 +10742,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             // materializes in the background (the next level's first fold adds
             // it to the combined basis).
             let defer_l0 = op_bg_dual_enabled() && j + 1 == k_i && i + 1 < r;
+            // Lane od1: likewise a deep dual reaching its depth here.
             let defer_deep = od_deep_bg_enabled() && j + 1 == k_i && i + 1 < r;
             // Lane op: a background basis joins this level's first fold.
             if j == 0 {
@@ -10857,15 +10755,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let (mut msg, dual_work) = if has_dual_work && join_pays && opus_dual_join_enabled() {
                 let (l0, deep, scp) =
                     (&mut active_sparse_dual_0, &mut active_deep_duals, &mut sc_prover);
-                if c4_join_swap_enabled() && c4_fold_wants_team(scp.f().len()) {
-                    rayon::join(|| scp.fold(ri), || sparse_duals_fold_step(l0, deep, ri, defer_l0, defer_deep))
-                } else {
-                    let (work, msg) = rayon::join(
-                        || sparse_duals_fold_step(l0, deep, ri, defer_l0, defer_deep),
-                        || scp.fold(ri),
-                    );
-                    (msg, work)
-                }
+                let (work, msg) =
+                    rayon::join(|| sparse_duals_fold_step(l0, deep, ri, defer_l0, defer_deep), || scp.fold(ri));
+                (msg, work)
             } else {
                 let msg = sc_prover.fold(ri);
                 (msg, sparse_duals_fold_step(&mut active_sparse_dual_0, &mut active_deep_duals, ri, defer_l0, defer_deep))
@@ -10931,7 +10823,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 challenger.observe_f128(*v);
             }
             crate::rstrace::ev("fin:yr", 0);
-            let nonce_last = challenger.grind_pow_any_valid(config.grinding_bits[i + 1] as u32);
+            let nonce_last = challenger.grind_pow(config.grinding_bits[i + 1] as u32);
             crate::rstrace::ev("fin:qgrind", 0);
             grinding_nonces.push(nonce_last);
             let num_queries_last = config.queries[i + 1];
@@ -11106,7 +10998,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         }
 
         crate::rstrace::ev("lv:ood", i as u32);
-        let nonce_i = challenger.grind_pow_any_valid(config.grinding_bits[i + 1] as u32);
+        let nonce_i = challenger.grind_pow(config.grinding_bits[i + 1] as u32);
         crate::rstrace::ev("lv:qgrind", i as u32);
         grinding_nonces.push(nonce_i);
         let num_queries_i = config.queries[i + 1];

@@ -585,6 +585,9 @@ pub struct Round1AbInner {
     /// tc: the ranked projection wrote the transpose-contract line layout
     /// (see [`Self::set_tc_layout`]); only round one's tc band fold reads it.
     tc_layout: bool,
+    /// tc2: on top of `tc_layout`, the rows are stored with row bits 10 and
+    /// 11 swapped and every line is a raw projection accumulator (see
+    /// [`Self::set_tc2_layout`]).
     tc2_layout: bool,
     #[cfg(all(
         target_arch = "x86_64",
@@ -794,11 +797,25 @@ impl Round1AbInner {
         self.tc_layout
     }
 
+    /// tc2: brand the storage as written in the second transpose-contract
+    /// layout. Storage row `pi(R)` (row bits 10 and 11 of `R` swapped) of
+    /// octa pair `b_base + e * 2048` (`e` = 0, 1; bits 10, 11 and 16.. of
+    /// `b_base` clear) is `pi(b_base + e * 2048) + (j >> 1) * 65536 +
+    /// (j & 1) * 2048` for slot `j = 0..8`, and every live window line holds
+    /// octa `e`'s raw accumulator `j`: byte `4 * (2y + h) + k` is the
+    /// incumbent byte `8j + y` of lane `2k + h`, whose true row is
+    /// `b_base + e * 2048 + k * 65536 + h * 1024`. With bits 10 and 11 of the
+    /// row index exchanged, lane `2k + h` sits in storage band
+    /// `(x & 30) | h | k << 5` of the same pair and window, so round one runs
+    /// on the storage rows with challenges 11 and 12 of `r_outer` exchanged
+    /// and its band-end fold weighs each lane with its own band's eq_hi
+    /// (`fold_ab_plane_banks_tc2_x86_avx512`). Implies [`Self::set_tc_layout`].
     pub fn set_tc2_layout(&mut self) {
         self.set_tc_layout();
         self.tc2_layout = true;
     }
 
+    /// Whether the storage holds the tc2 layout.
     #[inline]
     pub fn tc2_layout(&self) -> bool {
         self.tc2_layout
@@ -823,6 +840,8 @@ impl Round1AbInner {
             if ab1 { ab1_row_offset(row) } else { row * RANKED_AB_COMPACT_BLOCK_BYTES }
         };
         if tc2 {
+            // Octa pairs: the sixteen true rows b_base + {0, 2048} + h*1024 +
+            // k*65536 are the sixteen storage rows too (pi swaps bits 10, 11).
             (0..1usize << 14).into_par_iter().for_each(|o| {
                 let b_base = (o & 1023) | ((o >> 10) << 12);
                 let srows: [[usize; 8]; 2] = core::array::from_fn(|e| {
@@ -833,6 +852,8 @@ impl Round1AbInner {
                 });
                 for w in 0..AB1_ROW_LIVE / ELL {
                     let mut lines = [[[0u8; ELL]; 8]; 2];
+                    // SAFETY: the pair's sixteen rows are disjoint from every
+                    // other pair's; each line lies inside the checked storage.
                     unsafe {
                         for e in 0..2 {
                             for j in 0..8 {
@@ -3850,6 +3871,8 @@ pub(crate) struct WorkerStateAbOnly {
     /// tc: this band's quarter and the eq_hi of the four bands its lanes
     /// carry (`None`: incumbent layout and fold).
     tc_band: Option<(usize, [F128; 4])>,
+    /// tc2: this band's raw slot and the eq_hi of the eight bands its lanes
+    /// carry, index `4h + k` (`None` unless the tc2 layout is read).
     tc2_band: Option<(usize, [F128; 8])>,
 }
 
@@ -4609,6 +4632,10 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed_idle(
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
     ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
+    // tc2: the storage exchanges row bits 10 and 11 (w bit 4 and x_hi bit 0
+    // at the ranked shape, n_lo = 12), so every table below is built from
+    // r_outer with coordinates 11 and 12 exchanged. eq is a product of
+    // per-coordinate factors, so each storage row gets its true row's weight.
     let tc2 = ab_inner.tc2_layout && r.len() == k_skip + N_INNER + 19;
     if ab_inner.tc2_layout && !tc2 {
         ab_inner.restore_tc_layout();
@@ -4806,6 +4833,8 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed_idle(
     if ab_inner.tc_layout && !tc_bands {
         ab_inner.restore_tc_layout();
         if tc2 {
+            // Tables above used the exchanged challenges: rebuild them for
+            // the canonical rows (cold: kill switches and gate mismatches).
             return round1_shift_reduce_ab_packed_padded_with_precomputed_idle(
                 ab_inner, a_packed, b_packed, m, k_skip, r, inv_table, padding, idle,
             );
@@ -4829,6 +4858,8 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed_idle(
     let band = |state: &mut WorkerStateAbOnly, x_hi: usize| {
         crate::rstrace::evd("ab:b", x_hi as u32);
         state.ab1_layout = ab1_layout;
+        // tc2: band x holds raw slot j = 2 (x >> 5) + (x & 1); lane 2k + h
+        // of each line belongs to storage band (x & 30) | h | k << 5.
         state.tc2_band = (tc_bands && tc2).then(|| {
             let b = x_hi & 30;
             (2 * (x_hi >> 5) + (x_hi & 1), core::array::from_fn(|i| eq_hi[b | (i >> 2) | (i & 3) << 5]))
@@ -7395,6 +7426,8 @@ mod tc2_layout_tests {
         *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; *s
     }
 
+    /// Canonical ranked compact rows -> the tc2 storage (the producer's map:
+    /// octa pair e, slot j, raw byte 4(2y + h) + k = lane 2k + h, byte 8j + y).
     fn apply_tc2(bytes: &mut [u8]) {
         let src = bytes.to_vec();
         for o in 0..1usize << 14 {
@@ -7426,6 +7459,10 @@ mod tc2_layout_tests {
         inner
     }
 
+    /// The round-one AB message from the tc2 storage (raw lines, row bits
+    /// 10/11 exchanged, challenges 11/12 exchanged, tc2 band fold) equals
+    /// the message from the canonical rows; the cold restore inverts the
+    /// producer map exactly.
     #[test]
     fn tc2_ab_message_matches_canonical_layout() {
         use crate::challenger::Challenger;

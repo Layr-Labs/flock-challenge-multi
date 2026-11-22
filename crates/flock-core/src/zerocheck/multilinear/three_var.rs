@@ -526,6 +526,7 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
     // block layout, which only the cascade's b-canonical kernel produces.
     assert!(!b7 || casc, "the B7 table layout needs the deeper-cascade route");
     let chunk_b = if b7 { 7 * (2 * lo_size) / 8 } else { 2 * lo_size };
+    // A31 (lane z3a): four-block groups of 124 A outputs; needs B7.
     assert!(!a31 || (b7 && lo_size.is_multiple_of(64)), "the A31 table needs the B7 route");
     let chunk_a = if a31 { 31 * (2 * lo_size) / 32 } else { 2 * lo_size };
     // Deeper cascade: both lanes of an eight-group ride the odd lane's
@@ -573,6 +574,7 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
                                 if a31 { casc!(# $nt, $b7, $mk, true) } else { casc!(# $nt, $b7, $mk, false) }
                             };
                             (# $nt:literal, $b7:literal, $mk:literal, $a31:literal) => {
+                                // Lane r5 (FLOCK_NO_R5_PF1 / FLOCK_R5_PFD): prefetch lead in half-blocks.
                                 match kernels::x86_64::zc_r5_pfd() {
                                     1 => casc!(@ $nt, $b7, $mk, 1, $a31),
                                     2 => casc!(@ $nt, $b7, $mk, 2, $a31),
@@ -587,6 +589,7 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
                             };
                         }
                         let _ = wt;
+                        // Lane r5 (FLOCK_NO_R5_MAHK): asm variant fixed at compile time.
                         let mk = if !kernels::x86_64::zc_r5_mahk_enabled() {
                             0
                         } else if *crate::MAH_ASM_C4 {

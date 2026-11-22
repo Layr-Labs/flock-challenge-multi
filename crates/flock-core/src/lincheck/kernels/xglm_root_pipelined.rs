@@ -1,3 +1,5 @@
+//! Schedule-only root fold: four independent GFNI pairs before their XORs.
+//! Same pointer contract as gfni_fold_word_tiles4; no new demand spans.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -19,12 +21,18 @@ pub(crate) unsafe fn gfni_fold_word_tiles4_pipelined(
 ) {
     debug_assert!((1..=4).contains(&count));
     debug_assert!(tile_stride >= 512);
+    // SAFETY: the caller upholds the exact byte ranges above. Every modified
+    // GPR and ZMM is explicitly an output; flags and memory are also clobbered
+    // (no preserves_flags/nomem/readonly). No callee-saved GPR is touched. The
+    // ABI may place the seventh argument on the caller's stack; this asm itself
+    // neither reads nor writes the stack and contains no call instruction.
     unsafe {
         core::arch::asm!(
             "vmovdqu64 zmm20, [r10]",
             "mov r10, r11",
             "mov rax, 0x8040201008040201",
             "vpbroadcastq zmm21, rax",
+            // Read-only, nonfaulting hints for the next private plane bank.
             "test r10, r10",
             "jz 6f",
             "prefetcht0 [rdx + 1024]",
@@ -81,6 +89,7 @@ pub(crate) unsafe fn gfni_fold_word_tiles4_pipelined(
             "vmovdqu64 zmm14, [rdx + 896]",
             "vmovdqu64 zmm15, [rdx + 960]",
             "3:",
+            // Each tile's next source block is 512 bytes ahead.
             "test r10, r10",
             "jz 7f",
             "prefetcht0 [rdi + 512]",
@@ -94,6 +103,7 @@ pub(crate) unsafe fn gfni_fold_word_tiles4_pipelined(
             "7:",
             "vpermb zmm16, zmm20, [rdi]",
             "vpermb zmm17, zmm20, [rdi + 64]",
+            // Same operand order as affine(identity, permuted_raw_row).
             "vgf2p8affineqb zmm16, zmm21, zmm16, 0",
             "vgf2p8affineqb zmm17, zmm21, zmm17, 0",
             "vgf2p8affineqb zmm18, zmm16, [rsi]{{1to8}}, 0",
@@ -146,6 +156,7 @@ pub(crate) unsafe fn gfni_fold_word_tiles4_pipelined(
             "vpternlogq zmm15, zmm26, zmm27, 0x96",
             "vpermb zmm16, zmm20, [rdi + 128]",
             "vpermb zmm17, zmm20, [rdi + 192]",
+            // Same operand order as affine(identity, permuted_raw_row).
             "vgf2p8affineqb zmm16, zmm21, zmm16, 0",
             "vgf2p8affineqb zmm17, zmm21, zmm17, 0",
             "vgf2p8affineqb zmm18, zmm16, [rsi + 256]{{1to8}}, 0",
@@ -198,6 +209,7 @@ pub(crate) unsafe fn gfni_fold_word_tiles4_pipelined(
             "vpternlogq zmm15, zmm26, zmm27, 0x96",
             "vpermb zmm16, zmm20, [rdi + 256]",
             "vpermb zmm17, zmm20, [rdi + 320]",
+            // Same operand order as affine(identity, permuted_raw_row).
             "vgf2p8affineqb zmm16, zmm21, zmm16, 0",
             "vgf2p8affineqb zmm17, zmm21, zmm17, 0",
             "vgf2p8affineqb zmm18, zmm16, [rsi + 512]{{1to8}}, 0",
@@ -250,6 +262,7 @@ pub(crate) unsafe fn gfni_fold_word_tiles4_pipelined(
             "vpternlogq zmm15, zmm26, zmm27, 0x96",
             "vpermb zmm16, zmm20, [rdi + 384]",
             "vpermb zmm17, zmm20, [rdi + 448]",
+            // Same operand order as affine(identity, permuted_raw_row).
             "vgf2p8affineqb zmm16, zmm21, zmm16, 0",
             "vgf2p8affineqb zmm17, zmm21, zmm17, 0",
             "vgf2p8affineqb zmm18, zmm16, [rsi + 768]{{1to8}}, 0",
@@ -302,6 +315,8 @@ pub(crate) unsafe fn gfni_fold_word_tiles4_pipelined(
             "vpternlogq zmm15, zmm26, zmm27, 0x96",
             "dec r8",
             "jz 5f",
+            // Only advance when another live tile remains. The four stripe
+            // pairs use fixed offsets from the unchanged tile/matrix bases.
             "add rdi, rcx",
             "add rsi, 1024",
             "jmp 3b",

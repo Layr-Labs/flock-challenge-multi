@@ -101,6 +101,9 @@ std::thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// `FLOCK_NO_XP_CASC_BATCH_INV=1` restores the three separate inversions of
+/// the deeper tail cascade step (Meganpark980320
+/// 1cd0dc51-7c29-4c24-840c-1b822cc02738 piece 9). Read once.
 fn casc_batch_inv_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_XP_CASC_BATCH_INV").is_none());
@@ -1171,6 +1174,14 @@ fn gl1_split_lo() -> usize {
     *LO
 }
 
+/// Lane z3a TEQ (`FLOCK_NO_Z3_TEQ`): every tail level's split eq is built over
+/// `r_next[1..]`, a suffix of the zerocheck point `r`, which is fixed before
+/// round one. Each level used to build its `eq_lo`/`eq_hi` tensors (up to
+/// 2^12 products at level 1) and its `(w, w·x⁶⁴)` pair table serially between
+/// two Fiat-Shamir samples. Round one's idle AB thread now builds them for
+/// every suffix length the levels use, with the same functions on the same
+/// inputs; a level takes the entry whose key equals its own coordinates and
+/// `n_hi`, or builds as before. Same field elements, so the proof is unchanged.
 pub(crate) fn z3_teq_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_Z3_TEQ").is_none());
@@ -1186,9 +1197,13 @@ struct Z3TeqEntry {
 
 static Z3_TEQ: std::sync::Mutex<Vec<Z3TeqEntry>> = std::sync::Mutex::new(Vec::new());
 
+/// Suffix lengths prebuilt by [`z3_teq_prebuild`] (the ranked levels use 19,
+/// 17, 15, 13, 11, ...).
 const Z3_TEQ_MIN_LEN: usize = 5;
 const Z3_TEQ_MAX_LEN: usize = 19;
 
+/// Build the split eq (and pair table) of every suffix of `r` whose length is
+/// in `Z3_TEQ_MIN_LEN..=Z3_TEQ_MAX_LEN`, replacing any earlier entries.
 pub(crate) fn z3_teq_prebuild(r: &[F128]) {
     if !z3_teq_enabled() {
         return;
@@ -1206,6 +1221,8 @@ pub(crate) fn z3_teq_prebuild(r: &[F128]) {
     }
 }
 
+/// `SplitEqGhash::with_n_hi(r, n_hi)`, from the prebuilt entry when one has
+/// exactly these coordinates, plus its pair table (`None`: build it).
 fn z3_tail_eq(r: &[F128], n_hi: usize) -> (SplitEqGhash, Option<Vec<F128>>) {
     if z3_teq_enabled() {
         if let Ok(mut g) = Z3_TEQ.lock() {
@@ -1252,12 +1269,6 @@ pub(crate) const fn lane_select(sel: [(u8, u8); 4]) -> [u64; 8] {
         i += 1;
     }
     idx
-}
-
-fn c4_tail_team() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_C4_NO_TAILTEAM").is_none());
-    *ON && crate::flat_par::team_enabled()
 }
 
 /// Lane ru: the flat claim route (see `crate::flat_par`) for the large
@@ -1310,44 +1321,6 @@ pub(crate) fn flat_chunks2<T>(
             }
             // SAFETY: item `i` owns output chunk `i` of both tables; chunks are
             // disjoint and both borrows outlive `map_reduce`.
-            let (ac, bc) = unsafe {
-                (
-                    core::slice::from_raw_parts_mut((ao as *mut F128).add(i * chunk), chunk),
-                    core::slice::from_raw_parts_mut((bo as *mut F128).add(i * chunk_b), chunk_b),
-                )
-            };
-            leaf((i, (ac, bc)))
-        },
-        id,
-        op,
-    )
-}
-
-pub(crate) fn team_chunks2<T>(
-    a_out: &mut [F128],
-    chunk: usize,
-    b_out: &mut [F128],
-    chunk_b: usize,
-    leaf: impl Fn((usize, (&mut [F128], &mut [F128]))) -> T + Sync,
-    id: impl Fn() -> T + Sync,
-    op: impl Fn(T, T) -> T + Sync,
-) -> T {
-    assert!(chunk > 0 && a_out.len().is_multiple_of(chunk));
-    let n = a_out.len() / chunk;
-    assert!(chunk_b > 0 && b_out.len() == n * chunk_b);
-    let (ao, bo) = (a_out.as_mut_ptr() as usize, b_out.as_mut_ptr() as usize);
-    let rec = crate::flat_par::sl1_aff_enabled() && n <= crate::flat_par::SL1_OWN_CAP;
-    if rec {
-        *crate::flat_par::SL1_OWN_GEOM.lock().unwrap() = (ao, bo, chunk * 16, n);
-    }
-    crate::flat_par::team_map_reduce(
-        n,
-        |i| {
-            if rec {
-                let t = rayon::current_thread_index().map_or(u8::MAX, |t| t.min(250) as u8);
-                crate::flat_par::SL1_OWN[i].store(t, core::sync::atomic::Ordering::Relaxed);
-            }
-            // disjoint and both borrows outlive `team_map_reduce`.
             let (ac, bc) = unsafe {
                 (
                     core::slice::from_raw_parts_mut((ao as *mut F128).add(i * chunk), chunk),
@@ -3856,6 +3829,8 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm_casc(
     }
     // Deeper cascade: both lanes of an eight-group ride the odd lane's weight;
     // κ restores the even lanes' own weight in the message sums.
+    // With the batched inverse (below) κ_c is derived from the shared
+    // inversion once both weights have been checked.
     let casc_batch_inv = casc && casc_batch_inv_enabled();
     let kappa_c_single =
         if casc && !casc_batch_inv { (F128::ONE + r_next[2]) * r_next[2].inv() } else { F128::ZERO };
@@ -3891,10 +3866,18 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm_casc(
         !(in_lm || out_lm) || (lo_size.is_multiple_of(8) && zc_lane_major_handoff_on()),
         "lane-major tiles need eight-group AVX-512 chunks"
     );
+    // `FLOCK_NO_XP_CASC_BATCH_INV`: the deeper cascade needs r1⁻¹, r2⁻¹ and
+    // (r1·r2)⁻¹. One inversion P = (r1·r2)⁻¹ gives all three exactly:
+    // r1⁻¹ = r2·P and r2⁻¹ = r1·P (inverses in GF(2^128) are unique, so
+    // these are the same field elements, bit for bit). Both weights are
+    // asserted non-zero above. Port of terrapinelf's batched tri-pass
+    // inversion from the Apple track (28dfebfb, `FLOCK_NO_ZC_TRI_BATCH_INV`).
     let (kappa, r_inv, kappa_c, la7_scale) = if casc_batch_inv {
         let p = (r_next[1] * r_next[2]).inv();
         let r1_inv = r_next[2] * p;
         let r2_inv = r_next[1] * p;
+        // (1 + r1)·r1⁻¹ = r1⁻¹ + 1: the value both arms of
+        // `lookahead_inv_factors` return.
         (r1_inv + F128::ONE, r1_inv, (F128::ONE + r_next[2]) * r2_inv, Some(p))
     } else {
         let (kappa, r_inv) = lookahead_inv_factors(r);
@@ -4611,12 +4594,20 @@ pub(crate) fn tl2_route_ok(n: usize) -> bool {
     }
 }
 
+/// Lane sc1 `FLOCK_NO_SC_TL3=1` keeps level 3's separate output tables under
+/// the in-place handoff (level 4 then reads them as usual).
 pub(crate) fn tl3_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SC_TL3").is_none());
     *ON
 }
 
+/// Whether level 3 of the in-place handoff (level-1 input of `n` elements)
+/// can also write in place: it runs [`fold2_plain_tl_inplace`] on level 2's
+/// pieces, and level 4 is the same plain `wtab` kernel whose chunks cover
+/// whole level-3 pieces in sub-runs of a multiple of 16 groups. Level 3 writes
+/// its outputs over the start of each piece it has just read instead of into
+/// the cold scratch table, exactly as level 2 does.
 pub(crate) fn tl3_route_ok(n: usize) -> bool {
     #[cfg(all(
         target_arch = "x86_64",
@@ -4677,6 +4668,7 @@ pub(crate) fn fold3_oct_plain_and_round_pair_lookahead_inplace(
     use rayon::prelude::*;
     let n = a.len();
     assert!(tl_route_ok(n), "in-place handoff route unavailable");
+    // A31 (lane z3a): the A table fills the first 31/32 of its buffer.
     assert!(!a31 || b7.is_some(), "the A31 table comes with the B7 table");
     let a = &mut a[..if a31 { 31 * n / 32 } else { n }];
     // The B7 table fills the first seven eighths of its buffer.
@@ -4784,9 +4776,7 @@ pub(crate) fn fold3_oct_plain_and_round_pair_lookahead_inplace(
         }
         (s1 + c1, sinf + cinf, a)
     };
-    let (sum1_even, sum_inf_even, agg) = if flat_tail(n) && c4_tail_team() && crate::flat_par::team_ready() {
-        team_chunks2(a, chunk_in, b, chunk_in_b, leaf, id, op)
-    } else if flat_tail(n) {
+    let (sum1_even, sum_inf_even, agg) = if flat_tail(n) {
         flat_chunks2(a, chunk_in, b, chunk_in_b, leaf, id, op)
     } else {
         a.par_chunks_mut(chunk_in)
@@ -4817,6 +4807,10 @@ pub(crate) fn fold3_oct_b7_route_ok(n: usize) -> bool {
 
 /// `FLOCK_NO_ZC_B7=1` keeps the rounds 3+4+5 pass's B table in the full
 /// eight-ZMM octet layout (its four static lanes per block stored and read).
+/// Lane z3a A31 (`FLOCK_NO_Z3_A31`): with B7 and the in-place level-1
+/// hand-off, the rounds 3+4+5 pass also drops A's zero line 31 (rows
+/// 248..256 of every block are padding): four blocks are stored as 4 x 7
+/// ZMMs plus the three packed ZMM 7s, and only tail level 1 reads them.
 pub(crate) fn z3_a31_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_Z3_A31").is_none());
@@ -6927,6 +6921,10 @@ mod tests {
                             assert_eq!(aj[i * next.stride_a + k], a2[e], "a2 e={e}");
                             assert_eq!(bj[i * next.stride_b + k], b2[e], "b2 e={e}");
                         }
+                        // Level 3 in place too (lane sc1, `FLOCK_NO_SC_TL3`):
+                        // same messages and tables as level 3 on the level-2
+                        // pieces with separate outputs, and level 4 on the
+                        // level-3 pieces equals level 4 on that table.
                         if tl3_route_ok(n) {
                             let mut r3 = rng.f128_vec(log_n - 7);
                             r3[0] = F128::ONE;
@@ -6971,6 +6969,8 @@ mod tests {
         }
     }
 
+    /// Lane sc1: the ranked tail (level-1 input 2^23) takes the level-3
+    /// in-place route, and its geometry needs level 2 in place.
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
     #[test]
     fn tl3_route_holds_at_ranked_shape() {

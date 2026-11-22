@@ -1241,6 +1241,8 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const<
 }
 
 const RING_WORDS: usize = 32;
+/// st1: pair two ring words into one 64-byte zmm store (on; build-time env
+/// `NO_ST1_ZP=1` restores one 32-byte store per word). Same ring bytes.
 const ST1_ZP: bool = match option_env!("NO_ST1_ZP") { Some(x) => x.as_bytes()[0] != b'1', None => true };
 #[repr(C, align(64))]
 struct Ring64([V8; RING_WORDS]);
@@ -1327,6 +1329,8 @@ mod xor_projection;
 /// ab_inner layout (see `xor_projection`). The pipelined producer brands
 /// ab_inner with it only when this holds and every window 2..=29 of every
 /// octa is projected there ([`window_seed_projection_eligible`]).
+/// tc2: whether the tc projection also stores raw accumulators at the
+/// bit-swapped rows (see `xor_projection::tc2_layout_active`).
 pub(crate) fn tc2_layout_active() -> bool {
     #[cfg(all(
         target_feature = "avx512f",
@@ -1832,6 +1836,7 @@ impl<'t, const FLUSH: bool, const RANKED_CLOSED: bool, const WINDOW_COLS:usize> 
                 && (WORD < RANKED_STATIC_B_PREFIX_END || WORD >= RANKED_STATIC_B_TAIL_START)
                 && is_ranked_static;
             if !static_b && RANKED_CLOSED && ST1_ZP && WORD % 2 == 0 {
+                // Even word: hold it; the odd partner stores the full 64-byte line.
                 self.held = v;
             } else if !static_b && RANKED_CLOSED && ST1_ZP {
                 let line = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(self.held), v);
@@ -2077,7 +2082,10 @@ pub(crate) struct AbPend {
     pub(crate) stride: usize,
     pub(crate) cq: bool,
     pub(crate) live: bool,
+    /// tc2: the pending lines use [`tc2_lane_offset`] from `base`.
     pub(crate) tc2: bool,
+    /// tc2: start of storage row `pi(b)` (row bits 10 and 11 of the octa's
+    /// first row `b` exchanged), set by the octa's producer; null keeps tc.
     pub(crate) tc2_base: *mut u8,
 }
 impl AbPend {
@@ -2085,10 +2093,13 @@ impl AbPend {
         Self { v: [[0; 64]; 8], base: core::ptr::null_mut(), stride: 0, cq: false, live: false, tc2: false, tc2_base: core::ptr::null_mut() }
     }
 }
+/// tc2: storage row of raw slot `j` relative to `pi(b)`.
 #[inline(always)]
 pub(crate) const fn tc2_lane_offset(j: usize) -> usize {
     (j >> 1) * 65536 + (j & 1) * 2048
 }
+/// tc2: storage row of octa row `b` (bits 10 and 11 exchanged; bit 10 of an
+/// octa's first row is clear).
 #[inline(always)]
 pub(crate) const fn tc2_octa_row(b: usize) -> usize {
     debug_assert!(b & 1024 == 0);
