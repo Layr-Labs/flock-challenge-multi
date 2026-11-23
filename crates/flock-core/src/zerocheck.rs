@@ -1503,6 +1503,11 @@ fn prove_packed_padded_inner<C: Challenger>(
         + if n_levels > 0 { off } else { 0 }
         + if n_levels > c3_at { c3 as usize } else { 0 };
 
+    // Small tail rounds: round i's equality table is over `r_next[1..]` =
+    // `r[k_skip + i + 2..]`, and round i + 1's drops its first challenge, so it
+    // is the pair-sum of the previous table (`multilinear::eq_drop_first`).
+    let tail_eq_reuse = multilinear::zc_tail_eq_reuse_enabled();
+    let mut tail_eq: Vec<F128> = Vec::new();
     for i in loop_start..(n_mlv - 1) {
         crate::rstrace::ev("tr:in", i as u32);
         let t_round = std::time::Instant::now();
@@ -1535,6 +1540,15 @@ fn prove_packed_padded_inner<C: Challenger>(
             a_mlv.truncate(half);
             b_mlv.truncate(half);
             (m1, mi)
+        } else if tail_eq_reuse {
+            fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
+            let want = a_mlv.len() / 2;
+            tail_eq = if tail_eq.len() == 2 * want {
+                multilinear::eq_drop_first(&tail_eq)
+            } else {
+                crate::zerocheck::univariate_skip::build_eq(&r_next[1..])
+            };
+            multilinear::round_pair_naive_with_eq(&a_mlv, &b_mlv, r_next[0], &tail_eq)
         } else {
             fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
             round_pair_naive(&a_mlv, &b_mlv, &r_next)

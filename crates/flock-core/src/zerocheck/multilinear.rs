@@ -639,6 +639,54 @@ pub fn round_pair_naive(a_mlv: &[F128], b_mlv: &[F128], r: &[F128]) -> (F128, F1
     (r[0] * g_one, g_inf)
 }
 
+/// [`round_pair_naive`] with its equality table supplied: `eq` must equal
+/// `build_eq(&r[1..])` and `r_0` must equal `r[0]`. Same loop, same products,
+/// same accumulation order.
+pub fn round_pair_naive_with_eq(
+    a_mlv: &[F128],
+    b_mlv: &[F128],
+    r_0: F128,
+    eq: &[F128],
+) -> (F128, F128) {
+    let n = a_mlv.len();
+    assert_eq!(b_mlv.len(), n);
+    assert!(n.is_power_of_two() && n >= 2);
+    let half = n / 2;
+    assert_eq!(eq.len(), half);
+
+    let mut g_one = F128::ZERO;
+    let mut g_inf = F128::ZERO;
+    for x_prime in 0..half {
+        let a0 = a_mlv[2 * x_prime];
+        let a1 = a_mlv[2 * x_prime + 1];
+        let b0 = b_mlv[2 * x_prime];
+        let b1 = b_mlv[2 * x_prime + 1];
+        let eq_x = eq[x_prime];
+        g_one += eq_x * a1 * b1;
+        // Char-2: (a_1 − a_0)(b_1 − b_0) = (a_0 + a_1)(b_0 + b_1).
+        g_inf += eq_x * (a0 + a1) * (b0 + b1);
+    }
+    (r_0 * g_one, g_inf)
+}
+
+/// The equality table of a challenge suffix one shorter (port of the ARM
+/// track's `eq_drop_first`, `FLOCK_NO_ZC_TAIL_EQ_REUSE`): `build_eq(&r[1..])[x]
+/// == build_eq(r)[2x] + build_eq(r)[2x + 1]`, because index bit 0 carries
+/// `r[0]` and the two entries are `w·(1 + r_0)` and `w·r_0` for the same `w`;
+/// GF(2^128) arithmetic is exact, so the sum is `w` bit for bit. One XOR per
+/// entry where a fresh table takes one product per entry.
+pub fn eq_drop_first(eq: &[F128]) -> Vec<F128> {
+    eq.chunks_exact(2).map(|p| p[0] + p[1]).collect()
+}
+
+/// `FLOCK_NO_ZC_TAIL_EQ_REUSE` (any value) builds every small tail round's
+/// equality table afresh. Read once per process.
+pub fn zc_tail_eq_reuse_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TAIL_EQ_REUSE").is_none());
+    *ON
+}
+
 // ---------------------------------------------------------------------------
 // Naive fused (fold at z + round-2 message) for AB-pair.
 // ---------------------------------------------------------------------------
