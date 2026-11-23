@@ -2083,6 +2083,12 @@ pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
     out
 }
 
+pub(crate) fn build_eq_table_scaled(point: &[F128], root: F128) -> Vec<F128> {
+    let mut out = crate::alloc_uninit_vec::<F128>(1usize << point.len());
+    build_eq_table_fill_from(point, &mut out, root);
+    out
+}
+
 pub(crate) fn build_eq_table_into(point: &[F128], out: &mut Vec<F128>) {
     let n = 1usize << point.len();
     out.clear();
@@ -2092,9 +2098,14 @@ pub(crate) fn build_eq_table_into(point: &[F128], out: &mut Vec<F128>) {
 
 #[inline]
 fn build_eq_table_fill(point: &[F128], out: &mut [F128]) {
+    build_eq_table_fill_from(point, out, F128::ONE)
+}
+
+#[inline]
+fn build_eq_table_fill_from(point: &[F128], out: &mut [F128], root: F128) {
     let d = point.len();
     debug_assert_eq!(out.len(), 1usize << d);
-    out[0] = F128::ONE;
+    out[0] = root;
     for (j, &r_j) in point.iter().enumerate() {
         let len = 1usize << j;
         // Char-2: v*(1+r) = v + v*r. One GHASH plus an XOR per old entry.

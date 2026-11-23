@@ -25,6 +25,29 @@ use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 // Helpers
 // ---------------------------------------------------------------------------
 
+pub(crate) fn build_eq_scaled(r: &[F128], root: F128) -> Vec<F128> {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    if r.len() >= 3 {
+        return crate::lincheck::build_eq_table_scaled(r, root);
+    }
+    let n = r.len();
+    let mut t = crate::alloc_uninit_f128_vec(1usize << n);
+    t[0] = root;
+    for i in 0..n {
+        let r_i = r[i];
+        for x in (0..(1usize << i)).rev() {
+            let hi = t[x] * r_i;
+            t[x | (1 << i)] = hi;
+            t[x] += hi;
+        }
+    }
+    t
+}
+
 /// Build the multilinear-eq evaluation table over `r`:
 /// `table[x] = ∏_i ((1 + r_i) · (1 ⊕ bit_i(x)) + r_i · bit_i(x))` for `x ∈ {0,1}^n`,
 /// where `n = r.len()`. Standard in-place power-of-two doubling.
