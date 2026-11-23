@@ -5131,7 +5131,7 @@ const fn la1_env_usize(s: Option<&str>, d: usize) -> usize {
         }
     }
 }
-const R2_PAD: usize = la1_env_usize(option_env!("R2_PAD"), 3072);
+const R2_PAD: usize = la1_env_usize(option_env!("R2_PAD"), 3144);
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 core::arch::global_asm!(
     ".section .text.r2hot,\"ax\",@progbits",
