@@ -5131,7 +5131,7 @@ const fn la1_env_usize(s: Option<&str>, d: usize) -> usize {
         }
     }
 }
-const R2_PAD: usize = la1_env_usize(option_env!("R2_PAD"), 3072);
+const R2_PAD: usize = la1_env_usize(option_env!("R2_PAD"), 3000);
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 core::arch::global_asm!(
     ".section .text.r2hot,\"ax\",@progbits",
@@ -6448,20 +6448,15 @@ pub(crate) struct R4LaneWeights {
     target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
 )]
 #[inline(never)]
-unsafe fn r4_round4_batch(fa: *const F128, fb: *const F128, acc4: &mut [WideGhashX4; 10], skip: u8) {
+unsafe fn r4_round4_batch<const SKIP: u8>(fa: *const F128, fb: *const F128, acc4: &mut [WideGhashX4; 10]) {
     static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var_os("FLOCK_NO_ZC_R4_STREAM").is_some()
     });
     unsafe {
         if *OFF {
-            return r4_round4_batch_staged(fa, fb, acc4, skip);
+            return r4_round4_batch_staged(fa, fb, acc4, SKIP);
         }
-        match skip {
-            0 => r4_round4_batch_stream::<0>(fa, fb, acc4),
-            3 => r4_round4_batch_stream::<3>(fa, fb, acc4),
-            255 => r4_round4_batch_stream::<255>(fa, fb, acc4),
-            _ => r4_round4_batch_staged(fa, fb, acc4, skip),
-        }
+        r4_round4_batch_stream::<SKIP>(fa, fb, acc4)
     }
 }
 
@@ -7336,7 +7331,7 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
                 // (`fa_first` survives until then).
                 if PAIR && MERGE { pf_quarter!(g0, 1); } else { accum1!(g0, 1); }
                 accum2!(g0, 2, 3);
-                if !PAIR { r4_round4_batch(fa, fb, &mut acc4, 0); }
+                if !PAIR { r4_round4_batch::<0>(fa, fb, &mut acc4); }
             }
             fa=fa_work; fb=fb_work;
             {
@@ -7348,7 +7343,7 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
                 accum2!(g0, 2, 3);
                 if SPLIT {
                     r4_round4_batch_split((*sa_p).m_e.0.as_ptr(), (*sa_p).m_o.0.as_ptr().wrapping_add(0), (*sb_p).m_e.0.as_ptr(), (*sb_p).m_o.0.as_ptr(), &mut acc4);
-                } else { r4_round4_batch(fa, fb, &mut acc4, 255); }
+                } else { r4_round4_batch::<255>(fa, fb, &mut acc4); }
             }
             {
                 let g0 = row_base + 2 * (x_lo + 64);
@@ -7359,7 +7354,7 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
                 accum2!(g0, 2, 3);
                 if SPLIT {
                     r4_round4_batch_split((*sa_p).m_e.0.as_ptr(), (*sa_p).m_o.0.as_ptr().wrapping_add(0), (*sb_p).m_e.0.as_ptr(), (*sb_p).m_o.0.as_ptr(), &mut acc4);
-                } else { r4_round4_batch(fa, fb, &mut acc4, 255); }
+                } else { r4_round4_batch::<255>(fa, fb, &mut acc4); }
             }
             {
                 let g0 = row_base + 2 * (x_lo + 96);
@@ -7393,7 +7388,7 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
                         r4_canonical_set(fa_first,fb_first,1,fa,fb,2,&mut acc4);
                     }
                     if !SPLIT { r4_canonical_set(fa,fb,0,fa,fb,1,&mut acc4); }
-                } else { r4_round4_batch(fa, fb, &mut acc4, 3); }
+                } else { r4_round4_batch::<3>(fa, fb, &mut acc4); }
                 pf_quarter!(g0, 3);
                 #[cfg(test)]
                 R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -8468,4 +8463,3 @@ mod r4_canonical_pair_tests {
         }}}
     }
 }
-
