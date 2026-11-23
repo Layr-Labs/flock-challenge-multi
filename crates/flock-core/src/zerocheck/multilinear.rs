@@ -3705,42 +3705,46 @@ pub fn fold2_plain_and_round4_into(
     let eq_lo = &eq.lo;
     let eq_hi = &eq.hi;
 
-    let (sum1, sum_inf) = a_out
-        .par_chunks_mut(chunk_out)
-        .zip(b_out.par_chunks_mut(chunk_out))
-        .enumerate()
-        .map(|(x_hi, (a_out, b_out))| {
-            crate::rstrace::evd("p4:b", x_hi as u32);
-            let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
-            let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+    let leaf = |(x_hi, (a_out, b_out)): (usize, (&mut [F128], &mut [F128]))| {
+        crate::rstrace::evd("p4:b", x_hi as u32);
+        let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+        let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
 
-            #[cfg(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            ))]
-            // SAFETY: chunk geometry supplies four inputs per output and two
-            // outputs per eq_lo value; features are guaranteed by the cfg.
-            let (p1, pinf) = unsafe {
-                kernels::x86_64::fold2_and_message_x86_avx512(
-                    a_in, b_in, a_out, b_out, rho1, rho2, eq_lo,
-                )
-            };
-            #[cfg(not(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            )))]
-            let (p1, pinf) = fold2_and_message_scalar(a_in, b_in, a_out, b_out, rho1, rho2, eq_lo);
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        // SAFETY: chunk geometry supplies four inputs per output and two
+        // outputs per eq_lo value; features are guaranteed by the cfg.
+        let (p1, pinf) = unsafe {
+            kernels::x86_64::fold2_and_message_x86_avx512(
+                a_in, b_in, a_out, b_out, rho1, rho2, eq_lo,
+            )
+        };
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )))]
+        let (p1, pinf) = fold2_and_message_scalar(a_in, b_in, a_out, b_out, rho1, rho2, eq_lo);
 
-            let eq_h = eq_hi[x_hi];
-            crate::rstrace::evd("p4:e", 0);
-            (eq_h * p1, eq_h * pinf)
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
-        );
+        let eq_h = eq_hi[x_hi];
+        crate::rstrace::evd("p4:e", 0);
+        (eq_h * p1, eq_h * pinf)
+    };
+    let id = || (F128::ZERO, F128::ZERO);
+    let op = |(s1, sinf): (F128, F128), (c1, cinf): (F128, F128)| (s1 + c1, sinf + cinf);
+    let (sum1, sum_inf) = if crate::flat_par::team_enabled() && crate::flat_par::team_ready() {
+        team_chunks(a_out, b_out, chunk_out, leaf, id, op)
+    } else {
+        a_out
+            .par_chunks_mut(chunk_out)
+            .zip(b_out.par_chunks_mut(chunk_out))
+            .enumerate()
+            .map(leaf)
+            .reduce(id, op)
+    };
     crate::rstrace::ev("p4:red", 0);
 
     (r_next4[0] * sum1, sum_inf)
