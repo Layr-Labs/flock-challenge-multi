@@ -3155,9 +3155,18 @@ fn direct_fold8_round0_chunked(a_state: &[F128], w_state: &[F128]) -> (F128, F12
     use rayon::prelude::*;
     const CH: usize = 8;
     let len = a_state.len() / CH;
+    let leaf = |k: usize| direct_fold8_round0_wide(&a_state[k * len..(k + 1) * len], &w_state[k * len..(k + 1) * len]);
+    if crate::flat_par::team_enabled() && crate::flat_par::team_ready() {
+        return crate::flat_par::team_map_reduce(
+            CH,
+            leaf,
+            || (F128::ZERO, F128::ZERO),
+            |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+        );
+    }
     (0..CH)
         .into_par_iter()
-        .map(|k| direct_fold8_round0_wide(&a_state[k * len..(k + 1) * len], &w_state[k * len..(k + 1) * len]))
+        .map(leaf)
         .collect::<Vec<_>>()
         .into_iter()
         .fold((F128::ZERO, F128::ZERO), |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2))
