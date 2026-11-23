@@ -1179,3 +1179,5 @@ mod indexed_weight_tests {
         println!("INDEXED_ROOT_WEIGHTS labels=262144 arithmetic_octa_cases={weight_cases} full_reader_equalities={reader_equalities} wrong_weight_mutants_detected={mutants} original_expansions_per_reader=2048 indexed_expansions_per_reader=256 threads=7,9 reader_modes=2 bases=2 actual_production_consumer=true x4_enabled={}",super::super::lc_eq8_x4_enabled());
     }
 }
+#[allow(dead_code)]
+const GAUNTLET_REDRAW_79f21b5d_20261123T011721Z: u8 = 0;
