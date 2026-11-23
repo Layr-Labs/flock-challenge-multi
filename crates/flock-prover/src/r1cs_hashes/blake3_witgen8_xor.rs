@@ -1368,6 +1368,23 @@ _ => unreachable!(),
         }
     }
 }
+const PROJ_MODE_NO_PRUNE: u8 = 0;
+const PROJ_MODE_PIPE: u8 = 2;
+const PROJ_MODE_TC: u8 = 3;
+const PROJ_MODE_TC2: u8 = 4;
+static PROJ_MODE: std::sync::LazyLock<u8> = std::sync::LazyLock::new(|| {
+    if !*RPPRUNE_ON {
+        PROJ_MODE_NO_PRUNE
+    } else if !*PROJ_PIPE_ON {
+        1
+    } else if !*TC_ON {
+        PROJ_MODE_PIPE
+    } else if !*TC2_ON {
+        PROJ_MODE_TC
+    } else {
+        PROJ_MODE_TC2
+    }
+});
 /// Select the existing z store policy once before projecting this window.
 /// AB streams in both versions; the caller retains its final publication fence.
 #[inline(always)]
@@ -1386,13 +1403,14 @@ pub(super) unsafe fn project<const COMPACT_COLS:usize>(
         // sb1: the deferred ab_inner publication has its own instantiation so the
         // FLOCK_NO_SB1_DEFER path compiles to the unchanged code. A non-null buffer on another
         // policy only delays the previous window's lines to the octa-end flush.
-        if !proj.ab_pend.is_null() && rows.cross_quarter && *RPPRUNE_ON {
+        let mode = *PROJ_MODE;
+        if !proj.ab_pend.is_null() && rows.cross_quarter && mode != PROJ_MODE_NO_PRUNE {
             // Aligned pretranspose slots: production deferred policies only,
             // so every other policy keeps its single unchanged instantiation.
-            if *PROJ_PIPE_ON {
+            if mode >= PROJ_MODE_PIPE {
                 // tc: the transpose-contract layout (see `tc_layout_active`).
-                if *TC_ON {
-                    if *TC2_ON && !(*proj.ab_pend).tc2_base.is_null() {
+                if mode >= PROJ_MODE_TC {
+                    if mode == PROJ_MODE_TC2 && !(*proj.ab_pend).tc2_base.is_null() {
                         if rows.cached_z {
                             return project_policy::<true, true, COMPACT_COLS, true, true, true, true, true>(proj, blk, rows, ar, br, rw, t);
                         }
@@ -1413,7 +1431,7 @@ pub(super) unsafe fn project<const COMPACT_COLS:usize>(
             }
             return project_policy::<false, true, COMPACT_COLS, true, true, false, false, false>(proj, blk, rows, ar, br, rw, t);
         }
-        match (rows.cached_z, rows.cross_quarter, *RPPRUNE_ON) {
+        match (rows.cached_z, rows.cross_quarter, mode != PROJ_MODE_NO_PRUNE) {
             (true, true, true) => project_policy::<true, true, COMPACT_COLS, true, false, false, false, false>(proj, blk, rows, ar, br, rw, t),
             (true, false, true) => project_policy::<true, false, COMPACT_COLS, true, false, false, false, false>(proj, blk, rows, ar, br, rw, t),
             (false, true, true) => project_policy::<false, true, COMPACT_COLS, true, false, false, false, false>(proj, blk, rows, ar, br, rw, t),
