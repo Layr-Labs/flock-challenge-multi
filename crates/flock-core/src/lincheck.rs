@@ -2085,7 +2085,8 @@ pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
 
 pub(crate) fn build_eq_table_into(point: &[F128], out: &mut Vec<F128>) {
     let n = 1usize << point.len();
-    out.clear();
+    // The fill seeds slot zero and overwrites both children of each live entry.
+    // Keep initialized slots in a recycled buffer; only growth needs zeroing.
     out.resize(n, F128::ZERO);
     build_eq_table_fill(point, out);
 }
@@ -6294,6 +6295,30 @@ mod tests {
             // …and both agree with the row-scatter reference.
             let reference = sparse_row_fold_alpha_batched(alpha, &a, &b, &eq);
             assert_eq!(want, reference, "k={k} reference");
+        }
+    }
+
+    #[test]
+    fn recycled_eq_table_matches_boolean_weights() {
+        let poison = F128::new(u64::MAX, u64::MAX);
+        let mut out = vec![poison; 64];
+        for (step, d) in [0, 1, 6, 11, 11, 11, 9, 6, 0, 11].into_iter().enumerate() {
+            out.fill(poison);
+            let point: Vec<_> = (0..d)
+                .map(|j| match (step + j) % 5 {
+                    0 if step != 4 => F128::ZERO,
+                    1 if step != 4 => F128::ONE,
+                    _ => F128::new((j + 17) as u64, (step + 1) as u64),
+                })
+                .collect();
+            build_eq_table_into(&point, &mut out);
+            assert_eq!(out.len(), 1 << d);
+            for (i, &weight) in out.iter().enumerate() {
+                let expected = point.iter().enumerate().fold(F128::ONE, |acc, (j, &r)| {
+                    acc * if i & (1 << j) == 0 { F128::ONE + r } else { r }
+                });
+                assert_eq!(weight, expected, "step={step} index={i}");
+            }
         }
     }
 
