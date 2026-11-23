@@ -652,7 +652,7 @@ impl RootTileCache {
         if shift_free {
             debug_assert!(self.fixed_roots && n_out == 177 * 64);
             let out_addr = out.as_mut_ptr() as usize;
-            (0..fold_blocks).into_par_iter().for_each(|block| {
+            let leaf = |block: usize| {
                 crate::rstrace::evd("rf:rb", block as u32);
                 let mut buf = [F128::ZERO; 64];
                 unsafe {
@@ -673,7 +673,12 @@ impl RootTileCache {
                         }
                     }
                 }
-            });
+            };
+            if *C4_RED_TEAM && crate::flat_par::team_enabled() && crate::flat_par::team_ready() {
+                crate::flat_par::team_map_reduce(fold_blocks, leaf, || (), |_, _| ());
+            } else {
+                (0..fold_blocks).into_par_iter().for_each(leaf);
+            }
             crate::rstrace::ev("lcf:reduced", 0);
             out[833..897].fill(F128::ZERO);
             out[897 + 186 * 56..].fill(F128::ZERO);
