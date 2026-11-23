@@ -560,6 +560,14 @@ fn fast_pcs_open_encode_enabled() -> bool {
 /// Destination of the flat encoder.
 pub(crate) trait ByteSink {
     fn put(&mut self, bytes: &[u8]);
+
+    #[inline]
+    fn put_initial_rows(&mut self, rows: &[Vec<F128>])
+    where
+        Self: Sized,
+    {
+        put_rows(self, rows);
+    }
 }
 
 impl ByteSink for Vec<u8> {
@@ -605,6 +613,14 @@ struct WindowSink {
     pos: usize,
     lo: usize,
     hi: usize,
+    initial_row_stride: Option<usize>,
+}
+
+fn uniform_row_stride(rows: &[Vec<F128>]) -> Option<usize> {
+    let width = rows.first()?.len();
+    rows.iter().all(|row| row.len() == width).then(|| {
+        size_of::<u64>() + width * size_of::<F128>()
+    })
 }
 
 impl ByteSink for WindowSink {
@@ -624,6 +640,23 @@ impl ByteSink for WindowSink {
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr().add(a - start), self.base.add(a), b - a)
         };
+    }
+
+    fn put_initial_rows(&mut self, rows: &[Vec<F128>]) {
+        let Some(stride) = self.initial_row_stride else {
+            return put_rows(self, rows);
+        };
+        put_u64(self, rows.len() as u64);
+        let start = self.pos;
+        let first = (self.lo.saturating_sub(start) / stride).min(rows.len());
+        let end = self.hi.saturating_sub(start).div_ceil(stride).min(rows.len());
+        // Each row includes its own eight-byte length. Keep clipping both
+        // that field and its payload at window edges using the normal sink.
+        self.pos = start + first * stride;
+        for row in &rows[first..end] {
+            put_f128_vec(self, row);
+        }
+        self.pos = start + rows.len() * stride;
     }
 }
 
@@ -701,10 +734,11 @@ impl RawEncoding {
     }
 
     /// Lane gl2: [`Self::write`] spread over the Rayon pool with no serial
-    /// planning pass: each of `n` tasks walks the flat encoder over the whole
+    /// copy plan: each of `n` tasks walks the flat encoder over the
     /// bundle with a sink that copies only the bytes falling inside its own
     /// output window `[k*total/n, (k+1)*total/n)` and merely advances past the
-    /// rest. The windows tile `0..total` disjointly and every byte comes from
+    /// rest. Uniform initial rows permit a direct jump to the overlap.
+    /// The windows tile `0..total` disjointly and every byte comes from
     /// the same `put` the serial encoder makes, so the output is identical to
     /// [`Self::write`] whatever the schedule.
     ///
@@ -715,12 +749,15 @@ impl RawEncoding {
         let total = self.total;
         let base = dst as usize;
         let prefix = &self.prefix;
+        let initial_row_stride =
+            uniform_row_stride(&bundle.proof.pcs_open.ligerito.initial_proof.opened_rows);
         (0..n).into_par_iter().with_min_len(1).for_each(|k| {
             let mut sink = WindowSink {
                 base: base as *mut u8,
                 pos: 0,
                 lo: k * total / n,
                 hi: (k + 1) * total / n,
+                initial_row_stride,
             };
             sink.put(prefix);
             encode_pcs_open_flat(&mut sink, &bundle.proof.pcs_open);
@@ -823,7 +860,9 @@ fn encode_pcs_open_flat<S: ByteSink>(out: &mut S, p: &BatchOpeningProofLigerito)
         fold_grinding_nonces,
     } = ligerito;
     out.put(initial_root);
-    put_recursive_proof(out, initial_proof);
+    let RecursiveProof { opened_rows, merkle_proof } = initial_proof;
+    out.put_initial_rows(opened_rows);
+    put_hash_vec(out, merkle_proof);
     put_hash_vec(out, recursive_roots);
     put_u64(out, recursive_proofs.len() as u64);
     for rp in recursive_proofs {
@@ -1056,6 +1095,33 @@ impl std::error::Error for BundleReadError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_row_windows_match_every_serial_interval() {
+        let x = F128::new(0x0123456789abcdef, 0xfedcba9876543210);
+        for widths in [vec![], vec![0; 3], vec![1; 3], vec![2; 3], vec![2, 0, 1]] {
+            let rows: Vec<_> = widths.into_iter().enumerate()
+                .map(|(i, n)| vec![F128::new(x.lo ^ i as u64, x.hi); n]).collect();
+            let mut expected = vec![3u8; 5];
+            put_rows(&mut expected, &rows);
+            expected.extend_from_slice(&[7; 4]);
+            let stride = uniform_row_stride(&rows);
+            for lo in 0..=expected.len() {
+                for hi in lo..=expected.len() {
+                    let mut actual = vec![0xa5; expected.len()];
+                    let mut sink = WindowSink {
+                        base: actual.as_mut_ptr(), pos: 0, lo, hi, initial_row_stride: stride,
+                    };
+                    sink.put(&[3; 5]);
+                    sink.put_initial_rows(&rows);
+                    sink.put(&[7; 4]);
+                    assert_eq!(sink.pos, expected.len());
+                    assert_eq!(actual[lo..hi], expected[lo..hi]);
+                    assert!(actual[..lo].iter().chain(&actual[hi..]).all(|&b| b == 0xa5));
+                }
+            }
+        }
+    }
     use crate::r1cs_hashes::blake3::{Blake3Setup, Compression, blake3_compress, cv_to_phys_bits};
     use flock_core::challenger::FsChallenger;
 
