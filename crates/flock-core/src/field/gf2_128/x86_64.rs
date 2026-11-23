@@ -25,9 +25,15 @@ unsafe fn lane1(v: __m128i) -> u64 {
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_low_rhs(a: F128, b_lo: u64) -> F128 {
     unsafe {
-        let p0 = pmull(a.lo, b_lo);
-        let q = pmull(a.hi, b_lo);
-        super::ghash_reduce(lane0(p0), lane1(p0) ^ lane0(q), lane1(q), 0)
+        let x = _mm_set_epi64x(a.hi as i64, a.lo as i64);
+        let y = _mm_cvtsi64_si128(b_lo as i64);
+        let polynomial = _mm_set_epi64x(0, 0x87);
+        let p0 = _mm_clmulepi64_si128::<0x00>(x, y);
+        let q = _mm_clmulepi64_si128::<0x01>(x, y);
+        let result = _mm_xor_si128(p0, _mm_xor_si128(
+            _mm_slli_si128::<8>(q),
+            _mm_clmulepi64_si128::<0x01>(q, polynomial)));
+        F128 { lo: lane0(result), hi: lane1(result) }
     }
 }
 
@@ -190,20 +196,21 @@ pub unsafe fn ghash_mul_karatsuba_barrett(a: F128, b: F128) -> F128 {
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_unreduced_x86(a: F128, b: F128) -> F256Unreduced {
     unsafe {
-        let p_ll = pmull(a.lo, b.lo);
-        let p_lh = pmull(a.lo, b.hi);
-        let p_hl = pmull(a.hi, b.lo);
-        let p_hh = pmull(a.hi, b.hi);
-
-        let cross = _mm_xor_si128(p_lh, p_hl);
-        let cr_lo = lane0(cross);
-        let cr_hi = lane1(cross);
+        let x = _mm_set_epi64x(a.hi as i64, a.lo as i64);
+        let y = _mm_set_epi64x(b.hi as i64, b.lo as i64);
+        let p_ll = _mm_clmulepi64_si128::<0x00>(x, y);
+        let p_hh = _mm_clmulepi64_si128::<0x11>(x, y);
+        let cross = _mm_xor_si128(
+            _mm_clmulepi64_si128::<0x01>(x, y),
+            _mm_clmulepi64_si128::<0x10>(x, y));
+        let low = _mm_xor_si128(p_ll, _mm_slli_si128::<8>(cross));
+        let high = _mm_xor_si128(p_hh, _mm_srli_si128::<8>(cross));
 
         F256Unreduced {
-            r0: lane0(p_ll),
-            r1: lane1(p_ll) ^ cr_lo,
-            r2: lane0(p_hh) ^ cr_hi,
-            r3: lane1(p_hh),
+            r0: lane0(low),
+            r1: lane1(low),
+            r2: lane0(high),
+            r3: lane1(high),
         }
     }
 }
