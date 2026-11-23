@@ -68,6 +68,47 @@ pub fn build_eq(r: &[F128]) -> Vec<F128> {
     t
 }
 
+/// [`build_eq`] with the whole table scaled by `root`, in one doubling pass
+/// seeded with `root` (port of the ARM track's `build_eq_scaled`). Equal entry
+/// for entry to `build_eq(r)` multiplied by `root`: the same field products,
+/// regrouped, and GF(2^128) multiplication is exactly associative and
+/// commutative.
+pub fn build_eq_scaled(r: &[F128], root: F128) -> Vec<F128> {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        static OFF: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_X1_EQ_X4").is_some());
+        if r.len() >= 3 && !*OFF {
+            return crate::lincheck::build_eq_table_scaled(r, root);
+        }
+    }
+    let n = r.len();
+    let mut t = crate::alloc_uninit_f128_vec(1usize << n);
+    t[0] = root;
+    for i in 0..n {
+        let r_i = r[i];
+        for x in (0..(1usize << i)).rev() {
+            let hi = t[x] * r_i;
+            t[x | (1 << i)] = hi;
+            t[x] += hi;
+        }
+    }
+    t
+}
+
+/// `FLOCK_NO_EQ_ROOT_SEED` (any value) restores "build the eq table, then scale
+/// it by `D^-1` in a second pass" at the round-one AB weight builders. Read once
+/// per process.
+pub(crate) fn eq_root_seed_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_EQ_ROOT_SEED").is_none());
+    *ON
+}
+
 // ---------------------------------------------------------------------------
 // Naive round-1 prover message (extract_c form)
 // ---------------------------------------------------------------------------
