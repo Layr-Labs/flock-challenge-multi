@@ -127,6 +127,17 @@ pub unsafe fn ghash_square_register(a: F128) -> F128 {
 
 #[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
+pub unsafe fn ghash_reduce_unreduced_register(u: F256Unreduced) -> F128 {
+    unsafe {
+        reduce_register_product(
+            _mm_set_epi64x(u.r1 as i64, u.r0 as i64),
+            _mm_setzero_si128(),
+            _mm_set_epi64x(u.r3 as i64, u.r2 as i64))
+    }
+}
+
+#[inline]
+#[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_karatsuba(a: F128, b: F128) -> F128 {
     unsafe {
         let p0 = pmull(a.lo, b.lo);

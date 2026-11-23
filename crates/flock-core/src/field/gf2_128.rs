@@ -205,7 +205,14 @@ impl F256Unreduced {
 
     #[inline]
     pub fn reduce(self) -> F128 {
-        ghash_reduce(self.r0, self.r1, self.r2, self.r3)
+        #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+        {
+            unsafe { x86_64::ghash_reduce_unreduced_register(self) }
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
+        {
+            ghash_reduce(self.r0, self.r1, self.r2, self.r3)
+        }
     }
 }
 
