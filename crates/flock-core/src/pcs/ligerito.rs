@@ -9673,6 +9673,28 @@ fn sample_distinct_queries<Ch: Challenger>(
     );
     let mut out = Vec::with_capacity(count);
     if gl2_qs_reuse() && count <= 256 && block_len < u32::MAX as usize {
+        // The final ranked opening has 1024 possible positions. Membership
+        // fits on the stack, and bit order is already the required query order.
+        if block_len == 1024 {
+            let mut words = [0u64; 16];
+            let mut distinct = 0;
+            crate::rstrace::evd("qs:begin", count as u32);
+            while distinct < count {
+                let q = (challenger.sample_f128().lo as usize) & 1023;
+                let word = &mut words[q >> 6];
+                let bit = 1u64 << (q & 63);
+                distinct += usize::from(*word & bit == 0);
+                *word |= bit;
+            }
+            crate::rstrace::evd("qs:drawn", count as u32);
+            for (i, mut word) in words.into_iter().enumerate() {
+                while word != 0 {
+                    out.push(i * 64 + word.trailing_zeros() as usize);
+                    word &= word - 1;
+                }
+            }
+            return out;
+        }
         // Lane gl2: same draws, same first-occurrence dedupe, small hash set.
         Gl2QSet::with(|seen| {
             crate::rstrace::evd("qs:begin", count as u32);
@@ -12930,6 +12952,29 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn final_query_bitmap_matches_order_and_challenger_state() {
+        use crate::challenger::FsChallenger;
+        use std::collections::BTreeSet;
+
+        for kind in [HashKind::Blake3, HashKind::Sha256] {
+            let mut actual = FsChallenger::with_hash(b"query-bitmap", kind);
+            let mut reference = actual.clone();
+            for (domain, count) in [(0, 0), (1024, 0), (1024, 1), (1024, 36),
+                                    (1024, 256), (1024, 257), (1023, 36), (1025, 36)] {
+                let mut selected = BTreeSet::new();
+                while selected.len() < count {
+                    selected.insert(reference.sample_f128().lo as usize % domain);
+                }
+                assert_eq!(
+                    sample_distinct_queries(&mut actual, domain, count),
+                    selected.into_iter().collect::<Vec<_>>(),
+                );
+                assert_eq!(actual.sample_f128(), reference.sample_f128());
+            }
+        }
+    }
 
     #[test]
     fn query_phase_gathers_match_sequential_oracles() {
