@@ -339,6 +339,21 @@ impl Challenger for FsChallenger {
     fn observe_f128_slice(&mut self, values: &[F128]) {
         self.absorb(&[OP_OBSERVE, KIND_SLICE]);
         self.absorb(&(values.len() as u64).to_le_bytes());
+        #[cfg(target_endian = "little")]
+        {
+            const {
+                assert!(size_of::<F128>() == 16);
+                assert!(core::mem::offset_of!(F128, lo) == 0);
+                assert!(core::mem::offset_of!(F128, hi) == 8);
+            }
+            // SAFETY: the two initialized u64 limbs cover all 16 bytes. In
+            // little-endian memory they have exactly the transcript wire order.
+            let payload = unsafe {
+                core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
+            };
+            self.absorb(payload);
+        }
+        #[cfg(not(target_endian = "little"))]
         for v in values {
             self.absorb_f128(*v);
         }
@@ -2755,6 +2770,29 @@ mod tests {
     }
 
     // ---- FsChallenger ------------------------------------------------------
+
+    #[test]
+    fn field_slice_absorption_matches_little_endian_limb_stream() {
+        let values: Vec<_> = (0..257u64)
+            .map(|i| F128::new(i.wrapping_mul(0xfedc_ba98_7654_3211), !i.rotate_left(37)))
+            .collect();
+        for kind in KINDS {
+            let mut actual = FsChallenger::with_hash(b"slice-wire", kind);
+            let mut reference = actual.clone();
+            for n in [0, 1, 3, 4, 5, 25, 63, 64, 65, 128, 257] {
+                actual.observe_f128_slice(&values[..n]);
+                reference.absorb(&[OP_OBSERVE, KIND_SLICE]);
+                reference.absorb(&(n as u64).to_le_bytes());
+                for v in &values[..n] {
+                    reference.absorb(&v.lo.to_le_bytes());
+                    reference.absorb(&v.hi.to_le_bytes());
+                }
+                assert_eq!(actual.n_absorbed, reference.n_absorbed);
+                assert_eq!(actual.state_digest(), reference.state_digest(), "{kind} n={n}");
+                assert_eq!(actual.sample_f128(), reference.sample_f128());
+            }
+        }
+    }
 
     #[test]
     fn fs_challenger_identical_scripts_produce_identical_output() {
