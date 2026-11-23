@@ -3634,6 +3634,20 @@ pub(crate) fn fold_and_compute_round_pair_into_with_n_hi(
         // injection plus a latch round-trip on every worker, which for the
         // small tail rounds is more than the whole round's arithmetic.
         chunk_body(0, a_out, b_out)
+    } else if crate::flat_par::team_enabled() && crate::flat_par::team_ready() {
+        team_chunks(
+            a_out,
+            b_out,
+            chunk_out,
+            |(x_hi, (a_out, b_out)): (usize, (&mut [F128], &mut [F128]))| {
+                crate::rstrace::evd("fr:b", x_hi as u32);
+                let r = chunk_body(x_hi, a_out, b_out);
+                crate::rstrace::evd("fr:e", 0);
+                r
+            },
+            || (F128::ZERO, F128::ZERO),
+            |(s1, sinf): (F128, F128), (c1, cinf): (F128, F128)| (s1 + c1, sinf + cinf),
+        )
     } else {
         a_out
             .par_chunks_mut(chunk_out)
