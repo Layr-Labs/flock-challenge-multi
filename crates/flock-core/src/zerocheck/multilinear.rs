@@ -3208,6 +3208,72 @@ pub fn fold_in_place_pair(a: &mut Vec<F128>, b: &mut Vec<F128>, challenge: F128)
     b.truncate(half);
 }
 
+/// [`fold_in_place_pair`] at `challenge` followed by [`round_pair_naive`] on the
+/// folded tables with `r_next`, in one in-place pass (port of the ARM track's
+/// `fold_in_place_and_round_pair_with_eq`, `FLOCK_NO_ZC_TAIL_FUSED_FOLD`).
+///
+/// For each group of four input slots `4x..4x+3` it forms the two folded values
+/// of `a` and of `b` with exactly the products and sums of `fold_in_place_pair`,
+/// stores them into slots `2x` and `2x+1` (the slots the bind writes), and adds
+/// the pair's two message terms, with exactly `round_pair_naive`'s products, to
+/// the same accumulators in the same `x` order. All four inputs are read before
+/// either output is written, and `2x + 1 < 4x` for `x >= 1` (at `x = 0` slots
+/// 0 and 1 are written after slots 0..3 are read), so no unread input is
+/// clobbered. The equality table depends only on `r_next` and is built first.
+/// Tables and message are bit-identical to the two-pass form.
+pub fn fold_in_place_and_round_pair_naive(
+    a: &mut Vec<F128>,
+    b: &mut Vec<F128>,
+    challenge: F128,
+    r_next: &[F128],
+) -> (F128, F128) {
+    let n = a.len();
+    assert_eq!(b.len(), n);
+    assert!(n.is_power_of_two() && n >= 4);
+    let half = n / 2;
+    let quarter = n / 4;
+    assert_eq!(r_next.len(), half.trailing_zeros() as usize);
+    let eq_remaining = build_eq(&r_next[1..]);
+    assert_eq!(eq_remaining.len(), quarter);
+
+    let mut g_one = F128::ZERO;
+    let mut g_inf = F128::ZERO;
+    for x_prime in 0..quarter {
+        let a00 = a[4 * x_prime];
+        let a01 = a[4 * x_prime + 1];
+        let a10 = a[4 * x_prime + 2];
+        let a11 = a[4 * x_prime + 3];
+        let b00 = b[4 * x_prime];
+        let b01 = b[4 * x_prime + 1];
+        let b10 = b[4 * x_prime + 2];
+        let b11 = b[4 * x_prime + 3];
+        let a0 = a00 + challenge * (a01 + a00);
+        let a1 = a10 + challenge * (a11 + a10);
+        let b0 = b00 + challenge * (b01 + b00);
+        let b1 = b10 + challenge * (b11 + b10);
+        a[2 * x_prime] = a0;
+        a[2 * x_prime + 1] = a1;
+        b[2 * x_prime] = b0;
+        b[2 * x_prime + 1] = b1;
+        let eq_x = eq_remaining[x_prime];
+        g_one += eq_x * a1 * b1;
+        // Char-2: (a_1 − a_0)(b_1 − b_0) = (a_0 + a_1)(b_0 + b_1).
+        g_inf += eq_x * (a0 + a1) * (b0 + b1);
+    }
+    a.truncate(half);
+    b.truncate(half);
+    (r_next[0] * g_one, g_inf)
+}
+
+/// `FLOCK_NO_ZC_TAIL_FUSED_FOLD` (any value) restores the two-pass
+/// `fold_in_place_pair` + `round_pair_naive` in the zerocheck's small tail
+/// rounds. Read once per process.
+pub fn zc_tail_fused_fold_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TAIL_FUSED_FOLD").is_none());
+    *ON
+}
+
 /// Fused: bind one variable at `r_fold` AND compute the *next* round's prover
 /// message. Returns the new (folded) `a, b` vectors (half the input size) and
 /// `(r_next[0] · G(1), G(∞))` for the next round.

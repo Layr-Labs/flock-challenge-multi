@@ -1535,6 +1535,10 @@ fn prove_packed_padded_inner<C: Challenger>(
             a_mlv.truncate(half);
             b_mlv.truncate(half);
             (m1, mi)
+        } else if a_mlv.len() >= 4 && multilinear::zc_tail_fused_fold_enabled() {
+            multilinear::fold_in_place_and_round_pair_naive(
+                &mut a_mlv, &mut b_mlv, rho_prev, &r_next,
+            )
         } else {
             fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
             round_pair_naive(&a_mlv, &b_mlv, &r_next)
