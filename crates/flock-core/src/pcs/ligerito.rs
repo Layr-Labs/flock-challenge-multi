@@ -9756,7 +9756,7 @@ fn merkle_multi_proof_for_l0(
     assert_eq!(codeword.len(), block_len * num_interleaved);
 
     use rayon::prelude::*;
-    let indices = merkle::merkle_multi_proof_sibling_indices(block_len, queries);
+    let indices = merkle::sorted_sibling_indices(block_len, queries);
     let leaf_size = num_interleaved * core::mem::size_of::<F128>();
     // Leaf `i` is codeword row `l0_layout.row(i)` (page-blocked ranked codeword).
     let l0_layout = crate::ntt::additive_ntt_f128::L0Rows::of(codeword);
@@ -9832,7 +9832,7 @@ fn merkle_multi_proof_for_l0(
 fn multi_proof_gather(tree: &[Hash], block_len: usize, queries: &[usize], par: bool) -> Vec<Hash> {
     use rayon::prelude::*;
     if par {
-        let indices = merkle::merkle_multi_proof_sibling_indices(block_len, queries);
+        let indices = merkle::sorted_sibling_indices(block_len, queries);
         if indices.len() >= MULTIPROOF_PAR_MIN_SIBLINGS {
             return indices
                 .par_iter()
