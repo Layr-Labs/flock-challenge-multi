@@ -1503,6 +1503,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         + if n_levels > 0 { off } else { 0 }
         + if n_levels > c3_at { c3 as usize } else { 0 };
 
+    let mut tail_weights = Vec::new();
     for i in loop_start..(n_mlv - 1) {
         crate::rstrace::ev("tr:in", i as u32);
         let t_round = std::time::Instant::now();
@@ -1510,34 +1511,37 @@ fn prove_packed_padded_inner<C: Challenger>(
         let log_n_before = a_mlv.len().trailing_zeros() as usize;
         crate::rstrace::ev("zt:r0", log_n_before as u32);
 
-        // r_next for the next round's message: length log_n_before - 1.
-        // r_next[0] = ONE (Convention A factor); r_next[1..] are the eq
-        // weights for the remaining variables = r[k_skip + i + 2..m].
-        let mut r_next = vec![F128::ONE; log_n_before - 1];
-        r_next[1..].copy_from_slice(&r[k_skip + i + 2..]);
-
-        let (m1, mi) = if log_n_before >= 10 && !no_tail_fusion {
-            let half = a_mlv.len() / 2;
-            let (m1, mi) = fold_and_compute_round_pair_into(
-                &a_mlv,
-                &b_mlv,
-                &mut a_nxt[..half],
-                &mut b_nxt[..half],
-                rho_prev,
-                &r_next,
-            );
-            // Swap current <-> scratch, then shrink the new current to the
-            // folded size. The old (larger) buffer becomes scratch; we only
-            // ever write its leading `half` slots next round, so its stale
-            // length is harmless.
-            std::mem::swap(&mut a_mlv, &mut a_nxt);
-            std::mem::swap(&mut b_mlv, &mut b_nxt);
-            a_mlv.truncate(half);
-            b_mlv.truncate(half);
-            (m1, mi)
+        let suffix = &r[k_skip + i + 2..];
+        let (m1, mi) = if !no_tail_fusion && log_n_before < 10 {
+            multilinear::fold_small_tail_round(
+                &mut a_mlv, &mut b_mlv, rho_prev, suffix, &mut tail_weights,
+            )
         } else {
-            fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
-            round_pair_naive(&a_mlv, &b_mlv, &r_next)
+            let mut r_next = vec![F128::ONE; log_n_before - 1];
+            r_next[1..].copy_from_slice(suffix);
+            if no_tail_fusion {
+                fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
+                round_pair_naive(&a_mlv, &b_mlv, &r_next)
+            } else {
+                let half = a_mlv.len() / 2;
+                let (m1, mi) = fold_and_compute_round_pair_into(
+                    &a_mlv,
+                    &b_mlv,
+                    &mut a_nxt[..half],
+                    &mut b_nxt[..half],
+                    rho_prev,
+                    &r_next,
+                );
+                // Swap current <-> scratch, then shrink the new current to the
+                // folded size. The old (larger) buffer becomes scratch; we only
+                // ever write its leading `half` slots next round, so its stale
+                // length is harmless.
+                std::mem::swap(&mut a_mlv, &mut a_nxt);
+                std::mem::swap(&mut b_mlv, &mut b_nxt);
+                a_mlv.truncate(half);
+                b_mlv.truncate(half);
+                (m1, mi)
+            }
         };
         if zc_timing {
             tail_round_ms.push((log_n_before, t_round.elapsed().as_secs_f64() * 1e3));

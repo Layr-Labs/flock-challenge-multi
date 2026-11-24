@@ -3208,6 +3208,54 @@ pub fn fold_in_place_pair(a: &mut Vec<F128>, b: &mut Vec<F128>, challenge: F128)
     b.truncate(half);
 }
 
+/// Bind the low bit and form the Convention A message (leading factor one).
+/// On consecutive calls the suffix drops its first coordinate. Carry its
+/// equality weights in the consumed prefix of the same allocation.
+pub(super) fn fold_small_tail_round(
+    a: &mut Vec<F128>,
+    b: &mut Vec<F128>,
+    rho: F128,
+    suffix: &[F128],
+    weights: &mut Vec<F128>,
+) -> (F128, F128) {
+    let n = a.len();
+    assert!(n >= 4 && n.is_power_of_two());
+    assert_eq!(n, b.len());
+    assert_eq!(suffix.len(), n.trailing_zeros() as usize - 2);
+    if weights.is_empty() {
+        *weights = build_eq(suffix);
+    }
+    let quarter = n / 4;
+    assert_eq!(weights.len(), quarter);
+
+    let bind = |v0, v1| v0 + rho * (v0 + v1);
+    let mut one = F128::ZERO;
+    let mut infinity = F128::ZERO;
+    for x in 0..quarter {
+        let a0 = bind(a[4 * x], a[4 * x + 1]);
+        let a1 = bind(a[4 * x + 2], a[4 * x + 3]);
+        let b0 = bind(b[4 * x], b[4 * x + 1]);
+        let b1 = bind(b[4 * x + 2], b[4 * x + 3]);
+        a[2 * x] = a0;
+        a[2 * x + 1] = a1;
+        b[2 * x] = b0;
+        b[2 * x + 1] = b1;
+
+        let weight = weights[x];
+        one += weight * a1 * b1;
+        infinity += weight * (a0 + a1) * (b0 + b1);
+        if x % 2 == 1 {
+            // The two low-bit weights sum to the weight on the suffix.
+            // Both have been consumed before their parent overwrites a slot.
+            weights[x / 2] = weights[x - 1] + weight;
+        }
+    }
+    weights.truncate(quarter / 2);
+    a.truncate(n / 2);
+    b.truncate(n / 2);
+    (one, infinity)
+}
+
 /// Fused: bind one variable at `r_fold` AND compute the *next* round's prover
 /// message. Returns the new (folded) `a, b` vectors (half the input size) and
 /// `(r_next[0] · G(1), G(∞))` for the next round.
@@ -5145,6 +5193,43 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn small_tail_carry_matches_each_reference_round() {
+        for d in 2..=9 {
+            for seed in 0u64..8 {
+                let value = |j: usize| match seed {
+                    0 => F128::ZERO,
+                    1 => F128::ONE,
+                    _ => {
+                        let x = (j as u64 + seed).wrapping_mul(0x9e3779b97f4a7c15);
+                        F128::new(x ^ x.rotate_left(17), !x.rotate_right(11))
+                    }
+                };
+                let mut a: Vec<_> = (0..1 << d).map(value).collect();
+                let mut b: Vec<_> = (0..1 << d).map(|j| value(j + 621)).collect();
+                let (mut ar, mut br) = (a.clone(), b.clone());
+                let point: Vec<_> = (0..d - 2).map(|j| value(j + 708)).collect();
+                let mut weights = Vec::new();
+                for i in 0..=d - 2 {
+                    let rho = value(i + 2041);
+                    let suffix = &point[i..];
+                    let mut r = vec![F128::ONE];
+                    r.extend_from_slice(suffix);
+                    fold_in_place_pair(&mut ar, &mut br, rho);
+                    let msg = round_pair_naive(&ar, &br, &r);
+                    assert_eq!(fold_small_tail_round(&mut a, &mut b, rho, suffix, &mut weights), msg);
+                    assert_eq!((&a, &b), (&ar, &br));
+                    if suffix.is_empty() {
+                        assert!(weights.is_empty());
+                    } else {
+                        assert_eq!(weights, build_eq(&suffix[1..]));
+                    }
+                }
+            }
+        }
+    }
+
 
     /// Independent restatement of the Lagrange weight formula:
     /// `L_i(z) = ∏_{j≠i} (z + s_j) / ∏_{j≠i} (s_i + s_j)` over the φ_8 node
