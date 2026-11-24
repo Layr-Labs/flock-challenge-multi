@@ -1052,6 +1052,7 @@ fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
     temporary.push(".tmp");
     let temporary = PathBuf::from(temporary);
     flock_core::gaptime::abs("publish enter");
+    crate::profile_pad::pad_for_trial();
     let bytes = match publish_sized(path, &bundle) {
         Some(Ok(result)) => {
             flock_core::gaptime::abs("renamed");
@@ -1435,6 +1436,7 @@ fn speculative_main(
         PRESEED_HOLD.store(false, Ordering::Release);
         flock_core::rstrace::reset();
         flock_core::gaptime::abs("seed read");
+        crate::profile_pad::note_seed_read();
         let Some(line) = line_r else {
             close_fd(real_stdin);
             close_fd(writer);
