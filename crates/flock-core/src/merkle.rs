@@ -1028,9 +1028,54 @@ pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize])
     let mut active: Vec<usize> = positions.to_vec();
     active.sort_unstable();
     active.dedup();
-    debug_assert!(active.iter().all(|&p| p < num_leaves));
+    emit_multi_proof(tree, num_leaves, active, 0)
+}
 
-    let mut proof = Vec::new();
+/// Maximum sibling count for q distinct leaves in a complete binary tree.
+/// At each depth the number of occupied nodes is at most min(q, level width).
+fn sibling_count_bound(num_leaves: usize, q: usize) -> usize {
+    if q == 0 {
+        return 0;
+    }
+    let width = q.next_power_of_two();
+    let sparse_levels = num_leaves.ilog2() - width.ilog2();
+    // Parent slots minus occupied children, summed over all levels.
+    (width - q) + q * sparse_levels as usize
+}
+
+/// When the parallel gather cannot reach its cutoff, reuse the sampler's
+/// ordering and emit hashes directly into a vector reserved at the same bound.
+pub(crate) fn small_sorted_multi_proof(
+    tree: &[Hash],
+    num_leaves: usize,
+    positions: &[usize],
+    parallel_cutoff: usize,
+) -> Option<Vec<Hash>> {
+    if !num_leaves.is_power_of_two() || positions.len() > num_leaves {
+        return None;
+    }
+    let bound = sibling_count_bound(num_leaves, positions.len());
+    if bound >= parallel_cutoff
+        || positions.last().is_some_and(|&p| p >= num_leaves)
+        || !positions.is_sorted_by(|a, b| a < b)
+    {
+        return None;
+    }
+    assert_eq!(tree.len(), 2 * num_leaves - 1);
+    if bound == 0 {
+        return Some(Vec::new());
+    }
+    Some(emit_multi_proof(tree, num_leaves, positions.to_vec(), bound))
+}
+
+fn emit_multi_proof(
+    tree: &[Hash],
+    num_leaves: usize,
+    mut active: Vec<usize>,
+    capacity: usize,
+) -> Vec<Hash> {
+    debug_assert!(active.iter().all(|&p| p < num_leaves));
+    let mut proof = Vec::with_capacity(capacity);
     let mut level_start = 0usize;
     let mut level_len = num_leaves;
 
@@ -1886,6 +1931,33 @@ mod tests {
             *b = ((z >> 33) & 0xff) as u8;
         }
         data
+    }
+
+    #[test]
+    fn small_sorted_proofs_match_all_subsets_and_cutoffs() {
+        for log_n in 0..=4 {
+            let n = 1usize << log_n;
+            let tree: Vec<Hash> = (0..2 * n - 1).map(|i| [i as u8; 32]).collect();
+            let mut maxima = vec![0; n + 1];
+            for mask in 0..1u32 << n {
+                let positions: Vec<_> = (0..n).filter(|&i| mask & (1 << i) != 0).collect();
+                let want: Vec<_> = merkle_multi_proof_sibling_indices(n, &positions)
+                    .into_iter().map(|i| tree[i]).collect();
+                let q = positions.len();
+                let bound = sibling_count_bound(n, q);
+                maxima[q] = maxima[q].max(want.len());
+                assert!(want.len() <= bound);
+                assert_eq!(small_sorted_multi_proof(&tree, n, &positions, bound + 1), Some(want));
+                assert!(small_sorted_multi_proof(&tree, n, &positions, bound).is_none());
+            }
+            for (q, exact_max) in maxima.into_iter().enumerate() {
+                assert_eq!(sibling_count_bound(n, q), exact_max);
+            }
+        }
+        let tree = vec![[0; 32]; 15];
+        for q in [&[4, 1][..], &[1, 1], &[0, 8]] {
+            assert!(small_sorted_multi_proof(&tree, 8, q, 512).is_none());
+        }
     }
 
     #[test]

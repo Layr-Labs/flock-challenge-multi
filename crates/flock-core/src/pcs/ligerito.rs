@@ -9831,6 +9831,11 @@ fn merkle_multi_proof_for_l0(
 
 fn multi_proof_gather(tree: &[Hash], block_len: usize, queries: &[usize], par: bool) -> Vec<Hash> {
     use rayon::prelude::*;
+    if let Some(proof) =
+        merkle::small_sorted_multi_proof(tree, block_len, queries, MULTIPROOF_PAR_MIN_SIBLINGS)
+    {
+        return proof;
+    }
     if par {
         let indices = merkle::merkle_multi_proof_sibling_indices(block_len, queries);
         if indices.len() >= MULTIPROOF_PAR_MIN_SIBLINGS {
