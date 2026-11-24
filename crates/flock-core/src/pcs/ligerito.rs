@@ -9662,6 +9662,13 @@ fn gl2_qs_reuse() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_SPARSE_QUERY_SAMPLER` (any value) keeps the probe-set loop for
+/// sparse query shapes too. Read once per process.
+fn sparse_query_sampler_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_SPARSE_QUERY_SAMPLER").is_none())
+}
+
 fn sample_distinct_queries<Ch: Challenger>(
     challenger: &mut Ch,
     block_len: usize,
@@ -9672,6 +9679,36 @@ fn sample_distinct_queries<Ch: Challenger>(
         "sample_distinct_queries: count ({count}) > block_len ({block_len}) — config is too thin for this query count"
     );
     let mut out = Vec::with_capacity(count);
+    if gl2_qs_reuse()
+        && count <= 256
+        && block_len < u32::MAX as usize
+        && sparse_query_sampler_enabled()
+        && count.saturating_mul(count.saturating_sub(1)) / 2 <= block_len
+    {
+        // Sparse shapes (port of the ARM track's sparse query sampler): the
+        // output is sorted anyway, so the sort answers membership. Any sampler
+        // needs at least `count` draws (each adds at most one new position),
+        // so take exactly `count`, sort and dedup, then draw one at a time and
+        // insert each new value at its sorted place until `count` remain. After
+        // consuming draw k (k >= count) this holds exactly the distinct values
+        // of draws 1..k, so it stops at the same draw as the probe-set loop and
+        // returns the same sorted set: the same challenger draws, the same
+        // queries, no probe-set fill or clear.
+        for _ in 0..count {
+            let v = challenger.sample_f128();
+            out.push((v.lo as usize) % block_len);
+        }
+        out.sort_unstable();
+        out.dedup();
+        while out.len() < count {
+            let v = challenger.sample_f128();
+            let q = (v.lo as usize) % block_len;
+            if let Err(pos) = out.binary_search(&q) {
+                out.insert(pos, q);
+            }
+        }
+        return out;
+    }
     if gl2_qs_reuse() && count <= 256 && block_len < u32::MAX as usize {
         // Lane gl2: same draws, same first-occurrence dedupe, small hash set.
         Gl2QSet::with(|seen| {

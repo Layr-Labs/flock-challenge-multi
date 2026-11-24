@@ -323,6 +323,29 @@ fn lagrange_denominator_inv(k_skip: usize, node_base: usize) -> &'static [F128] 
     })
 }
 
+/// The common value of [`lagrange_denominator_inv`] when every node's inverse
+/// denominator is the same field element, else `None`. The nodes of either
+/// φ_8 domain are a translate of an additive subspace, so `s_i + s_j =
+/// φ_8(i ⊕ j)` and `∏_{j≠i}(s_i + s_j)` does not depend on `i`; this is not
+/// assumed but checked once per process on the cached table (untimed), so the
+/// shared path is taken only when it is exactly the per-node value.
+/// `FLOCK_NO_LAGRANGE_SHARED_DEN` (any value) keeps the per-node product.
+fn lagrange_shared_denominator_inv(k_skip: usize, node_base: usize) -> Option<F128> {
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LAGRANGE_SHARED_DEN").is_some());
+    if *OFF {
+        return None;
+    }
+    static CACHE: [[std::sync::OnceLock<Option<F128>>; 9]; 2] =
+        [const { [const { std::sync::OnceLock::new() }; 9] }; 2];
+    let domain = usize::from(node_base != 0);
+    *CACHE[domain][k_skip].get_or_init(|| {
+        let table = lagrange_denominator_inv(k_skip, node_base);
+        let first = *table.first()?;
+        table.iter().all(|&d| d == first).then_some(first)
+    })
+}
+
 /// `FLOCK_NO_LAGRANGE_BATCH_INV=1` restores the per-node numerator product
 /// and per-node denominator inversion for the Lagrange weights. The ranked
 /// worker's cleared environment never sets it.
@@ -364,6 +387,17 @@ fn lagrange_weights_on_nodes(k_skip: usize, z: F128, node_base: usize) -> Vec<F1
             }
             let total = acc;
             let mut suffix = total.inv();
+            if let Some(den) = lagrange_shared_denominator_inv(k_skip, node_base) {
+                // Every node's inverse denominator is the same element (port of
+                // the ARM track's shared Lagrange denominator): fold it into
+                // `total` once. `total·(p·s)·d == (total·d)·(p·s)` exactly.
+                let total_den = total * den;
+                for i in (0..ell).rev() {
+                    weights[i] = total_den * (prefix[i] * suffix);
+                    suffix *= terms[i];
+                }
+                return weights;
+            }
             for i in (0..ell).rev() {
                 weights[i] = total * (prefix[i] * suffix) * den_inv[i];
                 suffix *= terms[i];
