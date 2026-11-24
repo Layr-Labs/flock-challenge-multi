@@ -44,6 +44,7 @@ pub fn begin(label: &str) {
 /// Record a boundary: prints `+delta_ms @offset_ms label`.
 pub fn mark(label: &'static str) {
     crate::rstrace::ev(label, 0);
+    record(label);
     if !enabled() {
         return;
     }
@@ -79,11 +80,48 @@ pub fn abs_enabled() -> bool {
 static ABS_BUF: std::sync::Mutex<Vec<(u64, &'static str)>> = std::sync::Mutex::new(Vec::new());
 pub fn abs(label: &'static str) {
     crate::rstrace::ev(label, 1);
+    record(label);
     if !abs_enabled() { return; }
     let mut t = Ts { s: 0, ns: 0 };
     unsafe { clock_gettime(1, &mut t) };
     let ns = t.s as u64 * 1_000_000_000 + t.ns as u64;
     ABS_BUF.lock().unwrap().push((ns, label));
+}
+
+// --- Ranked diagnostics channel (honest profiling probe) ---
+// Always-on, cheap (one mutex push per mark; ~50 per prove, <5 us total).
+// `record` feeds `timeline_offsets`, which the diagnostics publication-delay
+// encoder in flock-prover consumes. "inner begin" resets the timeline so each
+// prove's offsets are anchored at its own start, whichever thread runs it.
+static TIMELINE: LazyLock<std::sync::Mutex<Vec<(u64, &'static str)>>> =
+    LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+static TL_EPOCH_NS: AtomicU64 = AtomicU64::new(0);
+
+pub fn record(label: &'static str) {
+    let now = now_ns();
+    if label == "inner begin" {
+        TL_EPOCH_NS.store(now, Ordering::Relaxed);
+        TIMELINE.lock().unwrap().clear();
+    }
+    TIMELINE.lock().unwrap().push((now, label));
+}
+
+/// Last-occurrence offset (ms since "inner begin") per label, in first-seen order.
+pub fn timeline_offsets() -> Vec<(&'static str, f64)> {
+    let epoch = TL_EPOCH_NS.load(Ordering::Relaxed);
+    let buf = TIMELINE.lock().unwrap();
+    let mut order: Vec<&'static str> = Vec::new();
+    let mut last: std::collections::HashMap<&'static str, u64> = std::collections::HashMap::new();
+    for (ns, l) in buf.iter() {
+        if !last.contains_key(l) {
+            order.push(l);
+        }
+        last.insert(l, *ns);
+    }
+    order
+        .into_iter()
+        .map(|l| (l, (last[l].saturating_sub(epoch)) as f64 / 1e6))
+        .collect()
 }
 pub fn abs_flush() {
     if !abs_enabled() { return; }
