@@ -1007,6 +1007,11 @@ pub fn verify_merkle_proof(
 // positions, deduplicating siblings that lie on multiple paths.
 // ---------------------------------------------------------------------------
 
+#[inline]
+fn multi_proof_capacity(active: usize, num_leaves: usize) -> usize {
+    active * num_leaves.trailing_zeros() as usize
+}
+
 /// Build a Merkle multi-proof for `positions`. Returns the sibling hashes
 /// needed to verify ALL positions against the root, in the canonical
 /// bottom-up sorted-by-position traversal order.
@@ -1030,7 +1035,7 @@ pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize])
     active.dedup();
     debug_assert!(active.iter().all(|&p| p < num_leaves));
 
-    let mut proof = Vec::new();
+    let mut proof = Vec::with_capacity(multi_proof_capacity(active.len(), num_leaves));
     let mut level_start = 0usize;
     let mut level_len = num_leaves;
 
@@ -1083,7 +1088,7 @@ pub fn merkle_multi_proof_sibling_indices(num_leaves: usize, positions: &[usize]
     active.dedup();
     debug_assert!(active.iter().all(|&p| p < num_leaves));
 
-    let mut indices = Vec::new();
+    let mut indices = Vec::with_capacity(multi_proof_capacity(active.len(), num_leaves));
     let mut level_start = 0usize;
     let mut level_len = num_leaves;
 
@@ -1196,6 +1201,38 @@ pub fn verify_merkle_multi_proof(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn multi_proof_reserve_bounds_output() {
+        for log_n in [1usize, 2, 5, 10] {
+            let n = 1usize << log_n;
+            let data: Vec<u8> = (0..n * 64).map(|i| (i * 131 + 7) as u8).collect();
+            let tree = merkle_tree(&data, n, HashKind::Blake3);
+            let sets: Vec<Vec<usize>> = vec![
+                vec![0],
+                vec![n - 1, 0],
+                (0..n).collect(),
+                (0..n).step_by(3).collect(),
+                vec![n / 2, n / 2, 1 % n],
+            ];
+            for positions in sets {
+                let mut active = positions.clone();
+                active.sort_unstable();
+                active.dedup();
+                let cap = multi_proof_capacity(active.len(), n);
+                let proof = merkle_multi_proof(&tree, n, &positions);
+                let idx = merkle_multi_proof_sibling_indices(n, &positions);
+                assert!(
+                    proof.len() <= cap,
+                    "proof {} > cap {cap} at n={n}",
+                    proof.len()
+                );
+                assert!(idx.len() <= cap);
+                assert_eq!(idx.iter().map(|&i| tree[i]).collect::<Vec<_>>(), proof);
+                assert!(proof.capacity() >= proof.len());
+            }
+        }
+    }
+
     /// Diagnostics: time small BLAKE3 trees (the Ligerito recursive-commit
     /// shapes) in isolation. `cargo test -p flock-core --release small_tree_timing_probe -- --ignored --nocapture`.
     /// Diagnostics: the Ligerito recursive-commit encode shapes (num_ntts=8,

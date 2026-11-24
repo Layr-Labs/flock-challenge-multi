@@ -382,6 +382,10 @@ impl Challenger for FsChallenger {
     }
 
     fn grind_pow(&mut self, bits: u32) -> u64 {
+        if bits == 0 {
+            self.observe_bytes(&0u64.to_le_bytes());
+            return 0;
+        }
         let kind = self.hash_kind();
         let state_digest = self.state_digest();
         let trace_t0 = if *GRIND_TRACE { Some(std::time::Instant::now()) } else { None };
