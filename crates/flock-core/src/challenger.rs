@@ -42,6 +42,13 @@ pub trait Challenger: Send {
     /// Absorb a single F128 prover message.
     fn observe_f128(&mut self, value: F128);
 
+    /// Observe consecutive scalar messages, each with its own scalar framing.
+    fn observe_f128_scalars(&mut self, values: &[F128]) {
+        for &value in values {
+            self.observe_f128(value);
+        }
+    }
+
     /// Absorb a slice of F128 prover messages (e.g. the round-1 vector).
     fn observe_f128_slice(&mut self, values: &[F128]) {
         for v in values {
@@ -324,6 +331,15 @@ impl FsChallenger {
     }
 }
 
+#[inline]
+fn scalar_observation(value: F128) -> [u8; 18] {
+    let mut frame = [0; 18];
+    frame[..2].copy_from_slice(&[OP_OBSERVE, KIND_SCALAR]);
+    frame[2..10].copy_from_slice(&value.lo.to_le_bytes());
+    frame[10..].copy_from_slice(&value.hi.to_le_bytes());
+    frame
+}
+
 impl Challenger for FsChallenger {
     fn observe_label(&mut self, label: &[u8]) {
         self.absorb(&[OP_LABEL]);
@@ -332,8 +348,17 @@ impl Challenger for FsChallenger {
     }
 
     fn observe_f128(&mut self, value: F128) {
-        self.absorb(&[OP_OBSERVE, KIND_SCALAR]);
-        self.absorb_f128(value);
+        self.absorb(&scalar_observation(value));
+    }
+
+    fn observe_f128_scalars(&mut self, values: &[F128]) {
+        let mut frames = [[0u8; 18]; 16];
+        for chunk in values.chunks(frames.len()) {
+            for (dst, &value) in frames.iter_mut().zip(chunk) {
+                *dst = scalar_observation(value);
+            }
+            self.absorb(frames[..chunk.len()].as_flattened());
+        }
     }
 
     fn observe_f128_slice(&mut self, values: &[F128]) {
@@ -366,19 +391,32 @@ impl Challenger for FsChallenger {
     fn sample_f128_vec(&mut self, n: usize) -> Vec<F128> {
         #[cfg(feature = "hash-count")]
         fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.absorb(&[OP_SQUEEZE, KIND_SLICE]);
-        self.absorb(&(n as u64).to_le_bytes());
-        let mut buf = vec![0u8; n * 16];
-        self.squeeze_into(&mut buf);
-        self.absorb(&buf);
-        buf.as_chunks::<16>()
-            .0
-            .iter()
-            .map(|c| F128 {
-                lo: u64::from_le_bytes(c[..8].try_into().unwrap()),
-                hi: u64::from_le_bytes(c[8..].try_into().unwrap()),
-            })
-            .collect()
+        let mut header = [0u8; 10];
+        header[..2].copy_from_slice(&[OP_SQUEEZE, KIND_SLICE]);
+        header[2..].copy_from_slice(&(n as u64).to_le_bytes());
+        self.absorb(&header);
+
+        let mut values = vec![F128::ZERO; n];
+        let slots = values.as_mut_slice();
+        const {
+            assert!(size_of::<F128>() == 16);
+            assert!(std::mem::offset_of!(F128, lo) == 0);
+            assert!(std::mem::offset_of!(F128, hi) == 8);
+        }
+        let byte_len = std::mem::size_of_val(slots);
+        // SAFETY: these initialized, exclusively borrowed slots contain only
+        // two u64s, with no padding. Every bit pattern is a valid value.
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(slots.as_mut_ptr().cast::<u8>(), byte_len)
+        };
+        self.squeeze_into(bytes);
+        self.absorb(bytes);
+        #[cfg(target_endian = "big")]
+        for v in slots {
+            v.lo = u64::from_le(v.lo);
+            v.hi = u64::from_le(v.hi);
+        }
+        values
     }
 
     fn grind_pow(&mut self, bits: u32) -> u64 {
@@ -2742,6 +2780,36 @@ mod tests {
         c2.observe_bytes(b"also ignored");
         for _ in 0..8 {
             assert_eq!(c1.sample_f128(), c2.sample_f128());
+        }
+    }
+
+    #[test]
+    fn framed_batches_match_the_scalar_wire_and_vector_oracle() {
+        for kind in [HashKind::Blake3, HashKind::Sha256] {
+            let mut observed = FsChallenger::with_hash(b"frame-boundaries", kind);
+            let mut reference = observed.clone();
+            for n in [0usize, 1, 2, 15, 16, 17, 31, 32, 57, 64, 65, 0] {
+                let values: Vec<_> = (0..n).map(|i| F128::new(i as u64, !(i as u64))).collect();
+                observed.observe_f128_scalars(&values);
+                for v in values {
+                    reference.absorb(&[OP_OBSERVE, KIND_SCALAR]);
+                    reference.absorb(&v.lo.to_le_bytes());
+                    reference.absorb(&v.hi.to_le_bytes());
+                }
+                reference.absorb(&[OP_SQUEEZE, KIND_SLICE]);
+                reference.absorb(&(n as u64).to_le_bytes());
+                let mut bytes = vec![0u8; 16 * n];
+                reference.squeeze_into(&mut bytes);
+                reference.absorb(&bytes);
+                let drawn = observed.sample_f128_vec(n);
+                assert_eq!(drawn.len(), n);
+                for (v, raw) in drawn.iter().zip(bytes.chunks_exact(16)) {
+                    assert_eq!(v.lo.to_le_bytes(), raw[..8]);
+                    assert_eq!(v.hi.to_le_bytes(), raw[8..]);
+                }
+                assert_eq!(observed.n_absorbed, reference.n_absorbed);
+                assert_eq!(observed.sample_f128(), reference.sample_f128());
+            }
         }
     }
 

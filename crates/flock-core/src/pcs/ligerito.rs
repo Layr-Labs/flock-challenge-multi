@@ -10927,9 +10927,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
 
         if i == r - 1 {
             let yr = sc_prover.f().to_vec();
-            for v in &yr {
-                challenger.observe_f128(*v);
-            }
+            challenger.observe_f128_scalars(&yr);
             crate::rstrace::ev("fin:yr", 0);
             let nonce_last = challenger.grind_pow_any_valid(config.grinding_bits[i + 1] as u32);
             crate::rstrace::ev("fin:qgrind", 0);
@@ -12345,9 +12343,7 @@ fn recursive_prover_inner<Ch: Challenger>(
                 t_total.elapsed()
             );
             let yr = sc_prover.f().to_vec();
-            for v in &yr {
-                challenger.observe_f128(*v);
-            }
+            challenger.observe_f128_scalars(&yr);
             let num_queries_last = udr_queries(config.log_inv_rates[i + 1]);
             let queries_last =
                 sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_last);
