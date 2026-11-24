@@ -17,6 +17,7 @@ pub use flock_core::*;
 pub mod chain;
 pub mod merkle_path;
 pub mod proof_io;
+pub mod profile_pad;
 pub mod prover;
 pub mod r1cs_hashes;
 pub mod recycle_alloc;
