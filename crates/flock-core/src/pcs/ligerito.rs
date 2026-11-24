@@ -9322,6 +9322,17 @@ struct SparseDualFoldWork {
     deep_delta: Option<SumcheckMessage>,
     deep_basis: Option<Vec<F128>>,
     deep_left: Option<usize>,
+    /// A deep dual reached its depth on the open's terminal fold and its
+    /// materialization was skipped (`FLOCK_NO_TERMINAL_DUAL_SKIP` kills).
+    deep_skipped: bool,
+}
+
+/// Kill switch for the terminal-fold skip in [`sparse_duals_fold_step`]:
+/// `FLOCK_NO_TERMINAL_DUAL_SKIP` (any value) keeps materializing and merging a
+/// deep dual that completes on the last fold of the open. Read once per process.
+fn terminal_dual_skip_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_TERMINAL_DUAL_SKIP").is_none())
 }
 
 /// Lane opus-pcs: whether the next fold step materializes any sparse dual
@@ -9345,6 +9356,7 @@ fn sparse_duals_fold_step(
     ri: F128,
     defer_l0: bool,
     defer_deep: bool,
+    terminal: bool,
 ) -> SparseDualFoldWork {
     let mut work = SparseDualFoldWork {
         l0_delta: None,
@@ -9353,6 +9365,7 @@ fn sparse_duals_fold_step(
         deep_delta: None,
         deep_basis: None,
         deep_left: None,
+        deep_skipped: false,
     };
     if let Some((dual, fold_challenges)) = l0.as_mut() {
         fold_challenges.push(ri);
@@ -9382,11 +9395,21 @@ fn sparse_duals_fold_step(
         }
         if fold_challenges.len() == dual.depth {
             assert!(
-                !l0_materialized_here && work.deep_basis.is_none() && work.deep_left.is_none(),
+                !l0_materialized_here
+                    && work.deep_basis.is_none()
+                    && work.deep_left.is_none()
+                    && !work.deep_skipped,
                 "two sparse duals materialize into one fold"
             );
             if defer_deep {
                 work.deep_left = Some(k);
+            } else if terminal && terminal_dual_skip_enabled() {
+                // The open's last fold: the caller would merge this basis
+                // into `combined_basis`, but after this fold the prover reads
+                // only `f` (the final `yr`) and the transcript, never the
+                // combined basis. The round delta above is kept, so the
+                // message is unchanged; only the materialize and merge go.
+                work.deep_skipped = true;
             } else {
                 work.deep_basis = Some(dual.materialize_after_folds(fold_challenges));
             }
@@ -10846,6 +10869,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             // it to the combined basis).
             let defer_l0 = op_bg_dual_enabled() && j + 1 == k_i && i + 1 < r;
             let defer_deep = od_deep_bg_enabled() && j + 1 == k_i && i + 1 < r;
+            // The last fold of the open: nothing reads the combined basis
+            // after it (the final level returns `yr = f` and the transcript).
+            let terminal = i + 1 == r && j + 1 == k_i;
             // Lane op: a background basis joins this level's first fold.
             if j == 0 {
                 if let Some(job) = op_bg_job.take() {
@@ -10858,17 +10884,17 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 let (l0, deep, scp) =
                     (&mut active_sparse_dual_0, &mut active_deep_duals, &mut sc_prover);
                 if c4_join_swap_enabled() && c4_fold_wants_team(scp.f().len()) {
-                    rayon::join(|| scp.fold(ri), || sparse_duals_fold_step(l0, deep, ri, defer_l0, defer_deep))
+                    rayon::join(|| scp.fold(ri), || sparse_duals_fold_step(l0, deep, ri, defer_l0, defer_deep, terminal))
                 } else {
                     let (work, msg) = rayon::join(
-                        || sparse_duals_fold_step(l0, deep, ri, defer_l0, defer_deep),
+                        || sparse_duals_fold_step(l0, deep, ri, defer_l0, defer_deep, terminal),
                         || scp.fold(ri),
                     );
                     (msg, work)
                 }
             } else {
                 let msg = sc_prover.fold(ri);
-                (msg, sparse_duals_fold_step(&mut active_sparse_dual_0, &mut active_deep_duals, ri, defer_l0, defer_deep))
+                (msg, sparse_duals_fold_step(&mut active_sparse_dual_0, &mut active_deep_duals, ri, defer_l0, defer_deep, terminal))
             };
             if let Some(delta) = dual_work.l0_delta {
                 msg = sc_prover.add_to_last_message(delta);

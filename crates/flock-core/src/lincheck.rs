@@ -2090,11 +2090,27 @@ pub(crate) fn build_eq_table_into(point: &[F128], out: &mut Vec<F128>) {
     build_eq_table_fill(point, out);
 }
 
+/// [`build_eq_table`] with every entry multiplied by `root`, in the same single
+/// doubling pass: the tree is seeded with `root` instead of one. Each entry is
+/// the same product of the same factors (GF(2^128) multiplication is exactly
+/// associative and commutative), so this equals `build_eq_table(point)` scaled
+/// entry-wise by `root`, without the second pass and the second table.
+pub(crate) fn build_eq_table_scaled(point: &[F128], root: F128) -> Vec<F128> {
+    let mut out = crate::alloc_uninit_vec::<F128>(1usize << point.len());
+    build_eq_table_fill_from(point, &mut out, root);
+    out
+}
+
 #[inline]
 fn build_eq_table_fill(point: &[F128], out: &mut [F128]) {
+    build_eq_table_fill_from(point, out, F128::ONE);
+}
+
+#[inline]
+fn build_eq_table_fill_from(point: &[F128], out: &mut [F128], root: F128) {
     let d = point.len();
     debug_assert_eq!(out.len(), 1usize << d);
-    out[0] = F128::ONE;
+    out[0] = root;
     for (j, &r_j) in point.iter().enumerate() {
         let len = 1usize << j;
         // Char-2: v*(1+r) = v + v*r. One GHASH plus an XOR per old entry.
