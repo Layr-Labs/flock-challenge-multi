@@ -382,6 +382,15 @@ impl Challenger for FsChallenger {
     }
 
     fn grind_pow(&mut self, bits: u32) -> u64 {
+        // No PoW at this site: the nonce is 0 whatever the state (see the
+        // `bits == 0` arm below), so the state digest (a hasher clone and
+        // finalize) has no reader. Absorb the zero nonce exactly as the end of
+        // this function does. Port of the ARM track's `FLOCK_NO_POW0_DIGEST_SKIP`
+        // (any value computes the digest anyway; read once per process).
+        if bits == 0 && pow0_digest_skip_enabled() {
+            self.observe_bytes(&0u64.to_le_bytes());
+            return 0;
+        }
         let kind = self.hash_kind();
         let state_digest = self.state_digest();
         let trace_t0 = if *GRIND_TRACE { Some(std::time::Instant::now()) } else { None };
@@ -521,6 +530,13 @@ impl Challenger for FsChallenger {
         self.observe_bytes(&pow_counter.to_le_bytes());
         ok
     }
+}
+
+/// Kill switch for the zero-bit grind shortcut in `FsChallenger::grind_pow`:
+/// `FLOCK_NO_POW0_DIGEST_SKIP` (any value) computes the unused state digest.
+fn pow0_digest_skip_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_POW0_DIGEST_SKIP").is_none())
 }
 
 // ---------------------------------------------------------------------------

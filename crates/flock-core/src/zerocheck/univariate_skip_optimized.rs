@@ -311,10 +311,14 @@ fn ab_eq_fold_gfni_enabled() -> bool {
 ))]
 fn ab_eq_fold_factors(r_lo: &[F128], bank_bits: usize) -> (Vec<F128>, Vec<F128>) {
     let eq_bot = super::univariate_skip::build_eq(&r_lo[..bank_bits]);
-    let eq_top_scaled = super::univariate_skip::build_eq(&r_lo[bank_bits..])
-        .into_iter()
-        .map(|v| v * d_inv())
-        .collect();
+    let eq_top_scaled = if super::univariate_skip::eq_root_seed_enabled() {
+        super::univariate_skip::build_eq_scaled(&r_lo[bank_bits..], d_inv())
+    } else {
+        super::univariate_skip::build_eq(&r_lo[bank_bits..])
+            .into_iter()
+            .map(|v| v * d_inv())
+            .collect()
+    };
     (eq_bot, eq_top_scaled)
 }
 
@@ -4698,10 +4702,14 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed_idle(
         Vec::new()
     } else {
         let d_inv_val = d_inv();
-        build_eq(&r_outer[..n_lo])
-            .into_iter()
-            .map(|v| v * d_inv_val)
-            .collect()
+        if super::univariate_skip::eq_root_seed_enabled() {
+            super::univariate_skip::build_eq_scaled(&r_outer[..n_lo], d_inv_val)
+        } else {
+            build_eq(&r_outer[..n_lo])
+                .into_iter()
+                .map(|v| v * d_inv_val)
+                .collect()
+        }
     };
     #[cfg(all(
         target_arch = "x86_64",
