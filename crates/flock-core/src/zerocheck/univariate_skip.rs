@@ -29,27 +29,6 @@ use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 /// `table[x] = ∏_i ((1 + r_i) · (1 ⊕ bit_i(x)) + r_i · bit_i(x))` for `x ∈ {0,1}^n`,
 /// where `n = r.len()`. Standard in-place power-of-two doubling.
 pub fn build_eq(r: &[F128]) -> Vec<F128> {
-    // Same doubling with the four-lane VPCLMULQDQ expansion step of
-    // `lincheck::build_eq_table` (every entry is still `v + v·r` / `v·r` of
-    // the same `v`, so the table is value-identical). This builder serves the
-    // per-level `SplitEqGhash` halves of the zerocheck tail (up to 2^12 + 2^11
-    // entries, rebuilt at each level start on the serial chain) and the
-    // round-one / round-two split factors. Mac-track analogue: fba014ca routes
-    // its scalar eq builder to the SIMD one. `FLOCK_NO_X1_EQ_X4=1` restores
-    // the scalar loop below.
-    // Mechanism from rival submission 9fc8de41-ba12-4559-8c56-2b88f91652ca (ported here).
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    {
-        static OFF: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_X1_EQ_X4").is_some());
-        if r.len() >= 3 && !*OFF {
-            return crate::lincheck::build_eq_table(r);
-        }
-    }
     let n = r.len();
     // Uninit alloc — same invariant as `build_eq_parallel` in ring_switch:
     // every slot in t[0..2^n] is written exactly once before any read.
@@ -57,12 +36,11 @@ pub fn build_eq(r: &[F128]) -> Vec<F128> {
     t[0] = F128::ONE;
     for i in 0..n {
         let r_i = r[i];
-        // Char-2: v*(1+r) = v + v*r. One GHASH plus an XOR per old entry.
+        let one_minus_r = F128::ONE + r_i;
         // Iterate downward so we read t[x] before overwriting it as t[x | (1<<i)].
         for x in (0..(1usize << i)).rev() {
-            let hi = t[x] * r_i;
-            t[x | (1 << i)] = hi;
-            t[x] += hi;
+            t[x | (1 << i)] = t[x] * r_i;
+            t[x] *= one_minus_r;
         }
     }
     t
@@ -224,231 +202,7 @@ impl SplitEqGhash {
 /// Ports `ntt_extend_f128_vec_ghash` (scalar form). The NTT is F_2-linear and
 /// φ_8 commutes with that linearity, which is what makes the bit-by-bit
 /// decomposition equal to the direct F_8-valued NTT extension.
-///
-/// The ranked `ell = 64` tables take the unit-image form
-/// ([`ntt_extend_f128_vec_ghash_units`]); `FLOCK_NO_NTT_EXTEND_UNITS=1`
-/// restores the 128 bit-plane passes everywhere.
 pub fn ntt_extend_f128_vec_ghash(in_s: &[F128], inv_table: &InvNttTableByteSingleGf8) -> Vec<F128> {
-    if inv_table.ell == 64 && ntt_extend_units_enabled() {
-        ntt_extend_f128_vec_ghash_units(in_s, inv_table)
-    } else {
-        ntt_extend_f128_vec_ghash_bitplanes(in_s, inv_table)
-    }
-}
-
-/// `FLOCK_NO_NTT_EXTEND_UNITS=1` restores the bit-plane form of
-/// [`ntt_extend_f128_vec_ghash`]. Read once per process.
-fn ntt_extend_units_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_EXTEND_UNITS").is_none());
-    *ON
-}
-
-/// Unit-image form of [`ntt_extend_f128_vec_ghash`] for `ell = 64`.
-///
-/// The extension is `F128`-linear: with `N[z]` the bit-input NTT image of the
-/// unit input `e_z`, the bit-plane sum regroups as
-/// `out[λ] = Σ_b γ^b · φ₈(Σ_z bit_b(in[z]) · N[z][λ]) = Σ_z in[z] · φ₈(N[z][λ])`,
-/// because `γ^b = X^b` is exactly bit `b` of an `F128` and `φ₈` is additive.
-/// `φ₈(n)` is the XOR of `φ₈(2^i)` over the set bits of `n`, so each nonzero
-/// input costs one unit apply, eight multiplies and subset XORs instead of
-/// sharing 128 plane passes of 64 multiplies each. Every term is an exact field
-/// sum, so the output is bit-identical to the bit-plane form.
-pub(crate) fn ntt_extend_f128_vec_ghash_units(
-    in_s: &[F128],
-    inv_table: &InvNttTableByteSingleGf8,
-) -> Vec<F128> {
-    const ELL: usize = 64;
-    assert_eq!(in_s.len(), ELL);
-    assert_eq!(inv_table.ell, ELL);
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512bw",
-        target_feature = "vpclmulqdq"
-    ))]
-    {
-        if sl1_lift_m4rm_enabled() {
-            return unsafe { ntt_extend_f128_vec_ghash_units_m4rm(in_s, inv_table) };
-        }
-        return unsafe { ntt_extend_f128_vec_ghash_units_avx512(in_s, inv_table) };
-    }
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512bw",
-        target_feature = "vpclmulqdq"
-    )))]
-    {
-        let basis: [F128; 8] = core::array::from_fn(|i| phi8(F8(1u8 << i)));
-        let mut out = vec![F128::ZERO; ELL];
-        let mut unit_bits = [0u8; ELL / 8];
-        let mut image = [F8::ZERO; ELL];
-        for (z, &v) in in_s.iter().enumerate() {
-            if v == F128::ZERO {
-                continue;
-            }
-            unit_bits[z / 8] = 1u8 << (z % 8);
-            inv_table.apply(&unit_bits, &mut image);
-            unit_bits[z / 8] = 0;
-            let prods: [F128; 8] = core::array::from_fn(|i| v * basis[i]);
-            for (dst, n) in out.iter_mut().zip(image.iter()) {
-                let mut bits = n.0;
-                while bits != 0 {
-                    *dst += prods[bits.trailing_zeros() as usize];
-                    bits &= bits - 1;
-                }
-            }
-        }
-        out
-    }
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512bw",
-    target_feature = "vpclmulqdq"
-))]
-#[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
-unsafe fn ntt_extend_f128_vec_ghash_units_avx512(
-    in_s: &[F128],
-    inv_table: &InvNttTableByteSingleGf8,
-) -> Vec<F128> {
-    use core::arch::x86_64::*;
-    const ELL: usize = 64;
-    let basis: [F128; 8] = core::array::from_fn(|i| phi8(F8(1u8 << i)));
-    let mut out = vec![F128::ZERO; ELL];
-    let base = inv_table.data_ptr();
-    let base8 = if inv_table.has_second_image() {
-        inv_table.half_swapped_data_ptr()
-    } else {
-        core::ptr::null()
-    };
-    unsafe {
-        let out_ptr = out.as_mut_ptr().cast::<__m512i>();
-        let mut acc: [__m512i; 16] = [_mm512_setzero_si512(); 16];
-        for (z, &v) in in_s.iter().enumerate() {
-            if v == F128::ZERO {
-                continue;
-            }
-            let b = z / 8;
-            let row_off = (1usize << (z % 8)) * ELL;
-            let raw = if b & 1 != 0 && !base8.is_null() {
-                _mm512_loadu_si512(base8.add(row_off).cast::<__m512i>())
-            } else {
-                let r = _mm512_loadu_si512(base.add(row_off).cast::<__m512i>());
-                if b & 1 != 0 {
-                    _mm512_shuffle_epi32::<0x4E>(r)
-                } else {
-                    r
-                }
-            };
-            let img = match b >> 1 {
-                0 => raw,
-                1 => _mm512_shuffle_i64x2::<0xB1>(raw, raw),
-                2 => _mm512_shuffle_i64x2::<0x4E>(raw, raw),
-                _ => _mm512_shuffle_i64x2::<0x1B>(raw, raw),
-            };
-            for i in 0..8 {
-                let p = v * basis[i];
-                let pv = _mm512_broadcast_i32x4(_mm_set_epi64x(p.hi as i64, p.lo as i64));
-                let m64: u64 =
-                    _mm512_test_epi8_mask(img, _mm512_set1_epi8((1u8 << i) as i8));
-                for g in 0..16 {
-                    let nibble = ((m64 >> (4 * g)) & 0xF) as u8;
-                    let mask8 =
-                        ((nibble & 1) * 3) | (((nibble >> 1) & 1) * 12) | (((nibble >> 2) & 1) * 48) | (((nibble >> 3) & 1) * 192);
-                    acc[g] = _mm512_mask_xor_epi64(acc[g], mask8, acc[g], pv);
-                }
-            }
-        }
-        for g in 0..16 {
-            _mm512_storeu_si512(out_ptr.add(g), acc[g]);
-        }
-    }
-    out
-}
-
-/// Lane sl1 (`FLOCK_NO_SL1_LIFT_M4RM`): the unit-image extension with
-/// two 16-entry subset tables per input instead of 8x16 masked XORs: for
-/// input z, `lo[n] = Σ_{i∈n} v·φ₈(2^i)` (i < 4) and `hi[n]` (i ≥ 4), so
-/// `out[λ] += lo[N[z][λ] & 15] + hi[N[z][λ] >> 4]` adds exactly the same
-/// products as the masked form (XOR sums regroup freely): bit-identical.
-fn sl1_lift_m4rm_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL1_LIFT_M4RM").is_none());
-    *ON
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512bw",
-    target_feature = "vpclmulqdq"
-))]
-#[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
-unsafe fn ntt_extend_f128_vec_ghash_units_m4rm(
-    in_s: &[F128],
-    inv_table: &InvNttTableByteSingleGf8,
-) -> Vec<F128> {
-    use core::arch::x86_64::*;
-    const ELL: usize = 64;
-    let basis: [F128; 8] = core::array::from_fn(|i| phi8(F8(1u8 << i)));
-    let base = inv_table.data_ptr();
-    let base8 = if inv_table.has_second_image() {
-        inv_table.half_swapped_data_ptr()
-    } else {
-        core::ptr::null()
-    };
-    let mut acc = [F128::ZERO; ELL];
-    let mut bytes = [0u8; ELL];
-    unsafe {
-        for (z, &v) in in_s.iter().enumerate() {
-            if v == F128::ZERO {
-                continue;
-            }
-            let b = z / 8;
-            let row_off = (1usize << (z % 8)) * ELL;
-            let raw = if b & 1 != 0 && !base8.is_null() {
-                _mm512_loadu_si512(base8.add(row_off).cast::<__m512i>())
-            } else {
-                let r = _mm512_loadu_si512(base.add(row_off).cast::<__m512i>());
-                if b & 1 != 0 {
-                    _mm512_shuffle_epi32::<0x4E>(r)
-                } else {
-                    r
-                }
-            };
-            let img = match b >> 1 {
-                0 => raw,
-                1 => _mm512_shuffle_i64x2::<0xB1>(raw, raw),
-                2 => _mm512_shuffle_i64x2::<0x4E>(raw, raw),
-                _ => _mm512_shuffle_i64x2::<0x1B>(raw, raw),
-            };
-            _mm512_storeu_si512(bytes.as_mut_ptr().cast::<__m512i>(), img);
-            let p: [F128; 8] = core::array::from_fn(|i| v * basis[i]);
-            let mut lo = [F128::ZERO; 16];
-            let mut hi = [F128::ZERO; 16];
-            for n in 1..16usize {
-                let t = n.trailing_zeros() as usize;
-                lo[n] = lo[n & (n - 1)] + p[t];
-                hi[n] = hi[n & (n - 1)] + p[4 + t];
-            }
-            for (dst, &n) in acc.iter_mut().zip(bytes.iter()) {
-                *dst += *lo.get_unchecked((n & 15) as usize) + *hi.get_unchecked((n >> 4) as usize);
-            }
-        }
-    }
-    acc.to_vec()
-}
-
-/// Bit-plane form of [`ntt_extend_f128_vec_ghash`] (every `ell`; the
-/// `FLOCK_NO_NTT_EXTEND_UNITS=1` arm and the oracle of the unit-image form).
-pub(crate) fn ntt_extend_f128_vec_ghash_bitplanes(
-    in_s: &[F128],
-    inv_table: &InvNttTableByteSingleGf8,
-) -> Vec<F128> {
     let ell = inv_table.ell;
     assert_eq!(in_s.len(), ell);
     assert_eq!(ell, 1usize << inv_table.k);
@@ -840,63 +594,6 @@ mod tests {
         let t = build_eq(&r);
         let sum: F128 = t.iter().copied().fold(F128::ZERO, |a, b| a + b);
         assert_eq!(sum, F128::ONE, "Σ_x eq(r, x) should be 1");
-    }
-
-    /// Char-2 one-mul doubling is bit-identical to the two-GHASH formula.
-    #[test]
-    fn build_eq_matches_two_mul() {
-        fn two_mul(r: &[F128]) -> Vec<F128> {
-            let n = r.len();
-            let mut t = vec![F128::ZERO; 1usize << n];
-            t[0] = F128::ONE;
-            for i in 0..n {
-                let r_i = r[i];
-                let one_plus_r = F128::ONE + r_i;
-                for x in (0..(1usize << i)).rev() {
-                    t[x | (1 << i)] = t[x] * r_i;
-                    t[x] *= one_plus_r;
-                }
-            }
-            t
-        }
-        let mut rng = Rng::new(0xE0_D0_B1E);
-        for n in 0..=8 {
-            let r = rng.f128_vec(n);
-            assert_eq!(build_eq(&r), two_mul(&r), "n={n}");
-        }
-    }
-
-    /// The unit-image extension equals the bit-plane extension on the ranked
-    /// `ell = 64` table: random, sparse, single-unit and all-zero inputs.
-    #[test]
-    fn ntt_extend_units_matches_bitplanes() {
-        let ntt_s = AdditiveNttGf8::new(6, F8::ZERO);
-        let ntt_l = AdditiveNttGf8::new(6, F8(64));
-        let table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
-        let mut rng = Rng::new(0x0E17_E4D5);
-        let mut cases: Vec<Vec<F128>> = vec![vec![F128::ZERO; 64]];
-        for z in [0usize, 7, 8, 33, 63] {
-            let mut unit = vec![F128::ZERO; 64];
-            unit[z] = rng.f128_vec(1)[0];
-            cases.push(unit);
-        }
-        for _ in 0..24 {
-            let mut v = rng.f128_vec(64);
-            for (i, x) in v.iter_mut().enumerate() {
-                if i % 5 == 3 {
-                    *x = F128::ZERO;
-                }
-            }
-            cases.push(v);
-            cases.push(rng.f128_vec(64));
-        }
-        for (i, input) in cases.iter().enumerate() {
-            assert_eq!(
-                ntt_extend_f128_vec_ghash_units(input, &table),
-                ntt_extend_f128_vec_ghash_bitplanes(input, &table),
-                "case {i}"
-            );
-        }
     }
 
     #[test]

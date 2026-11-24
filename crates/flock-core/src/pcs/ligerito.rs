@@ -1,4 +1,33 @@
+// Copyright (c) 2026 Bain Capital Crypto, LP and Ron Rothblum
+// Modifications copyright 2026 Succinct Labs, Benedikt Bunz, William Wang
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+//
+// Ported from bolt-rs (https://github.com/bcc-research/bolt-rs,
+// `ligerito_recursive.rs`).
 
+//! Ligerito: recursive multilinear PCS.
+//!
+//! Ported from bolt-rs (`ligerito_recursive.rs`) onto Flock primitives:
+//! `F128` (GHASH irreducible), [`AdditiveNttF128`] (LCH novel basis,
+//! byte-identical to bolt-rs's FFT), SHA-256 merkle from [`crate::merkle`],
+//! and the [`Challenger`] trait for Fiat-Shamir.
+//!
+//! Soundness regimes (our paper App. C.3): unique decoding (Thm `ca-udr`,
+//! BCHKS25 Cor. 1.4, `Secure` profile) and Johnson list decoding with
+//! out-of-domain binding (Thm `ca-johnson`, BCHKS25 Thm 4.6 + Johnson
+//! interleaved list bound, `Fast`/`Slim` profiles). See [`SoundnessRegime`].
+//!
+//! ## Protocol
+//! 1. Commit f^0: reshape into `num_interleaved × msg_cols`, RS-encode each
+//!    lane to `block_len = msg_cols · 2^log_inv_rate`, merkle over codeword
+//!    positions (one position across all lanes = one leaf).
+//! 2. Partial-eval f^0 with `initial_k` challenges → f^1.
+//! 3. Commit f^1.
+//! 4. Open `num_queries` rows of f^0; build induced sumcheck basis poly.
+//! 5. For each recursive step i:
+//!    a. Run k_i sumcheck rounds.
+//!    b. Last step: send remaining poly + open f^i.
+//!    c. Else: commit f^{i+2}, open f^{i+1}, induce next basis, glue.
 
 use crate::challenger::Challenger;
 use crate::field::F128;
@@ -7,21 +36,29 @@ use crate::merkle::{self, Hash, HashKind};
 use crate::ntt::additive_ntt_f128::AdditiveNttF128;
 use serde::{Deserialize, Serialize};
 
-mod sparse_window;
+// ===================================================================
+// Config
+// ===================================================================
 
-pub(crate) fn open_timing() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_OPEN_TIMING").is_some());
-    *ON
-}
-
-pub(crate) fn open_fill_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_FILL").is_none());
-    *ON
-}
-
-
+/// Per-level Reed-Solomon inverse rate (log₂). The CORE Ligerito idea is to
+/// **decrease the rate at deeper levels**: at level i, lower rate ⟹ Johnson
+/// list-decoding per-query error = √ρ ≈ 2^(-log_inv_rate/2) ⟹ fewer queries
+/// needed for the same security ⟹ drastically smaller opened-rows cost at
+/// deeper levels.
+///
+/// `log_inv_rates[i]` is the log inverse rate at commit i (so wtns_0 uses
+/// `log_inv_rates[0]`, wtns_1 uses `log_inv_rates[1]`, …). Length = R + 1.
+/// Named parameter profile for the Ligerito PCS. Decouples "which security
+/// config" from the raw code rate: `Fast` and `Secure` share rate 1/2 but
+/// differ in regime/target, so the rate alone cannot key the config lookup.
+///
+/// - `Fast`:   rate 1/2, Johnson list-decoding regime with OOD binding,
+///             100-bit overall soundness. Default.
+/// - `Slim`:   rate 1/4, Johnson + OOD + 16-bit query grinding, 100-bit
+///             overall. Roughly half the proof, ~2x the L0 encoding work.
+/// - `Secure`: rate 1/2, unique-decoding regime (list size 1, no OOD),
+///             120-bit overall soundness. Largest proof, most conservative
+///             analysis.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LigeritoProfile {
@@ -31,22 +68,17 @@ pub enum LigeritoProfile {
     Secure,
 }
 
-/// Lane sl1: hold window for grind prewarm calls (`FLOCK_SL1_PREWARM_SCALE`
-/// percent, default 100).
-pub(crate) fn sl1_hold_us(base: u64) -> u64 {
-    static S: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
-        std::env::var("FLOCK_SL1_PREWARM_SCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(100)
-    });
-    base * *S / 100
-}
-
 impl LigeritoProfile {
+    /// L0 code rate index for this profile (`rho_0 = 2^-log_inv_rate`).
     pub fn log_inv_rate(self) -> usize {
         match self {
             Self::Fast | Self::Secure => 1,
             Self::Slim => 2,
         }
     }
+    /// Round-by-round soundness target (bits) the profile's configs are derived
+    /// for: every round must individually clear this level (total security =
+    /// min over rounds, per the Fiat-Shamir / `soundcalc` convention).
     pub fn security_bits(self) -> usize {
         match self {
             Self::Fast | Self::Slim => 100,
@@ -79,10 +111,28 @@ pub struct ProverConfig {
     pub initial_k: usize,
     pub recursive_log_msg_cols: Vec<usize>,
     pub recursive_ks: Vec<usize>,
+    /// Per-level query counts (L0, L1, ..., L_r). Length = recursive_steps + 1.
+    /// `default_config` fills these via [`udr_queries`]; for tighter
+    /// (or stronger) per-level numbers, load a [`LigeritoSecurityConfig`].
     pub queries: Vec<usize>,
+    /// Per-level **query-phase** PoW grinding bits (L0, L1, ..., L_r), ground
+    /// post-commit/pre-queries. Length = recursive_steps + 1. Each bit here
+    /// substitutes for ~1/log₂(1/(1−γ)) queries at that level.
     pub grinding_bits: Vec<usize>,
+    /// Per-level **fold-challenge** PoW grinding bits (L0, ..., L_r), ground
+    /// immediately before EACH of the level's fold challenges (so a level
+    /// with `k` folds does `k` grinds of this many bits). Boosts the
+    /// proximity-gap term, which lives on the fold challenges. Length =
+    /// recursive_steps + 1.
     pub fold_grinding_bits: Vec<usize>,
+    /// Per-commit-level out-of-domain samples (L0, ..., L_r), taken right
+    /// after the level's Merkle root enters the transcript. `[0]` must be 0:
+    /// L0 is bound by the opening's own (post-commit, random-point)
+    /// evaluation claim. Length = recursive_steps + 1.
     pub ood_samples: Vec<usize>,
+    /// Hash backing every Merkle commitment this prover makes (L0 and each
+    /// recursive level). Comes from the `hash` field of the security config;
+    /// [`Default`] is SHA-256.
     pub merkle_hash: HashKind,
 }
 
@@ -95,23 +145,60 @@ pub struct VerifierConfig {
     pub initial_k: usize,
     pub recursive_log_msg_cols: Vec<usize>,
     pub recursive_ks: Vec<usize>,
+    /// Per-level query counts. Length = recursive_steps + 1.
     pub queries: Vec<usize>,
+    /// Per-level query-phase PoW grinding bits. Length = recursive_steps + 1.
     pub grinding_bits: Vec<usize>,
+    /// Per-level fold-challenge PoW grinding bits (one grind per fold
+    /// challenge of the level). Length = recursive_steps + 1.
     pub fold_grinding_bits: Vec<usize>,
+    /// Per-commit-level OOD samples. Length = recursive_steps + 1.
     pub ood_samples: Vec<usize>,
+    /// Hash the prover's Merkle commitments were built under. Must match the
+    /// prover's — a mismatch makes every opening fail to verify, which is the
+    /// correct outcome: the root commits to the hash as much as to the data.
     pub merkle_hash: HashKind,
 }
 
+/// Proximity loss `ε*` for the UDR (unique-decoding regime) analysis. It
+/// would back the proximity radius off to `γ = δ/2 − ε*` (δ = 1 − ρ the
+/// code's relative distance); set to `0`, so we decode to the full
+/// unique-decoding radius `γ = δ/2` with no backoff. Per our paper's Appendix
+/// C.3 (Theorem `ca-udr`, BCHKS25 Cor. 1.4) the proximity-gap exceptional set
+/// is then `a = γ·n + 1` — length-dependent (see [`paper_thm_1_4_log_a`]), so
+/// `eps_pg = 128 − log₂ a` shrinks ~1 bit per witness doubling and is
+/// recovered by `fold_grinding_bits`.
 pub const UDR_PROXIMITY_LOSS: f64 = 0.0;
 
+/// Soundness (in bits) the query phase must close on its own at every level
+/// (the "100 bits from queries always" policy).
 const UDR_TARGET_BITS: f64 = 100.0;
 
+/// Number of queries for 100-bit soundness in the **unique-decoding regime**
+/// at rate `2^(-log_inv_rate)`: `γ = δ/2 = (1−ρ)/2`, per-query soundness
+/// `log₂(1/(1−γ))` (see [`udr_per_query_bits`]). Within the unique decoding
+/// radius the prover is pinned to a single codeword, so there is no list and
+/// no union-bound term — queries close the full target by themselves.
+/// Per-query soundness saturates below 1 bit (`γ < 1/2`), so slimmer codes
+/// bottom out near `UDR_TARGET_BITS` queries: 243 at rate 1/2, 148 at 1/4,
+/// 121 at 1/8, 110 at 1/16, 105 at 1/32.
 pub fn udr_queries(log_inv_rate: usize) -> usize {
     assert!(log_inv_rate > 0, "log_inv_rate=0 (rate 1) has no soundness");
     let per_q = udr_per_query_bits_asymptotic(log_inv_rate);
     (UDR_TARGET_BITS / per_q).ceil() as usize
 }
 
+/// Build a sensible default Ligerito config from the upstream PCS shape.
+/// `log_n` is the packed-witness log size (= `m - LOG_PACKING`); `log_batch_size`
+/// and `log_inv_rate` come from `PcsParams` (Ligerito's `initial_k` matches
+/// `log_batch_size` for L0 reuse; the first rate matches `log_inv_rate`).
+///
+/// Strategy: 3-bit recursive folds (`k_i = 3`) with **decreasing rate**
+/// (one rate step per recursive level) until the residual is small (`≤ 5` bits).
+/// Asserts that the chosen rate keeps `block_len ≥ udr_queries(rate)` at
+/// every level; if not, bumps the rate further.
+///
+/// Returns `Err` when no feasible config exists (e.g. `log_n` is too small).
 pub fn default_config(
     log_n: usize,
     log_batch_size: usize,
@@ -129,6 +216,7 @@ pub fn default_config(
     let mut n_running = log_n - initial_k;
     let mut rate_running = log_inv_rate;
 
+    // L0 feasibility check.
     {
         let block_len_log = n_running + rate_running;
         let qs = udr_queries(rate_running);
@@ -140,6 +228,7 @@ pub fn default_config(
     while n_running > 5 {
         let k = 3.min(n_running);
         let log_msg_cols_next = n_running - k;
+        // Pick the smallest rate ≥ rate_running+1 such that block_len ≥ queries.
         let mut next_rate = rate_running + 1;
         loop {
             let bl = 1usize << (log_msg_cols_next + next_rate);
@@ -183,6 +272,7 @@ pub fn default_config(
     })
 }
 
+/// Recursion-ladder shape: per-level dims (index 0 = L0) plus the residual.
 struct LadderShape {
     log_inv_rates: Vec<usize>,
     log_msg_cols: Vec<usize>,
@@ -191,6 +281,10 @@ struct LadderShape {
     yr_log_n: usize,
 }
 
+/// Shared shape derivation behind [`default_config`] and
+/// [`LigeritoSecurityConfig::derive_profile`]: 3-bit recursive folds with the
+/// rate index increasing by ≥ 1 per level, bumped further whenever the block
+/// length couldn't accommodate `queries_at_rate(rate)` distinct queries.
 fn derive_ladder_shape(
     log_n: usize,
     initial_k: usize,
@@ -239,6 +333,10 @@ fn derive_ladder_shape(
     Ok(shape)
 }
 
+/// Embedded security-spec TOML files. The lookup table maps `(m, profile)`
+/// to a TOML payload that's hash-independent (Ligerito's shape only depends
+/// on `log_n = m − LOG_PACKING`). Regenerate with
+/// `cargo run --release --example gen_ligerito_configs`.
 macro_rules! profile_configs {
     ($($m:literal),+ $(,)?) => {
         &[
@@ -256,6 +354,8 @@ macro_rules! profile_configs {
 const EMBEDDED_CONFIGS: &[((usize, LigeritoProfile), &str)] =
     profile_configs!(22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35);
 
+/// Look up the embedded security config TOML for `(m, profile)`.
+/// Returns `None` if no config has been derived for this combination yet.
 pub fn embedded_security_config(m: usize, profile: LigeritoProfile) -> Option<&'static str> {
     EMBEDDED_CONFIGS.iter().find_map(|&(key, toml)| {
         if key == (m, profile) {
@@ -266,57 +366,23 @@ pub fn embedded_security_config(m: usize, profile: LigeritoProfile) -> Option<&'
     })
 }
 
-#[allow(clippy::type_complexity)]
-static PARSED_EMBEDDED_CONFIGS: std::sync::LazyLock<
-    Vec<(
-        (usize, LigeritoProfile),
-        Result<(usize, ProverConfig, VerifierConfig), String>,
-    )>,
-> = std::sync::LazyLock::new(|| {
-    EMBEDDED_CONFIGS
-        .iter()
-        .map(|&(key, toml)| {
-            let parsed = LigeritoSecurityConfig::from_toml_str(toml).and_then(|sec| {
-                let initial_k = sec.initial_k;
-                sec.to_prover_verifier_configs()
-                    .map(|(pv, vc)| (initial_k, pv, vc))
-            });
-            (key, parsed)
-        })
-        .collect()
-});
-
-fn parsed_config_for(
-    m: usize,
-    log_batch_size: usize,
-    profile: LigeritoProfile,
-) -> Option<Result<(ProverConfig, VerifierConfig), String>> {
-    let (_, parsed) = PARSED_EMBEDDED_CONFIGS
-        .iter()
-        .find(|&&(key, _)| key == (m, profile))?;
-    Some(match parsed {
-        Err(e) => Err(e.clone()),
-        Ok((initial_k, pv, vc)) => {
-            if *initial_k != log_batch_size {
-                Err(format!(
-                    "embedded config for (m={m}, profile={}) has \
-                     initial_k={initial_k} but caller requested log_batch_size={log_batch_size}",
-                    profile.as_str()
-                ))
-            } else {
-                Ok((pv.clone(), vc.clone()))
-            }
-        }
-    })
-}
-
+/// Build a `ProverConfig` for `(log_n, log_batch_size, log_inv_rate)` from
+/// the embedded security TOML. **Strict**: returns `Err` if no security
+/// config has been derived for `(m, log_inv_rate)`. Use this as the
+/// production entry point; never silently falls back to default parameters
+/// with weaker (or unverified) soundness.
+///
+/// For ad-hoc / testing shapes where a security spec hasn't been derived,
+/// callers can use [`default_config`] explicitly — but that's
+/// `#[deprecated]` outside of test code because the per-level parameters
+/// haven't been audited.
 pub fn prover_config_for(
     log_n: usize,
     log_batch_size: usize,
     profile: LigeritoProfile,
 ) -> Result<ProverConfig, String> {
     let m = log_n + crate::pcs::LOG_PACKING;
-    let (pv, _) = parsed_config_for(m, log_batch_size, profile).ok_or_else(|| {
+    let toml = embedded_security_config(m, profile).ok_or_else(|| {
         format!(
             "no security config registered for (m={m}, profile={}). \
              Add a TOML at configs/ligerito/m{m}_{}.toml and register it in \
@@ -324,25 +390,47 @@ pub fn prover_config_for(
             profile.as_str(),
             profile.as_str(),
         )
-    })??;
+    })?;
+    let sec = LigeritoSecurityConfig::from_toml_str(toml)?;
+    if sec.initial_k != log_batch_size {
+        return Err(format!(
+            "embedded config for (m={m}, profile={}) has \
+             initial_k={} but caller requested log_batch_size={log_batch_size}",
+            profile.as_str(),
+            sec.initial_k
+        ));
+    }
+    let (pv, _) = sec.to_prover_verifier_configs()?;
     Ok(pv)
 }
 
+/// Verifier-side counterpart to [`prover_config_for`]. Same strict lookup.
 pub fn verifier_config_for(
     log_n: usize,
     log_batch_size: usize,
     profile: LigeritoProfile,
 ) -> Result<VerifierConfig, String> {
     let m = log_n + crate::pcs::LOG_PACKING;
-    let (_, vc) = parsed_config_for(m, log_batch_size, profile).ok_or_else(|| {
+    let toml = embedded_security_config(m, profile).ok_or_else(|| {
         format!(
             "no security config registered for (m={m}, profile={})",
             profile.as_str()
         )
-    })??;
+    })?;
+    let sec = LigeritoSecurityConfig::from_toml_str(toml)?;
+    if sec.initial_k != log_batch_size {
+        return Err(format!(
+            "embedded config for (m={m}, profile={}) has \
+             initial_k={} but caller requested log_batch_size={log_batch_size}",
+            profile.as_str(),
+            sec.initial_k
+        ));
+    }
+    let (_, vc) = sec.to_prover_verifier_configs()?;
     Ok(vc)
 }
 
+/// Verifier-side counterpart to [`default_config`].
 pub fn default_verifier_config(
     log_n: usize,
     log_batch_size: usize,
@@ -365,74 +453,223 @@ pub fn default_verifier_config(
     })
 }
 
+// ===================================================================
+// Security configuration schema
+// ===================================================================
+//
+// Auditable, per-level spec for a Ligerito instance: query count, grinding
+// bits, slack-from-Johnson, and the proximity-gap analysis the parameters
+// were derived under. Designed to be (de)serializable so it can live in a
+// TOML/JSON file alongside the prover/verifier code.
 
+/// Which proximity-gap analysis a level's parameters were derived under.
+/// Determines which formulas the implementation should verify against the
+/// declared (η, queries, grinding) tuple.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SoundnessRegime {
+    /// Unique decoding radius: γ = δ/2 (δ = 1 − ρ the code's relative
+    /// distance; no proximity-loss backoff). Theorem `ca-udr` of our paper's
+    /// Appendix C.3 (adapted from Ben-Sasson–Carmon–Haböck–Kopparty–Saraf
+    /// "On Proximity Gaps for Reed–Solomon Codes", 2025, Corollary 1.4): the
+    /// exceptional set is `a = γ·n + 1`, growing with the codeword length `n`,
+    /// so the proximity-gap term is recovered per level by `fold_grinding_bits`
+    /// rather than coming out 0. `eta` is `None` for this regime.
     Udr,
+    /// Johnson radius with explicit slack `η` (γ = (1 − √ρ) − η) **with
+    /// out-of-domain binding**. Theorem 1.5 of the same paper gives the
+    /// proximity-gap exceptional set `a = O_ρ(n / η^5)`; the level's
+    /// `fold_grinding_bits` should be ≥ (target_bits − log₂(q/a)).
+    /// Binding to a single codeword of the (Johnson-bounded) interleaved list
+    /// is via `ood_samples` explicit multilinear OOD evaluations — except at
+    /// L0, where the opening's own post-commit random evaluation claim plays
+    /// the OOD role (union over the list, `L·μ/q`), so `ood_samples = 0`.
+    ///
+    /// Note there is deliberately no plain `Johnson` variant: without OOD
+    /// binding the query phase pays a union bound over the interleaved list
+    /// (≈ 19–52 bits here), which our query counts do not include. A config
+    /// claiming Johnson soundness without OOD accounting would be unsound.
     JohnsonOod,
 }
 
+/// Where in a level's Fiat-Shamir transcript the grinding step lands.
+/// Currently only one choice; reserved for future protocol variants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GrindingStep {
+    /// Grind happens after the level's Merkle root is observed but before
+    /// query positions are sampled. Standard FRI/STARK pattern.
     PostCommitPreQueries,
 }
 
+/// Parameters for a single level in the recursive Ligerito ladder.
+/// L0 = the upstream `pcs::commit` output (reused, not re-committed);
+/// L1 .. L_{r−1} are the recursive commits; the final residual `yr` block
+/// is described separately in [`FinalBlockConfig`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LigeritoLevelConfig {
+    /// PCS rate at this level: codeword expansion factor = 2^log_inv_rate.
     pub log_inv_rate: usize,
+    /// Message dimension at this level (log of number of F128 columns in
+    /// the codeword). `log_msg_cols + log_inv_rate = log_2(block_len)`.
     pub log_msg_cols: usize,
+    /// Log of lane width per Merkle leaf at this level. For L0 = `initial_k`;
+    /// for L_i (i ≥ 1) = the previous level's k_recursive.
     pub log_num_interleaved: usize,
+    /// Number of sumcheck folds taken at this level. For L0 = `initial_k`
+    /// (the lane fold); for L_i (i ≥ 1) = the recursive fold k_{i−1}.
     pub k_recursive: usize,
+    /// Which proximity-gap analysis the (eta, queries, grinding_bits)
+    /// tuple was derived under. Determines the formulas the implementation
+    /// validates against.
     pub regime: SoundnessRegime,
+    /// Slack from the Johnson radius. Required for the `JohnsonOod` regime;
+    /// must be `None` for `Udr`.
     pub eta: Option<f64>,
+    /// Proximity loss `ε*` for the UDR radius `γ = δ/2 − ε*` (our paper
+    /// App. C.3 / BCHKS25 Cor. 1.4); `0` in the shipped configs (full
+    /// unique-decoding radius δ/2, no backoff). Required for `Udr`; must be
+    /// `None` for `JohnsonOod`. The exceptional set is `a = γ·n + 1`,
+    /// length-dependent (see [`paper_thm_1_4_log_a`]).
     #[serde(default)]
     pub proximity_loss: Option<f64>,
+    /// Number of codeword position queries opened at this level (the FRI
+    /// query phase). Bounds the per-query soundness term `(1−γ)^Q`.
     pub queries: usize,
+    /// **Query-phase** PoW grinding bits, ground post-commit/pre-queries
+    /// (see [`GrindingStep`]). Each bit substitutes for
+    /// ~1/log₂(1/(1−γ)) queries at this level.
     pub grinding_bits: usize,
+    /// **Fold-challenge** PoW grinding bits, ground immediately before EACH
+    /// of this level's `k_recursive` fold challenges. Boosts the
+    /// proximity-gap term (which lives on the fold challenges):
+    /// `eps_pg + fold_grinding_bits ≥ target`.
     #[serde(default)]
     pub fold_grinding_bits: usize,
+    /// Out-of-domain samples taken right after this level's commit enters
+    /// the transcript (`JohnsonOod` only). Each binds the prover to a single
+    /// codeword of the interleaved list via a multilinear evaluation claim.
+    /// Must be 0 at L0 (bound by the opening's own post-commit evaluation
+    /// claim) and ≥ 1 at deeper `JohnsonOod` levels.
     #[serde(default)]
     pub ood_samples: usize,
+    /// Security target this level guarantees, post-grinding.
     pub target_security_bits: usize,
+    /// Diagnostic — `log₂(q/a)` under the chosen regime. The implementation
+    /// should assert this matches the formula at startup, modulo rounding.
     pub expected_eps_pg_bits: f64,
+    /// Diagnostic — `Q · log₂(1/(1−γ))`. Should be ≥
+    /// `target_security_bits − grinding_bits`.
     pub expected_eps_query_bits: f64,
+    /// Diagnostic — OOD binding bits (`JohnsonOod` only):
+    /// `s·(128 − log₂μ) − (2·log₂L − 1)` for explicit samples, or
+    /// `128 − log₂L − log₂μ` for the implicit L0 binding, where `L` is the
+    /// Johnson interleaved list size and `μ` the level's variable count.
     #[serde(default)]
     pub expected_eps_ood_bits: Option<f64>,
 }
 
+/// Descriptor for the final-residual block (`yr`) sent in the clear at the
+/// end of the last recursive level. It has no commit and no queries, so the
+/// only meaningful parameter is its dimension.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FinalBlockConfig {
+    /// `log_2(|yr|)` — number of F128 values sent in the clear. The last
+    /// recursive level's sumcheck stops at this dim instead of folding to 1.
     pub yr_log_n: usize,
 }
 
+/// Complete security spec for one Ligerito instance, covering a single
+/// `(hash, m)` pair. Designed to round-trip cleanly via serde (TOML/JSON).
+///
+/// **Validation invariants** (checked by [`Self::validate`]):
+/// 1. `initial_k + Σ levels[1..].k_recursive + final_block.yr_log_n == log_n`.
+/// 2. Each level's `expected_eps_pg_bits` is consistent with the declared
+///    regime and `eta` (within tolerance).
+/// 3. Each level's `expected_eps_query_bits ≥ target_security_bits −
+///    grinding_bits` (queries cover what grinding doesn't).
+/// 4. `eta` is `Some` iff regime ∈ {Johnson, JohnsonOod}; `None` for Udr.
+/// 5. `log_msg_cols`, `log_num_interleaved`, `k_recursive` match the
+///    recursive-shape constraint (each level's input dim equals the
+///    previous level's `log_msg_cols`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LigeritoSecurityConfig {
+    /// Block-encoder log size: m = log₂(witness bit count).
     pub m: usize,
+    /// Packed-witness log dim (`= m − LOG_PACKING = m − 7`).
     pub log_n: usize,
+    /// L0 lane fold. Must equal the upstream `PcsParams::log_batch_size` so
+    /// the L0 commit can be reused without re-committing.
     pub initial_k: usize,
+    /// Round-by-round security target (bits): validate() asserts every error
+    /// term at every round (round-by-round soundness) clears at least this
+    /// much. Total security is the *minimum* over rounds — the notion that
+    /// governs Fiat-Shamir security (cf. Ethereum's `soundcalc`) — so there is
+    /// deliberately no whole-protocol union bound over terms.
     pub target_security_bits: usize,
+    /// Identifier of the proximity-gap analysis used. Self-documents which
+    /// theorem the per-level parameters were derived from. Example:
+    /// `"ben_sasson_2025_thm_4_6"`.
     pub analysis_version: String,
+    /// Field of the protocol. Example: `"f128"`.
     pub field: String,
+    /// Hash function used by the Merkle commitments: `"sha256"` or
+    /// `"blake3"`. Read via [`LigeritoSecurityConfig::merkle_hash`] and
+    /// carried into the prover/verifier configs; [`validate`] rejects any
+    /// other value.
+    ///
+    /// This selects the **Merkle** hash only. The Fiat-Shamir transcript hash
+    /// is a separate, independent choice made where the challenger is built
+    /// ([`crate::challenger::FsChallenger::with_hash`]) — the challenger is
+    /// constructed by the caller, upstream of any PCS config, so there is
+    /// deliberately no field for it here rather than one that cannot drive
+    /// anything.
+    ///
+    /// [`validate`]: LigeritoSecurityConfig::validate
     pub hash: String,
+    /// Where in the per-level FS transcript grinding is placed.
     pub grinding_step: GrindingStep,
+    /// Per-level parameters, in order L0, L1, L2, ....
     pub levels: Vec<LigeritoLevelConfig>,
+    /// Final residual block descriptor.
     pub final_block: FinalBlockConfig,
 }
 
+/// Default field size used for soundness analysis: `q = 2^128` (our F128).
 const ANALYSIS_LOG_Q: f64 = 128.0;
 
+/// Round a float to one decimal place. Used to round paper-predicted
+/// soundness diagnostics so the generated TOMLs stay readable.
 fn round1(x: f64) -> f64 {
     (x * 10.0).round() / 10.0
 }
 
+/// Bit-level tolerance when comparing declared diagnostics
+/// (`expected_eps_pg_bits` / `expected_eps_query_bits`) against the value
+/// computed from the regime's formulas. Set generously enough that rounding
+/// in the TOML doesn't cause spurious failures, but tightly enough that an
+/// incorrect declaration of η, Q, or grinding can't slip through.
 const PAPER_COMPAT_TOL_BITS: f64 = 0.6;
 
+/// Proximity-gap exceptional set for the list-decoding (Johnson) regime, per
+/// our paper's Appendix C.3 (Theorem `ca-johnson`, adapted from BCHKS25
+/// Theorem 4.6). For a Reed–Solomon code of rate `ρ`, codeword length `n`,
+/// and Johnson slack `η` (proximity radius `γ = 1 − √ρ − η`), the MCA error is
+/// `a/|F|` with
+///
+///   `a = [2(m+½)^5 + 3(m+½)·γ·ρ] / (3·ρ^{3/2}) · n + (m+½)/√ρ`,
+///
+/// where `η = 1 − √ρ − γ` and `m = max(⌈√ρ/(2η)⌉, 3)`. Returns `log₂ a`.
+///
+/// This is the per-fold-step MCA error, stated for a two-row interleaved word
+/// (`C ∈ F^{2×n}`). The ℓ-round lane fold of a `2^ℓ`-interleaved word adds a
+/// row-union factor via App. C.3's Lemma `mca-commutes`; see
+/// [`paper_johnson_log_a`].
 fn paper_thm_ca_johnson_log_a(log_inv_rate: usize, eta: f64, log_msg_cols: usize) -> f64 {
     let rho = (-(log_inv_rate as f64)).exp2();
     let sqrt_rho = rho.sqrt();
     let gamma = 1.0 - sqrt_rho - eta;
+    // m = ⌈√ρ/(2η)⌉ where η = 1−√ρ−γ, floored at 3.
     let m_param = ((sqrt_rho / (2.0 * eta)).ceil() as usize).max(3) as f64;
     let half = m_param + 0.5;
     let half5 = half.powi(5);
@@ -443,6 +680,19 @@ fn paper_thm_ca_johnson_log_a(log_inv_rate: usize, eta: f64, log_msg_cols: usize
     a.log2()
 }
 
+/// Johnson-regime proximity-gap `log₂ a` for a level, including the row-union
+/// factor from our paper's Appendix C.3 (Lemma `mca-commutes`, "MCA commutes
+/// with list decoding").
+///
+/// The base MCA error `ε = a_RLC/|F|` from [`paper_thm_ca_johnson_log_a`] is
+/// stated for a two-row interleaved word (one fold step). Folding a
+/// `2^ℓ`-interleaved word (ℓ = `log_num_interleaved`) over its ℓ lane-fold
+/// rounds pays a row union: by the lemma, round `i` incurs `2^{ℓ-i}·ε`, so the
+/// worst round (`i = 1`) pays the factor `2^{ℓ-1}` = (interleaving factor)/2.
+/// We bind the per-level grinding to that worst round, returning
+/// `log₂(2^{ℓ-1}·a_RLC) = log₂ a_RLC + (ℓ-1)`.
+///
+/// `ℓ ≤ 1` (`L ≤ 2`) means no row union; the `(ℓ-1)` penalty clamps to 0.
 fn paper_johnson_log_a(
     log_inv_rate: usize,
     eta: f64,
@@ -450,16 +700,31 @@ fn paper_johnson_log_a(
     log_num_interleaved: usize,
 ) -> f64 {
     let base = paper_thm_ca_johnson_log_a(log_inv_rate, eta, log_msg_cols);
+    // Row-union factor 2^{ℓ-1} (worst round i=1 of the ℓ-round lane fold),
+    // ℓ = log_num_interleaved. In bits: (ℓ-1), clamped ≥ 0.
     let row_union_penalty = (log_num_interleaved as f64 - 1.0).max(0.0);
     base + row_union_penalty
 }
 
+/// Per-query log₂(1/(1−γ)) under the Johnson regime: each query closes
+/// `log_2(1/(1-γ))` bits of soundness against a γ-far adversary.
 fn paper_per_query_bits(log_inv_rate: usize, eta: f64) -> f64 {
     let rho = (-(log_inv_rate as f64)).exp2();
     let gamma = 1.0 - rho.sqrt() - eta;
     (1.0 / (1.0 - gamma)).log2()
 }
 
+/// UDR proximity radius: the **maximum** allowed by our paper's App. C.3
+/// (Theorem `ca-udr`, BCHKS25 Cor. 1.4), whose valid range is
+/// `[δ/3, δ/2 − 3/(δ·n)]`. We take the top of the range,
+///
+///   `γ = δ/2 − 3/(δ·n) − ε*`,
+///
+/// where `δ = 1 − ρ` is the code's relative minimum distance,
+/// `n = 2^(log_msg_cols + log_inv_rate)` the codeword length, and `ε*`
+/// (`proximity_loss`) optional extra slack below the maximum (`0` in shipped
+/// configs → exactly the maximal radius). The `3/(δ·n)` backoff is the
+/// theorem-mandated minimum and shrinks with the codeword length.
 fn udr_gamma(log_inv_rate: usize, log_msg_cols: usize, proximity_loss: f64) -> f64 {
     let rho = (-(log_inv_rate as f64)).exp2();
     let delta = 1.0 - rho;
@@ -467,23 +732,67 @@ fn udr_gamma(log_inv_rate: usize, log_msg_cols: usize, proximity_loss: f64) -> f
     delta / 2.0 - 3.0 / (delta * n) - proximity_loss
 }
 
+/// Per-query log₂(1/(1−γ)) under the UDR regime at the maximal radius
+/// `γ = δ/2 − 3/(δ·n) − ε*` (see [`udr_gamma`]).
 fn udr_per_query_bits(log_inv_rate: usize, log_msg_cols: usize, proximity_loss: f64) -> f64 {
     let gamma = udr_gamma(log_inv_rate, log_msg_cols, proximity_loss);
     (1.0 / (1.0 - gamma)).log2()
 }
 
+/// Asymptotic (n → ∞) UDR per-query soundness at `γ = δ/2`, dropping the
+/// finite-length `3/(δ·n)` backoff. Length-agnostic — used for ladder-shape
+/// feasibility and [`udr_queries`]; the shipped per-level configs use the
+/// n-aware [`udr_per_query_bits`]. The dropped backoff slightly *under*-counts
+/// queries, but the per-level block-length check in `derive_profile` (and the
+/// `+5` feasibility padding) catch any shape that wouldn't hold the real,
+/// n-aware query count.
 fn udr_per_query_bits_asymptotic(log_inv_rate: usize) -> f64 {
     let rho = (-(log_inv_rate as f64)).exp2();
     let gamma = (1.0 - rho) / 2.0;
     (1.0 / (1.0 - gamma)).log2()
 }
 
+/// UDR proximity-gap exceptional set, per our paper's Appendix C.3
+/// (Theorem `ca-udr`, adapted from BCHKS25 Corollary 1.4): at proximity
+/// radius `γ` (here the maximal `γ = δ/2 − 3/(δ·n)`; see [`udr_gamma`]) the
+/// exceptional set is
+///
+///   `a = γ·n + 1`,
+///
+/// where `n = 2^(log_msg_cols + log_inv_rate)` is the codeword length at this
+/// level. The `log₂ a ≈ log₂(γ·n)` term therefore **grows with the codeword
+/// length**, so larger witnesses give a smaller `eps_pg = 128 − log₂ a` and
+/// need proportionally more `fold_grinding_bits` to hold a fixed target.
+/// Callers add **no** row-union penalty in this regime: the unique-decoding
+/// list has size 1, so (per Diamond and Gruen) MCA-commutes holds with error
+/// ε directly, unlike the Johnson regime's `2^{ℓ-1}` factor. This replaced an
+/// earlier length-independent `a ≤ 2/ε*` form, which did not match the paper's
+/// stated bound.
 fn paper_thm_1_4_log_a(log_inv_rate: usize, log_msg_cols: usize, proximity_loss: f64) -> f64 {
     let gamma = udr_gamma(log_inv_rate, log_msg_cols, proximity_loss);
     let n = ((log_msg_cols + log_inv_rate) as f64).exp2();
     (gamma * n + 1.0).log2()
 }
 
+/// Johnson-bound list size of the *interleaved* RS code at radius
+/// `θ = 1 − √ρ − η`, in log₂. Independent of the interleaving factor.
+///
+/// Interleaving preserves relative distance — `V^{⊙m}` has the base code's
+/// distance `δ = 1 − ρ` — and only enlarges the alphabet (to `q^m`). The
+/// Johnson bound depends solely on (distance, radius, alphabet size), so the
+/// interleaved list size at any radius *below* the Johnson radius `1 − √ρ`
+/// is bounded by the very same single-code Johnson list size
+///
+///   `L_int ≤ L_base ≤ 1/(2·η·√ρ)`,
+///
+/// with no dependence on `m` and, crucially, no `L_base^r` blow-up.
+///
+/// The general GGR (Gopalan–Guruswami–Raghavendra, Thm 2.5) interleaved bound
+/// `L_int ≤ C(b+r, r)·L_base^r` is only needed to push the list-decoding
+/// radius *past* the Johnson bound toward `δ`. Ligerito deliberately sits at
+/// `θ = 1 − √ρ − η`, strictly below the Johnson radius by slack `η > 0`, so
+/// that regime never applies and the plain Johnson bound is both correct and
+/// far tighter (it dominates GGR throughout the regime RS can reach).
 fn johnson_interleaved_list_log2(log_inv_rate: usize, eta: f64) -> f64 {
     debug_assert!(
         eta > 0.0,
@@ -495,6 +804,17 @@ fn johnson_interleaved_list_log2(log_inv_rate: usize, eta: f64) -> f64 {
     l_base.log2()
 }
 
+/// OOD binding bits for a `JohnsonOod` level. `mu_vars` is the level's
+/// multilinear variable count (`log_msg_cols + log_num_interleaved`).
+///
+/// - `ood_samples ≥ 1` (explicit samples): the bad event is two distinct
+///   list elements agreeing on all `s` random points of `F^μ`
+///   (Schwartz–Zippel, total degree ≤ μ), union over pairs:
+///       bits = s·(128 − log₂ μ) − (2·log₂ L_int − 1).
+/// - `ood_samples = 0` (L0's implicit binding): the opening's own evaluation
+///   claim at a post-commit random point pins the prover to one claimed
+///   value, so the union is over the list (not pairs):
+///       bits = 128 − log₂ L_int − log₂ μ.
 fn paper_ood_bits(log_inv_rate: usize, eta: f64, mu_vars: usize, ood_samples: usize) -> f64 {
     let log2_l = johnson_interleaved_list_log2(log_inv_rate, eta);
     let log2_mu = (mu_vars as f64).log2();
@@ -506,10 +826,23 @@ fn paper_ood_bits(log_inv_rate: usize, eta: f64, mu_vars: usize, ood_samples: us
 }
 
 impl LigeritoLevelConfig {
+    /// Compute the proximity-gap and per-query soundness bits this level is
+    /// expected to deliver under its declared regime. Returns
+    /// `(eps_pg_bits, eps_query_bits)` where:
+    ///   eps_pg_bits   = log₂(q/a) under the regime's threshold-a formula
+    ///   eps_query_bits = Q · log₂(1/(1−γ))
+    ///
+    /// Used by [`LigeritoSecurityConfig::validate`] to assert the declared
+    /// `expected_*_bits` diagnostics are consistent with the regime's
+    /// canonical formulas (i.e., the config is compatible with the paper).
     pub fn paper_predicted_bits(&self) -> (f64, f64) {
         match self.regime {
             SoundnessRegime::JohnsonOod => {
                 let eta = self.eta.expect("JohnsonOod must have eta");
+                // App. C.3 Lemma `mca-commutes`: the ℓ-round lane fold of a
+                // 2^ℓ-interleaved word (ℓ = log_num_interleaved) pays a
+                // row-union factor 2^{ℓ-i} at round i; the worst round (i=1)
+                // gives 2^{ℓ-1}, on top of the base ca-johnson MCA error.
                 let log_a = paper_johnson_log_a(
                     self.log_inv_rate,
                     eta,
@@ -517,14 +850,23 @@ impl LigeritoLevelConfig {
                     self.log_num_interleaved,
                 );
                 let eps_pg = ANALYSIS_LOG_Q - log_a;
+                // Per-query soundness WITHOUT a list union bound — the OOD
+                // binding (see `paper_ood_bits`) pins the prover to a single
+                // codeword of the interleaved list before queries are drawn.
                 let per_q = paper_per_query_bits(self.log_inv_rate, eta);
                 let eps_query = self.queries as f64 * per_q;
                 (eps_pg, eps_query)
             }
             SoundnessRegime::Udr => {
+                // App. C.3 Thm `ca-udr` (BCHKS25 Cor. 1.4): a = γ·n + 1 for
+                // radius γ = δ/2 (ε* = 0, no backoff).
                 let proximity_loss = self
                     .proximity_loss
                     .expect("Udr regime must carry proximity_loss");
+                // No row-union penalty in the unique-decoding regime: the list
+                // has size 1, so (per Diamond and Gruen) the MCA-commutes step
+                // holds with error ε directly — the Johnson regime's 2^{ℓ-1}
+                // row union is unnecessary. So eps_pg = 128 − log₂ a.
                 let log_a =
                     paper_thm_1_4_log_a(self.log_inv_rate, self.log_msg_cols, proximity_loss);
                 let eps_pg = ANALYSIS_LOG_Q - log_a;
@@ -536,6 +878,9 @@ impl LigeritoLevelConfig {
         }
     }
 
+    /// OOD binding bits this level is expected to deliver (`JohnsonOod`
+    /// only; `None` for `Udr`, where the unique-decoding list has size 1 and
+    /// no binding step exists). See [`paper_ood_bits`].
     pub fn paper_predicted_ood_bits(&self) -> Option<f64> {
         match self.regime {
             SoundnessRegime::JohnsonOod => {
@@ -549,6 +894,8 @@ impl LigeritoLevelConfig {
 }
 
 impl LigeritoSecurityConfig {
+    /// Validate that the config is internally consistent and matches the
+    /// declared analysis. Returns the first violation found, if any.
     pub fn validate(&self) -> Result<(), String> {
         if self.log_n + 7 != self.m {
             return Err(format!(
@@ -557,8 +904,11 @@ impl LigeritoSecurityConfig {
             ));
         }
 
+        // Reject a `hash` we do not implement here, so a bad spelling is caught
+        // at config-load time rather than silently committing under SHA-256.
         self.merkle_hash()?;
 
+        // Recursion shape: initial_k + Σ k_recursive (L1+) + yr_log_n = log_n.
         let levels_recursive_sum: usize = self.levels.iter().skip(1).map(|lv| lv.k_recursive).sum();
         let yr_log_n = self.final_block.yr_log_n;
         if self.initial_k + levels_recursive_sum + yr_log_n != self.log_n {
@@ -572,6 +922,7 @@ impl LigeritoSecurityConfig {
             ));
         }
 
+        // L0 must have k_recursive = initial_k and log_num_interleaved = initial_k.
         let l0 = self
             .levels
             .first()
@@ -589,8 +940,10 @@ impl LigeritoSecurityConfig {
             ));
         }
 
+        // Per-level checks.
         let mut dim_in = self.log_n;
         for (i, lv) in self.levels.iter().enumerate() {
+            // Shape: log_msg_cols + log_num_interleaved = dim_in.
             if lv.log_msg_cols + lv.log_num_interleaved != dim_in {
                 return Err(format!(
                     "L{i}: log_msg_cols ({}) + log_num_interleaved ({}) ≠ input dim ({dim_in})",
@@ -598,6 +951,7 @@ impl LigeritoSecurityConfig {
                 ));
             }
 
+            // eta presence matches regime.
             match (lv.regime, lv.eta) {
                 (SoundnessRegime::Udr, Some(_)) => {
                     return Err(format!("L{i}: regime=udr but eta is set"));
@@ -608,6 +962,7 @@ impl LigeritoSecurityConfig {
                 _ => {}
             }
 
+            // proximity_loss presence matches regime (UDR-only).
             match (lv.regime, lv.proximity_loss) {
                 (SoundnessRegime::Udr, None) => {
                     return Err(format!("L{i}: regime=udr but proximity_loss is missing"));
@@ -621,6 +976,9 @@ impl LigeritoSecurityConfig {
                 _ => {}
             }
 
+            // OOD samples match regime: UDR has no list, so no OOD; under
+            // JohnsonOod every level past L0 needs explicit samples, while
+            // L0 is bound by the opening's own post-commit evaluation claim.
             match lv.regime {
                 SoundnessRegime::Udr if lv.ood_samples != 0 => {
                     return Err(format!(
@@ -646,6 +1004,7 @@ impl LigeritoSecurityConfig {
                 _ => {}
             }
 
+            // OOD diagnostic matches regime + formula.
             match (lv.regime, lv.expected_eps_ood_bits) {
                 (SoundnessRegime::Udr, Some(_)) => {
                     return Err(format!("L{i}: regime=udr but expected_eps_ood_bits is set"));
@@ -670,6 +1029,10 @@ impl LigeritoSecurityConfig {
                 _ => {}
             }
 
+            // Paper-compatibility: the declared expected_*_bits must agree
+            // with what the regime's formula predicts (within tolerance).
+            // Asserts the config was actually derived from the paper, not
+            // hand-waved into compliance.
             let (pg_pred, q_pred) = lv.paper_predicted_bits();
             if (lv.expected_eps_pg_bits - pg_pred).abs() > PAPER_COMPAT_TOL_BITS {
                 return Err(format!(
@@ -694,6 +1057,7 @@ impl LigeritoSecurityConfig {
                 ));
             }
 
+            // Security: queries cover the gap left by grinding.
             if lv.target_security_bits > lv.grinding_bits
                 && lv.expected_eps_query_bits + 1e-3
                     < (lv.target_security_bits - lv.grinding_bits) as f64
@@ -707,6 +1071,10 @@ impl LigeritoSecurityConfig {
                 ));
             }
 
+            // Per-application proximity gap + fold-challenge grinding must
+            // reach target. (The pg bad event lives on the fold challenges,
+            // so only the fold grind — done before each fold challenge —
+            // boosts it; the query-phase grind does not.)
             if lv.expected_eps_pg_bits + lv.fold_grinding_bits as f64 + 1e-3
                 < lv.target_security_bits as f64
             {
@@ -716,6 +1084,8 @@ impl LigeritoSecurityConfig {
                 ));
             }
 
+            // OOD binding must reach target on its own (no grind covers it;
+            // escalate ood_samples instead).
             if let Some(ood) = lv.expected_eps_ood_bits
                 && ood + 1e-3 < lv.target_security_bits as f64
             {
@@ -733,6 +1103,7 @@ impl LigeritoSecurityConfig {
                 ));
             }
 
+            // Advance dim_in for next level: subtract k_recursive (the folds at this level).
             dim_in -= lv.k_recursive;
         }
 
@@ -742,9 +1113,30 @@ impl LigeritoSecurityConfig {
             ));
         }
 
+        // Round-by-round soundness: each error term at each round is checked
+        // against `target_security_bits` in the per-level loop above. Total
+        // security is the minimum over rounds (the Fiat-Shamir-relevant notion;
+        // cf. Ethereum's `soundcalc`), so there is intentionally no
+        // whole-protocol union bound summed across terms.
         Ok(())
     }
 
+    /// Mechanically derive a paper-compatible `LigeritoSecurityConfig` for
+    /// `(m, log_inv_rate)` targeting `target_security_bits`, in the
+    /// **unique-decoding regime** (BCHKS25 Theorem 1.4). Uses the same
+    /// recursion shape as [`default_config`] and picks per-level
+    /// `(proximity_loss, queries)` so that each level satisfies:
+    ///
+    ///   * `expected_eps_query_bits ≥ target_security_bits` (queries alone
+    ///     close the target; per the "100 bits from queries always" policy).
+    ///   * `expected_eps_pg_bits + fold_grinding_bits ≥ target_security_bits`.
+    ///     Under Thm `ca-udr` the exceptional set is `a = γ·n + 1`
+    ///     (length-dependent), so `eps_pg = 128 − log₂(γ·n+1) − log₂(log L)`
+    ///     decreases with witness size; any shortfall below target is made up
+    ///     by `fold_grinding_bits` (query-phase `grinding_bits` stays 0).
+    ///
+    /// All diagnostic fields are populated from the paper formulas so the
+    /// resulting config validates strictly against [`Self::validate`].
     pub fn derive_paper_compatible(
         m: usize,
         log_inv_rate: usize,
@@ -757,9 +1149,11 @@ impl LigeritoSecurityConfig {
         let prover = default_config(log_n, initial_k, log_inv_rate).map_err(|e| e.to_string())?;
         let r = prover.recursive_steps;
         let mut levels = Vec::with_capacity(r + 1);
+        // Build per-level (log_msg_cols, log_num_interleaved, k_recursive).
         let mut log_msg_cols_per_level = Vec::with_capacity(r + 1);
         let mut log_num_interleaved_per_level = Vec::with_capacity(r + 1);
         let mut k_recursive_per_level = Vec::with_capacity(r + 1);
+        // L0
         log_msg_cols_per_level.push(log_n - initial_k);
         log_num_interleaved_per_level.push(initial_k);
         k_recursive_per_level.push(initial_k);
@@ -770,11 +1164,20 @@ impl LigeritoSecurityConfig {
         }
         for i in 0..=r {
             let rate = prover.log_inv_rates[i];
+            // UDR: γ = δ/2 = (1−ρ)/2 (ε* = UDR_PROXIMITY_LOSS = 0, no backoff).
+            // Thm `ca-udr`'s exceptional set a = γ·n + 1 grows with the
+            // codeword length, so eps_pg falls ~1 bit per witness doubling and
+            // is recovered by fold_grinding_bits below.
             let proximity_loss = UDR_PROXIMITY_LOSS;
             let per_q = udr_per_query_bits(rate, log_msg_cols_per_level[i], proximity_loss);
             let queries = ((target_security_bits as f64) / per_q).ceil() as usize;
+            // No row-union penalty in the unique-decoding regime (list size 1):
+            // per Diamond and Gruen, MCA-commutes holds with error ε directly,
+            // unlike the Johnson regime's 2^{ℓ-1} row union.
             let log_a = paper_thm_1_4_log_a(rate, log_msg_cols_per_level[i], proximity_loss);
             let eps_pg = ANALYSIS_LOG_Q - log_a;
+            // Any pg shortfall is ground on the fold challenges (where the
+            // pg bad event lives); 0 at the 100-bit target.
             let fold_grinding_bits =
                 ((target_security_bits as f64) - eps_pg).ceil().max(0.0) as usize;
             let eps_query = queries as f64 * per_q;
@@ -796,6 +1199,7 @@ impl LigeritoSecurityConfig {
                 expected_eps_ood_bits: None,
             });
         }
+        // Final residual: yr_log_n = log_n − initial_k − Σ k_recursive
         let total_recursive: usize = prover.recursive_ks.iter().sum();
         let yr_log_n = log_n - initial_k - total_recursive;
         let cfg = Self {
@@ -814,12 +1218,21 @@ impl LigeritoSecurityConfig {
         Ok(cfg)
     }
 
+    /// Derive the security config for a named [`LigeritoProfile`] at witness
+    /// size `m`. Each profile targets its bit level under **round-by-round
+    /// soundness**: every error term (pg + fold grinding, query + query
+    /// grinding, OOD) clears the target individually, and the protocol's
+    /// security is the *minimum* over rounds — the notion that governs
+    /// Fiat-Shamir security (cf. Ethereum's `soundcalc`), not a whole-protocol
+    /// union bound over terms. The three shipped profiles:
+    ///
+    /// - `Fast`:   JohnsonOod, rate 1/2, η = 0.02, 100 bits per round.
+    /// - `Slim`:   JohnsonOod, rate 1/4, η = 0.02, 16-bit query grinding at
+    ///             every level, 100 bits per round.
+    /// - `Secure`: Udr, rate 1/2, ε* = 1e-3, 120 bits per round.
     pub fn derive_profile(m: usize, profile: LigeritoProfile) -> Result<Self, String> {
-        let johnson_eta = match profile {
-            LigeritoProfile::Fast => 0.04,
-            LigeritoProfile::Slim => 0.02,
-            LigeritoProfile::Secure => 0.0, // unused in the UDR branch
-        };
+        /// Johnson slack below the Johnson radius, flat across levels.
+        const JOHNSON_ETA: f64 = 0.02;
         let target_bits = profile.security_bits();
         let log_inv_rate = profile.log_inv_rate();
         let query_grind: usize = match profile {
@@ -831,15 +1244,23 @@ impl LigeritoSecurityConfig {
             .ok_or_else(|| format!("m ({m}) < LOG_PACKING (7)"))?;
         let initial_k = 6usize;
 
+        // Length-agnostic per-query estimate for ladder-shape feasibility
+        // (the per-level codeword length `n` is not known until the shape is
+        // fixed). UDR uses the asymptotic γ = δ/2; the actual per-level config
+        // below uses the n-aware `udr_per_query_bits`.
         let per_query_bits_feas = |rate: usize| -> f64 {
             match profile {
                 LigeritoProfile::Secure => udr_per_query_bits_asymptotic(rate),
                 LigeritoProfile::Fast | LigeritoProfile::Slim => {
-                    paper_per_query_bits(rate, johnson_eta)
+                    paper_per_query_bits(rate, JOHNSON_ETA)
                 }
             }
         };
 
+        // Shape derivation needs per-level query counts for block-length
+        // feasibility before the level count (and hence the exact per-term
+        // target) is known. Use a conservative target of target_bits + 5
+        // (≥ log₂(3 terms · 10 levels)); the final counts are ≤ this.
         let t_feas = target_bits as f64 + 5.0;
         let queries_feas = |rate: usize| -> usize {
             ((t_feas - query_grind as f64).max(1.0) / per_query_bits_feas(rate)).ceil() as usize
@@ -847,6 +1268,16 @@ impl LigeritoSecurityConfig {
         let shape = derive_ladder_shape(log_n, initial_k, log_inv_rate, &queries_feas)?;
         let n_levels = shape.log_inv_rates.len();
 
+        // Round-by-round target: every error term (pg, query, ood) at every
+        // round must individually clear `target_bits`. Round-by-round soundness
+        // — the notion that governs the Fiat-Shamir security of the IOP — is the
+        // *minimum* security level over rounds, not the sum, so there is
+        // deliberately NO `log₂(#terms)` union-bound headroom. This matches the
+        // convention Ethereum's `soundcalc` uses for hash-based zkEVM IOPs
+        // (total security = min over rounds). It also keeps the proximity-gap
+        // fold grinding (especially L0's, the dominant prover cost) at the
+        // round-by-round minimum rather than paying ~4 bits of union slack that
+        // buys nothing.
         let t = target_bits as f64;
 
         let mut levels = Vec::with_capacity(n_levels);
@@ -854,10 +1285,12 @@ impl LigeritoSecurityConfig {
             let rate = shape.log_inv_rates[i];
             let cols = shape.log_msg_cols[i];
             let ilv = shape.log_num_interleaved[i];
+            // Actual per-level per-query bits: n-aware (maximal radius) for
+            // UDR, length-agnostic Johnson otherwise.
             let per_q = match profile {
                 LigeritoProfile::Secure => udr_per_query_bits(rate, cols, UDR_PROXIMITY_LOSS),
                 LigeritoProfile::Fast | LigeritoProfile::Slim => {
-                    paper_per_query_bits(rate, johnson_eta)
+                    paper_per_query_bits(rate, JOHNSON_ETA)
                 }
             };
             let queries = ((t - query_grind as f64).max(1.0) / per_q).ceil() as usize;
@@ -871,6 +1304,9 @@ impl LigeritoSecurityConfig {
 
             let (regime, eta, proximity_loss, eps_pg, ood_samples, eps_ood) = match profile {
                 LigeritoProfile::Secure => {
+                    // No row-union penalty in the unique-decoding regime (list
+                    // size 1): per Diamond and Gruen, MCA-commutes holds with
+                    // error ε directly (vs the Johnson regime's 2^{ℓ-1} factor).
                     let eps_pg =
                         ANALYSIS_LOG_Q - paper_thm_1_4_log_a(rate, cols, UDR_PROXIMITY_LOSS);
                     (
@@ -883,21 +1319,21 @@ impl LigeritoSecurityConfig {
                     )
                 }
                 LigeritoProfile::Fast | LigeritoProfile::Slim => {
-                    let eps_pg = ANALYSIS_LOG_Q - paper_johnson_log_a(rate, johnson_eta, cols, ilv);
+                    let eps_pg = ANALYSIS_LOG_Q - paper_johnson_log_a(rate, JOHNSON_ETA, cols, ilv);
                     let mu = cols + ilv;
                     let ood_samples = if i == 0 {
                         0 // bound by the opening's own evaluation claim
                     } else {
                         (1..=8usize)
-                            .find(|&s| paper_ood_bits(rate, johnson_eta, mu, s) >= t)
+                            .find(|&s| paper_ood_bits(rate, JOHNSON_ETA, mu, s) >= t)
                             .ok_or_else(|| {
                                 format!("L{i}: no OOD sample count reaches {t:.1} bits")
                             })?
                     };
-                    let eps_ood = paper_ood_bits(rate, johnson_eta, mu, ood_samples);
+                    let eps_ood = paper_ood_bits(rate, JOHNSON_ETA, mu, ood_samples);
                     (
                         SoundnessRegime::JohnsonOod,
-                        Some(johnson_eta),
+                        Some(JOHNSON_ETA),
                         None,
                         eps_pg,
                         ood_samples,
@@ -950,16 +1386,26 @@ impl LigeritoSecurityConfig {
         Ok(cfg)
     }
 
+    /// Parse a [`LigeritoSecurityConfig`] from a TOML string and validate it.
+    /// The caller is expected to embed the file contents via
+    /// `include_str!("../../configs/ligerito/m29_fast.toml")` (for compile-time
+    /// configs) or read it via `std::fs` (for runtime configs).
     pub fn from_toml_str(s: &str) -> Result<Self, String> {
         let cfg: Self = toml::from_str(s).map_err(|e| format!("toml parse: {e}"))?;
         cfg.validate()?;
         Ok(cfg)
     }
 
+    /// Serialize the config back out to TOML. Round-trip-stable with
+    /// [`from_toml_str`].
     pub fn to_toml_string(&self) -> Result<String, String> {
         toml::to_string_pretty(self).map_err(|e| format!("toml serialize: {e}"))
     }
 
+    /// Build a `(ProverConfig, VerifierConfig)` pair from this security config.
+    /// Drops the security-only fields (eta, queries, grinding, expected_*) but
+    /// preserves the recursion shape so the existing prover/verifier code path
+    /// works unchanged.
     pub fn to_prover_verifier_configs(&self) -> Result<(ProverConfig, VerifierConfig), String> {
         self.validate()?;
         let merkle_hash = self.merkle_hash()?;
@@ -1012,21 +1458,36 @@ impl LigeritoSecurityConfig {
         Ok((prover, verifier))
     }
 
+    /// The Merkle hash this config selects, parsed from its `hash` field.
+    ///
+    /// Errors on any spelling we do not implement rather than defaulting —
+    /// a config asking for a hash that is not wired up must fail loudly, not
+    /// silently produce SHA-256 proofs under a `hash = "…"` that says
+    /// otherwise.
     pub fn merkle_hash(&self) -> Result<HashKind, String> {
         HashKind::parse(&self.hash).map_err(|e| format!("security config `hash`: {e}"))
     }
 }
 
+// ===================================================================
+// Proof
+// ===================================================================
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecursiveProof {
+    /// One row per query, each of `num_interleaved` F128 entries. Rows are
+    /// emitted in **sorted** query-position order so they align with the
+    /// merkle multi-proof.
     pub opened_rows: Vec<Vec<F128>>,
+    /// Single octopus multi-proof shared across all queries at this level.
     pub merkle_proof: Vec<Hash>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FinalProof {
+    /// Remaining polynomial sent in clear at the last recursive step.
     pub yr: Vec<F128>,
+    /// Same sorted-by-position convention as [`RecursiveProof`].
     pub opened_rows: Vec<Vec<F128>>,
     pub merkle_proof: Vec<Hash>,
 }
@@ -1039,10 +1500,20 @@ pub struct LigeritoProof {
     pub recursive_proofs: Vec<RecursiveProof>,
     pub final_proof: FinalProof,
     pub sumcheck_transcript: Vec<SumcheckMessage>,
+    /// Per-level PoW nonces (one entry per query phase). When all
+    /// `grinding_bits` are 0 (the default config), each entry is just 0
+    /// and the verifier's PoW check is a no-op. `#[serde(default)]` keeps
+    /// older serialized proofs that pre-date this field readable.
     #[serde(default)]
     pub grinding_nonces: Vec<u64>,
+    /// Claimed multilinear OOD evaluations, flattened in transcript order
+    /// (level 1's `ood_samples[1]` values, then level 2's, ...). Empty when
+    /// the config takes no OOD samples (UDR profiles, legacy paths).
     #[serde(default)]
     pub ood_values: Vec<F128>,
+    /// Fold-challenge PoW nonces, flattened in transcript order — one per
+    /// fold challenge at every level with `fold_grinding_bits > 0`. Empty
+    /// when no level fold-grinds.
     #[serde(default)]
     pub fold_grinding_nonces: Vec<u64>,
 }
@@ -1073,6 +1544,7 @@ impl LigeritoProof {
         total
     }
 
+    /// Print a per-component breakdown of the proof size to stderr.
     pub fn print_size_breakdown(&self) {
         const ELEM: usize = core::mem::size_of::<F128>();
         let kb = |b: usize| {
@@ -1158,22 +1630,38 @@ impl LigeritoProof {
     }
 }
 
+// ===================================================================
+// Multilinear helpers
+// ===================================================================
 
+/// Multilinear extension of `evals` at the boolean cube of dimension `n`,
+/// LSB-first indexing: `eval(b_0, …, b_{n-1}) = evals[b_0 + 2·b_1 + …]`.
+///
+/// Partially evaluate at the first `k` variables (the LSB end): given
+/// challenges `rs ∈ F^k`, returns the length-`2^{n-k}` table
+/// `f(rs[0], …, rs[k-1], x_k, …, x_{n-1})`.
+///
+/// Matches Flock's [`build_eq_table`] LSB-first convention (and bolt-rs's
+/// `partial_eval` Julia convention).
 pub(crate) fn partial_eval_lsb(evals: &[F128], rs: &[F128]) -> Vec<F128> {
     let mut cur = evals.to_vec();
     for &r in rs {
+        let one_plus_r = F128::ONE + r;
         let half = cur.len() / 2;
+        // Pair (cur[2i], cur[2i+1]) collapses to cur[2i]·(1+r) + cur[2i+1]·r.
+        // LSB-first ⇒ adjacent pairs are bit_0 = 0 vs 1.
         let mut next = Vec::with_capacity(half);
         for i in 0..half {
-            let e0 = cur[2 * i];
-            let e1 = cur[2 * i + 1];
-            next.push(e0 + r * (e0 + e1));
+            next.push(cur[2 * i] * one_plus_r + cur[2 * i + 1] * r);
         }
         cur = next;
     }
     cur
 }
 
+/// Evaluate the multilinear extension of `evals` at `point` (LSB-first).
+/// `point.len()` must equal `log2(evals.len())`. Test oracle for
+/// `partial_eval_lsb` composition; not used in production paths.
 #[cfg(test)]
 pub(crate) fn eval_mle_lsb(evals: &[F128], point: &[F128]) -> F128 {
     let folded = partial_eval_lsb(evals, point);
@@ -1181,12 +1669,22 @@ pub(crate) fn eval_mle_lsb(evals: &[F128], point: &[F128]) -> F128 {
     folded[0]
 }
 
+// ===================================================================
+// LCH novel-basis evaluations (ported from bolt-rs `fft.rs`)
+// ===================================================================
+//
+// Same subspace-polynomial recurrence `s_{i+1}(x) = s_i(x)² + s_i(v_i)·s_i(x)`
+// as Flock's `AdditiveNttF128`, but we expose the evaluation at an arbitrary
+// point — which the NTT doesn't currently surface publicly. Standard basis only
+// (v_i = 2^i, embedded as `F128::new(1 << i, 0)`).
 
 #[inline]
 fn next_s(s: F128, s_at_root: F128) -> F128 {
     s * s + s_at_root * s
 }
 
+/// `sks_vks[k] = s_k(v_k)` for `k = 0..=log_n`. Length `log_n + 1`.
+/// Only depends on `log_n`, so callers cache.
 pub(crate) fn eval_sk_at_vks(log_n: usize) -> Vec<F128> {
     let mut sks_vks = vec![F128::ZERO; log_n + 1];
     sks_vks[0] = F128::ONE;
@@ -1209,51 +1707,13 @@ pub(crate) fn eval_sk_at_vks(log_n: usize) -> Vec<F128> {
     sks_vks
 }
 
-/// Serial Montgomery batch inversion for the short deterministic denominator
-/// vectors used by Ligerito basis induction (one field inversion plus three
-/// products per element instead of one inversion per element). A zero input
-/// stays zero, matching the element-wise
-/// `if v.is_zero() { ZERO } else { v.inv() }` it replaces; every nonzero
-/// output is the identical canonical inverse at the same index. Ported from
-/// the Mac track (jacklightChen a0163b69, flock-challenge).
-/// `FLOCK_NO_LIG_BATCH_INV=1` restores the element-wise form.
-/// Mechanism from rival submission 9fc8de41-ba12-4559-8c56-2b88f91652ca (ported here).
-fn batch_inverse_or_zero(values: &[F128]) -> Vec<F128> {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LIG_BATCH_INV").is_none());
-    if values.len() < 2 || !*ON {
-        return values
-            .iter()
-            .map(|&v| if v.is_zero() { F128::ZERO } else { v.inv() })
-            .collect();
-    }
-
-    let mut inverses = vec![F128::ZERO; values.len()];
-    let Some(first_nonzero) = values.iter().position(|v| !v.is_zero()) else {
-        return inverses;
-    };
-    let mut product = values[first_nonzero];
-    for index in first_nonzero + 1..values.len() {
-        let value = values[index];
-        if value.is_zero() {
-            continue;
-        }
-        inverses[index] = product;
-        product *= value;
-    }
-    let mut suffix_inverse = product.inv();
-    for index in (first_nonzero + 1..values.len()).rev() {
-        let value = values[index];
-        if value.is_zero() {
-            continue;
-        }
-        inverses[index] *= suffix_inverse;
-        suffix_inverse *= value;
-    }
-    inverses[first_nonzero] = suffix_inverse;
-    inverses
-}
-
+/// Write into `basis` the **normalized** LCH novel-basis polynomials
+/// `X̂_j(x) = Π_{k: bit_k(j)=1} Ŵ_k(x)` for `j ∈ [0, 2^log_n)`, each scaled by
+/// `alpha`. `Ŵ_k = s_k / s_k(v_k)` is normalized to match Flock's NTT twiddles.
+///
+/// `sks_at_x` is a scratch buffer of length `≥ log_n`. `sks_vks` is from
+/// [`eval_sk_at_vks`]; `inv_sks_vks[k] = sks_vks[k].inv()` precomputed once
+/// across many queries.
 fn evaluate_scaled_basis_inplace(
     sks_at_x: &mut [F128],
     basis: &mut [F128],
@@ -1272,41 +1732,38 @@ fn evaluate_scaled_basis_inplace(
         for i in 1..log_n {
             sks_at_x[i] = next_s(sks_at_x[i - 1], sks_vks[i - 1]);
         }
+        // Normalize: Ŵ_i(x) = s_i(x) / s_i(v_i)
         for i in 0..log_n {
             sks_at_x[i] *= inv_sks_vks[i];
         }
     }
 
     basis[0] = alpha;
-    let wide = open_basis_x4_enabled();
     for k in 0..log_n {
         let s_at_x = sks_at_x[k];
         let current_len = 1 << k;
-        if wide {
-            let (current, rest) = basis[..2 * current_len].split_at_mut(current_len);
-            #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-            unsafe {
-                eq_expand_block_x4(rest, current, s_at_x);
-            }
-            #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
-            for (dst, &src) in rest.iter_mut().zip(current.iter()) {
-                *dst = s_at_x * src;
-            }
-        } else {
-            for i in 0..current_len {
-                basis[i + current_len] = s_at_x * basis[i];
-            }
+        for i in 0..current_len {
+            basis[i + current_len] = s_at_x * basis[i];
         }
     }
 }
 
-fn open_basis_x4_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_BASIS_X4").is_none());
-    *ON
-}
+// ===================================================================
+// induce_sumcheck_poly — the per-level basis-poly builder.
+// ===================================================================
+//
+// Given Q opened rows of the previous commitment at query positions and the
+// post-partial-eval challenges `v_challenges`, builds:
+//   basis_poly[j] = Σ_i  α^i · Ŵ_j(q_i_field)
+//   enforced_sum  = Σ_i  α^i · ⟨row_i, eq(v_challenges, ·)⟩
+//
+// The verifier reconstructs both independently from public inputs and checks
+// the sumcheck claim Σ_j f(j) · basis_poly[j] = enforced_sum at the residual.
 
-
+/// Compute just the `enforced_sum` half of [`induce_sumcheck_poly`]:
+///   `enforced_sum = Σ_i eq(α, i_bin) · ⟨opened_rows[i], eq(v_challenges, ·)⟩`
+/// Cheap: O(num_queries × num_interleaved). Verifier needs this at level
+/// intro time (before residual challenges are known).
 pub(crate) fn induce_sumcheck_enforced_sum(
     opened_rows: &[Vec<F128>],
     v_challenges: &[F128],
@@ -1334,6 +1791,23 @@ pub(crate) fn induce_sumcheck_enforced_sum(
     sum
 }
 
+/// **Succinct** evaluator for the induced basis poly's MLE at residual points.
+/// Replaces `induce_sumcheck_poly` + `partial_eval_lsb` in the verifier:
+/// instead of materializing the dense `2^log_msg_cols` basis_poly, evaluates
+/// its MLE directly using the closed-form identity:
+///   `MLE(basis_poly)(p) = Σ_i α^i · Π_k (1 + p[k] · (1 + Ŵ_k(q_i)))`
+/// where each `q_i` is the field embedding of `queries[i]`.
+///
+/// `ris_for_basis` is the fixed prefix of the residual point (the ris range
+/// that would have been passed to `partial_eval_lsb(basis_poly, ris_for_basis)`).
+/// Length must be `log_msg_cols - yr_log_n`. The function returns evaluations
+/// at `2^yr_log_n` points: `ris_for_basis ++ y_bits` for `y ∈ [0, 2^yr_log_n)`.
+///
+/// Cost: O(num_queries × yr_log_n × 2^yr_log_n + num_queries × log_msg_cols),
+/// vs the dense path's O(num_queries × log_msg_cols × 2^log_msg_cols). At m=30
+/// L0 with 221 queries, log_msg_cols=17, yr_log_n=4: ~18k ops vs ~500M ops.
+/// `⌈log₂ n⌉`. Number of bits needed to index `n` items. Used to size the
+/// per-level `alpha` slice for the eq-tensor basis-induction combination.
 #[inline]
 pub(crate) fn ceil_log2(n: usize) -> usize {
     if n <= 1 {
@@ -1357,6 +1831,11 @@ pub(crate) fn induce_sumcheck_evaluate_at_residual(
     let n_queries = queries.len();
     let yr_len = 1usize << yr_log_n;
 
+    // Per-query weights are the eq-tensor coefficients `eq(α, i_bin)` for
+    // `i ∈ {0,1}^{⌈log₂ n_queries⌉}` (LSB-first), padded with zeros for
+    // indices ≥ n_queries. Replaces the legacy α^i Vandermonde scheme;
+    // soundness bound goes from `Q/q` (univariate S-Z) to `⌈log₂ Q⌉/q`
+    // (multilinear S-Z), matching the rest of the multilinear protocol.
     let alpha_pows: Vec<F128> = if n_queries == 0 {
         Vec::new()
     } else {
@@ -1372,12 +1851,15 @@ pub(crate) fn induce_sumcheck_evaluate_at_residual(
 
     let prefix_len = ris_for_basis.len();
 
+    // Per-query precomputation: Ŵ_k(q) for all k, then split into prefix
+    // product (fixed scalar) and suffix Ŵ values (varied per y).
     struct PerQuery {
         prefix_prod: F128,
         suffix_w: Vec<F128>, // length = yr_log_n
     }
     let compute_query = |&q: &usize| -> PerQuery {
         let q_field = F128::new(q as u64, 0);
+        // Compute s_k(q_field) recursively, then normalize by 1/s_k(v_k).
         let mut sks_at_x = Vec::with_capacity(log_msg_cols.max(1));
         if log_msg_cols > 0 {
             sks_at_x.push(q_field);
@@ -1388,6 +1870,7 @@ pub(crate) fn induce_sumcheck_evaluate_at_residual(
                 sks_at_x[k] *= inv_sks_vks[k];
             }
         }
+        // Prefix product: Π_{k<prefix_len} (1 + ris[k] · (1 + Ŵ_k(q)))
         let mut prefix_prod = F128::ONE;
         for k in 0..prefix_len {
             prefix_prod *= F128::ONE + ris_for_basis[k] * (F128::ONE + sks_at_x[k]);
@@ -1402,6 +1885,11 @@ pub(crate) fn induce_sumcheck_evaluate_at_residual(
             suffix_w,
         }
     };
+    // This runs once per recursion level over tiny verify-sized inputs
+    // (`queries` ≈ tens; `yr_len` ≤ 2^5 since the residual folds to ≤5 bits), so
+    // a rayon dispatch per level costs more than the field work itself (measured
+    // ~0.47 ms serial vs ~0.75 ms parallel for the whole residual eval at m=30).
+    // Stay serial below the crossover — mirror of merkle.rs's `SERIAL_LEVEL_NODES`.
     const PAR_FLOOR: usize = 1024;
     let per_query: Vec<PerQuery> = if n_queries > PAR_FLOOR {
         queries.par_iter().map(compute_query).collect()
@@ -1409,6 +1897,7 @@ pub(crate) fn induce_sumcheck_evaluate_at_residual(
         queries.iter().map(compute_query).collect()
     };
 
+    // For each residual position y, accumulate the suffix product per query.
     let compute_y = |y: usize| -> F128 {
         let mut sum = F128::ZERO;
         for i in 0..n_queries {
@@ -1433,6 +1922,11 @@ pub(crate) fn induce_sumcheck_evaluate_at_residual(
     }
 }
 
+/// `queries` are **0-indexed** codeword positions. `q_field = F128::new(q, 0)`.
+///
+/// Parallel: each thread takes a chunk of queries, builds a partial basis_poly
+/// accumulator + partial enforced_sum, then we reduce. The per-query work
+/// (eq-dot + LCH novel-basis expansion) is independent of other queries.
 pub(crate) fn induce_sumcheck_poly(
     log_msg_cols: usize,
     sks_vks: &[F128],
@@ -1455,6 +1949,10 @@ pub(crate) fn induce_sumcheck_poly(
 
     let eq = build_eq_table(v_challenges); // length 2^v_challenges.len() = num_interleaved
 
+    // Per-query weights are the eq-tensor coefficients `eq(α, i_bin)` for
+    // `i ∈ {0,1}^{⌈log₂ n_queries⌉}` (LSB-first), truncated to the first
+    // `n_queries` indices. Replaces the legacy α^i Vandermonde scheme;
+    // matches the multilinear S-Z structure used by the lane fold.
     let alpha_pows: Vec<F128> = if n_queries == 0 {
         Vec::new()
     } else {
@@ -1463,12 +1961,18 @@ pub(crate) fn induce_sumcheck_poly(
         table.into_iter().take(n_queries).collect()
     };
 
-    let inv_sks_vks: Vec<F128> = batch_inverse_or_zero(sks_vks);
+    // Precompute inv_sks_vks once across all queries and threads.
+    let inv_sks_vks: Vec<F128> = sks_vks
+        .iter()
+        .map(|&v| if v.is_zero() { F128::ZERO } else { v.inv() })
+        .collect();
 
+    // Per-thread chunked accumulation: each thread accumulates a partial
+    // basis_poly (length n) and a partial enforced_sum, then we reduce.
     let n_threads = rayon::current_num_threads().max(1);
     let chunk_size = (n_queries + n_threads - 1) / n_threads.max(1);
 
-    let mut partials: Vec<(Vec<F128>, F128)> = (0..n_threads)
+    let partials: Vec<(Vec<F128>, F128)> = (0..n_threads)
         .into_par_iter()
         .map(|t| {
             let start = t * chunk_size;
@@ -1477,6 +1981,7 @@ pub(crate) fn induce_sumcheck_poly(
                 return (vec![F128::ZERO; n], F128::ZERO);
             }
             let mut accum_basis = vec![F128::ZERO; n];
+            // Per-thread scratch reused across this chunk's queries.
             let mut local_basis = vec![F128::ZERO; n];
             let mut sks_at_x = vec![F128::ZERO; log_msg_cols.max(1)];
             let mut local_sum = F128::ZERO;
@@ -1510,190 +2015,29 @@ pub(crate) fn induce_sumcheck_poly(
         })
         .collect();
 
-    debug_assert!(!partials.is_empty());
-    let (mut basis_poly, mut enforced_sum) = partials.remove(0);
-    for (_, ls) in partials.iter() {
-        enforced_sum += *ls;
-    }
-    const REDUCE_PAR_FLOOR: usize = 1 << 12;
-    if induce_sched_enabled() && n >= REDUCE_PAR_FLOOR && partials.len() > 1 {
-        let reduce_floor = if open_fill_enabled() {
-            1usize << 9
-        } else {
-            REDUCE_PAR_FLOOR
-        };
-        let chunk = (n / rayon::current_num_threads().max(1)).max(reduce_floor);
-        basis_poly
-            .par_chunks_mut(chunk)
-            .enumerate()
-            .for_each(|(ci, out)| {
-                let base = ci * chunk;
-                let len = out.len();
-                for (lb, _) in partials.iter() {
-                    for (acc, &v) in out.iter_mut().zip(lb[base..base + len].iter()) {
-                        *acc += v;
-                    }
-                }
-            });
-    } else {
-        for (lb, _) in partials.iter() {
-            for (acc, &v) in basis_poly.iter_mut().zip(lb.iter()) {
-                *acc += v;
-            }
+    // Reduce across threads.
+    let mut basis_poly = vec![F128::ZERO; n];
+    let mut enforced_sum = F128::ZERO;
+    for (lb, ls) in partials {
+        for (acc, &v) in basis_poly.iter_mut().zip(lb.iter()) {
+            *acc += v;
         }
+        enforced_sum += ls;
     }
 
     (basis_poly, enforced_sum)
 }
 
-#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn transpose_butterfly_avx512(top: &mut [F128], bot: &mut [F128], t: F128) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
-    use core::arch::x86_64::*;
-
-    unsafe {
-        let tb = _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64));
-        let tb_x64 = ghash_shift64_x4(tb);
-        let lanes = top.len() & !3;
-        let mut i = 0;
-        while i < lanes {
-            let va = _mm512_loadu_si512(top.as_ptr().add(i) as *const __m512i);
-            let vb = _mm512_loadu_si512(bot.as_ptr().add(i) as *const __m512i);
-            let vs = _mm512_xor_si512(va, vb);
-            _mm512_storeu_si512(top.as_mut_ptr().add(i) as *mut __m512i, vs);
-            let nb = _mm512_xor_si512(vb, ghash_mul_x4_split(vs, tb, tb_x64));
-            _mm512_storeu_si512(bot.as_mut_ptr().add(i) as *mut __m512i, nb);
-            i += 4;
-        }
-        while i < top.len() {
-            let s = top[i] + bot[i];
-            top[i] = s;
-            bot[i] = t * s + bot[i];
-            i += 1;
-        }
-    }
-}
-
-#[inline(always)]
-fn transpose_butterfly(top_h: &mut [F128], bot: &mut [F128], t: F128) {
-    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-    unsafe {
-        transpose_butterfly_avx512(top_h, bot, t)
-    }
-    #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
-    {
-        for (a_ref, b_ref) in top_h.iter_mut().zip(bot.iter_mut()) {
-            let a = *a_ref;
-            let b = *b_ref;
-            let s = a + b;
-            *a_ref = s;
-            *b_ref = t * s + b;
-        }
-    }
-}
-
-#[inline]
-fn tnt_pass_b_zero_selected(disabled: bool) -> bool {
-    !disabled
-}
-
-fn tnt_pass_b_zero_enabled() -> bool {
-    static DISABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_TNT_ZERO_TWIDDLE").is_some());
-    tnt_pass_b_zero_selected(*DISABLED)
-}
-
-#[inline(never)]
-fn transpose_pass_b_block_zero_xor(
-    cols: &mut [&mut [F128]],
-    stride: usize,
-    _layer: usize,
-    _ntt: &AdditiveNttF128,
-) {
-    for u in 0..stride {
-        let (lo, hi) = cols.split_at_mut(u + stride);
-        let top = &mut *lo[u];
-        let bot = &*hi[0];
-        debug_assert_eq!(top.len(), bot.len());
-        #[cfg(target_feature = "avx512f")]
-        {
-            use core::arch::x86_64::*;
-            unsafe {
-                let lanes = top.len() & !3;
-                let mut i = 0;
-                while i < lanes {
-                    let a = _mm512_loadu_si512(top.as_ptr().add(i).cast::<__m512i>());
-                    let b = _mm512_loadu_si512(bot.as_ptr().add(i).cast::<__m512i>());
-                    _mm512_storeu_si512(
-                        top.as_mut_ptr().add(i).cast::<__m512i>(),
-                        _mm512_xor_si512(a, b),
-                    );
-                    i += 4;
-                }
-                while i < top.len() {
-                    top[i] += bot[i];
-                    i += 1;
-                }
-            }
-        }
-        #[cfg(not(target_feature = "avx512f"))]
-        {
-            for (a, &b) in top.iter_mut().zip(bot.iter()) {
-                *a += b;
-            }
-        }
-    }
-}
-
-#[inline(never)]
-fn transpose_pass_b_block_zero_general(
-    cols: &mut [&mut [F128]],
-    stride: usize,
-    layer: usize,
-    ntt: &AdditiveNttF128,
-) {
-    let t = ntt.twiddle(layer, 0);
-    for u in 0..stride {
-        let (lo, hi) = cols.split_at_mut(u + stride);
-        transpose_butterfly(lo[u], hi[0], t);
-    }
-}
-
-fn tntt_block_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_TNTT_BLOCK").is_none());
-    *ON
-}
-
-#[allow(dead_code)] // Full-transform entry kept beside the `_dead` variant.
-fn transpose_forward_ntt_dense_layers(ntt: &AdditiveNttF128, data: &mut [F128], top: usize) {
-    transpose_forward_ntt_dense_layers_dead(ntt, data, top, 0);
-}
-
-fn transpose_forward_ntt_dense_layers_dead(
-    ntt: &AdditiveNttF128,
-    data: &mut [F128],
-    top: usize,
-    dead_top: usize,
-) {
-    if tntt_block_enabled() {
-        transpose_forward_ntt_dense_layers_blocked_dead(ntt, data, top, dead_top);
-    } else {
-        transpose_forward_ntt_dense_layers_per_layer(ntt, data, top);
-    }
-}
-
-fn transpose_forward_ntt_dense_layers_per_layer(
-    ntt: &AdditiveNttF128,
-    data: &mut [F128],
-    top: usize,
-) {
+/// Transposed forward additive NTT, `Fᵀ`, in place over `2^log_d` coefficients.
+/// Forward butterfly is `M=[[1,t],[1,t+1]]`; transpose `Mᵀ=[[1,1],[t,t+1]]` is
+/// `s=a+b; top=s; bot=t·s+b`, applied in **reverse** layer order. (Baseline:
+/// one parallel sweep per layer.)
+fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize) {
     use rayon::prelude::*;
-    let log_d = data.len().trailing_zeros() as usize;
-    debug_assert!(top <= log_d);
+    debug_assert_eq!(data.len(), 1usize << log_d);
+    debug_assert!(log_d <= ntt.log_domain_size());
     let n_threads = rayon::current_num_threads().max(1);
-    for layer in (0..top).rev() {
+    for layer in (0..log_d).rev() {
         let num_blocks = 1usize << layer;
         let block_size = 1usize << (log_d - layer);
         let bsh = block_size >> 1;
@@ -1702,288 +2046,37 @@ fn transpose_forward_ntt_dense_layers_per_layer(
                 .enumerate()
                 .for_each(|(block, chunk)| {
                     let t = ntt.twiddle(layer, block);
-                    let (top_h, bot) = chunk.split_at_mut(bsh);
-                    transpose_butterfly(top_h, bot, t);
+                    let (top, bot) = chunk.split_at_mut(bsh);
+                    for (a_ref, b_ref) in top.iter_mut().zip(bot.iter_mut()) {
+                        let a = *a_ref;
+                        let b = *b_ref;
+                        let s = a + b;
+                        *a_ref = s;
+                        *b_ref = t * s + b;
+                    }
                 });
         } else {
             for block in 0..num_blocks {
                 let t = ntt.twiddle(layer, block);
                 let chunk = &mut data[block * block_size..(block + 1) * block_size];
-                let (top_h, bot) = chunk.split_at_mut(bsh);
-                const SEG: usize = 4096;
-                top_h
-                    .par_chunks_mut(SEG)
-                    .zip(bot.par_chunks_mut(SEG))
-                    .for_each(|(a, b)| transpose_butterfly(a, b, t));
+                let (top, bot) = chunk.split_at_mut(bsh);
+                top.par_iter_mut()
+                    .zip(bot.par_iter_mut())
+                    .for_each(|(a_ref, b_ref)| {
+                        let a = *a_ref;
+                        let b = *b_ref;
+                        let s = a + b;
+                        *a_ref = s;
+                        *b_ref = t * s + b;
+                    });
             }
         }
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn transpose_forward_ntt_dense_layers_blocked(
-    ntt: &AdditiveNttF128,
-    data: &mut [F128],
-    top: usize,
-) {
-    transpose_forward_ntt_dense_layers_blocked_dead(ntt, data, top, 0);
-}
-
-fn transpose_top_only(top: &mut [F128], bot: &[F128]) {
-    debug_assert_eq!(top.len(), bot.len());
-    #[cfg(target_feature = "avx512f")]
-    {
-        use core::arch::x86_64::*;
-        unsafe {
-            let dst = top.as_mut_ptr();
-            let src = bot.as_ptr();
-            let n = top.len();
-            let pair_lanes = n & !7;
-            let mut i = 0;
-            while i < pair_lanes {
-                let a0 = _mm512_loadu_si512(dst.add(i).cast::<__m512i>());
-                let a1 = _mm512_loadu_si512(dst.add(i + 4).cast::<__m512i>());
-                let b0 = _mm512_loadu_si512(src.add(i).cast::<__m512i>());
-                let b1 = _mm512_loadu_si512(src.add(i + 4).cast::<__m512i>());
-                _mm512_storeu_si512(dst.add(i).cast::<__m512i>(), _mm512_xor_si512(a0, b0));
-                _mm512_storeu_si512(
-                    dst.add(i + 4).cast::<__m512i>(),
-                    _mm512_xor_si512(a1, b1),
-                );
-                i += 8;
-            }
-            let lanes = n & !3;
-            while i < lanes {
-                let a = _mm512_loadu_si512(dst.add(i).cast::<__m512i>());
-                let b = _mm512_loadu_si512(src.add(i).cast::<__m512i>());
-                _mm512_storeu_si512(dst.add(i).cast::<__m512i>(), _mm512_xor_si512(a, b));
-                i += 4;
-            }
-            while i < n {
-                top[i] += bot[i];
-                i += 1;
-            }
-        }
-    }
-    #[cfg(not(target_feature = "avx512f"))]
-    {
-        for (a, &b) in top.iter_mut().zip(bot.iter()) {
-            *a += b;
-        }
-    }
-}
-
-/// Lane opus-pcs: CHUNK_LOG of the blocked transpose-NTT sites (17 = dense
-/// blocked Pass A/B split and tile, 18 = fused sparse densify split). The
-/// incumbent constant is 16 at both. `FLOCK_OPUS_TNTT_C17=<n>` /
-/// `FLOCK_OPUS_TNTT_C18=<n>` (10..=20, read once) select another value for a
-/// same-binary A/B; any value only changes how the same butterflies are
-/// partitioned into tasks, never the retained output (tests:
-/// `opus_tntt_chunk_log_preserves_outputs`). Tests may override per thread.
-fn opus_tntt_chunk_log(site: u32) -> usize {
-    if let Some(v) = opus_tntt_test_override() {
-        return v;
-    }
-    fn read(name: &str) -> usize {
-        std::env::var(name)
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| (10..=20).contains(v))
-            .unwrap_or(16)
-    }
-    static C17: std::sync::LazyLock<usize> =
-        std::sync::LazyLock::new(|| read("FLOCK_OPUS_TNTT_C17"));
-    static C18: std::sync::LazyLock<usize> =
-        std::sync::LazyLock::new(|| read("FLOCK_OPUS_TNTT_C18"));
-    if site == 17 { *C17 } else { *C18 }
-}
-
-#[cfg(test)]
-thread_local! {
-    static OPUS_TNTT_C_TEST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-}
-
-#[cfg(test)]
-fn opus_tntt_test_override() -> Option<usize> {
-    OPUS_TNTT_C_TEST.with(|c| c.get())
-}
-
-#[cfg(not(test))]
-#[inline(always)]
-fn opus_tntt_test_override() -> Option<usize> {
-    None
-}
-
-fn transpose_forward_ntt_dense_layers_blocked_dead(
-    ntt: &AdditiveNttF128,
-    data: &mut [F128],
-    top: usize,
-    dead_top: usize,
-) {
-    use rayon::prelude::*;
-    let log_d = data.len().trailing_zeros() as usize;
-    debug_assert!(top <= log_d);
-    if top == 0 {
-        return;
-    }
-    let block_zero_xor = tnt_pass_b_zero_enabled();
-    if log_d <= 10 {
-        for layer in (0..top).rev() {
-            let num_blocks = 1usize << layer;
-            let block_size = 1usize << (log_d - layer);
-            let bsh = block_size >> 1;
-            if layer < dead_top {
-                for jb in 0..num_blocks {
-                    let (top_h, bot) =
-                        data[jb * block_size..(jb + 1) * block_size].split_at_mut(bsh);
-                    transpose_top_only(top_h, bot);
-                }
-                continue;
-            }
-            let jb_start = if block_zero_xor {
-                let (top_h, bot) = data[..block_size].split_at_mut(bsh);
-                transpose_top_only(top_h, bot);
-                1
-            } else {
-                0
-            };
-            for jb in jb_start..num_blocks {
-                let t = ntt.twiddle(layer, jb);
-                let (top_h, bot) = data[jb * block_size..(jb + 1) * block_size].split_at_mut(bsh);
-                transpose_butterfly(top_h, bot, t);
-            }
-        }
-        return;
-    }
-    let n_threads = rayon::current_num_threads().max(1);
-    // Lane opus-pcs: site-17 chunk log, default 16 (incumbent); see
-    // `opus_tntt_chunk_log`. Every value only re-partitions the same layers.
-    let chunk_log = opus_tntt_chunk_log(17);
-
-    let split = log_d
-        .saturating_sub(chunk_log)
-        .max(ceil_log2(n_threads))
-        .min(top);
-
-    if top > split {
-        let chunk_len = 1usize << (log_d - split);
-        data.par_chunks_mut(chunk_len)
-            .enumerate()
-            .for_each(|(c, chunk)| {
-                for layer in (split..top).rev() {
-                    let nb = 1usize << (layer - split); // blocks inside this chunk
-                    let block_size = 1usize << (log_d - layer);
-                    let bsh = block_size >> 1;
-                    for jb in 0..nb {
-                        let t = ntt.twiddle(layer, (c << (layer - split)) + jb);
-                        let (top_h, bot) =
-                            chunk[jb * block_size..(jb + 1) * block_size].split_at_mut(bsh);
-                        transpose_butterfly(top_h, bot, t);
-                    }
-                }
-            });
-    }
-
-    if split > 0 {
-        let nseg = 1usize << split;
-        let seg = 1usize << (log_d - split);
-        let mut tile = ((1usize << chunk_log) / nseg).max(1).min(seg);
-        if open_fill_enabled() {
-            let cap = seg >> ceil_log2(n_threads);
-            if cap >= 64 {
-                tile = tile.min(cap);
-            }
-        }
-        let ntiles = seg / tile;
-        if ntiles == 1 {
-            for b in 0..split {
-                let layer = split - 1 - b;
-                let num_blocks = 1usize << layer;
-                let block_size = 1usize << (log_d - layer);
-                let bsh = block_size >> 1;
-                if layer < dead_top {
-                    for jb in 0..num_blocks {
-                        let (top_h, bot) =
-                            data[jb * block_size..(jb + 1) * block_size].split_at_mut(bsh);
-                        transpose_top_only(top_h, bot);
-                    }
-                    continue;
-                }
-                let jb_start = if block_zero_xor {
-                    let (top_h, bot) = data[..block_size].split_at_mut(bsh);
-                    transpose_top_only(top_h, bot);
-                    1
-                } else {
-                    0
-                };
-                for jb in jb_start..num_blocks {
-                    let t = ntt.twiddle(layer, jb);
-                    let (top_h, bot) =
-                        data[jb * block_size..(jb + 1) * block_size].split_at_mut(bsh);
-                    transpose_butterfly(top_h, bot, t);
-                }
-            }
-            return;
-        }
-        let mut tiles: Vec<Vec<&mut [F128]>> =
-            (0..ntiles).map(|_| Vec::with_capacity(nseg)).collect();
-        for part in data.chunks_mut(seg) {
-            for (ti, col) in part.chunks_mut(tile).enumerate() {
-                tiles[ti].push(col);
-            }
-        }
-        type BlockZeroFn = fn(&mut [&mut [F128]], usize, usize, &AdditiveNttF128);
-        let block_zero: BlockZeroFn = if block_zero_xor {
-            transpose_pass_b_block_zero_xor
-        } else {
-            transpose_pass_b_block_zero_general
-        };
-        tiles.into_par_iter().for_each(|mut cols| {
-            for b in 0..split {
-                let layer = split - 1 - b;
-                let stride = 1usize << b;
-                if layer < dead_top {
-                    let mut j = 0;
-                    while j < nseg {
-                        for u in j..j + stride {
-                            let (lo, hi) = cols.split_at_mut(u + stride);
-                            transpose_top_only(lo[u], hi[0]);
-                        }
-                        j += stride << 1;
-                    }
-                    continue;
-                }
-                block_zero(&mut cols, stride, layer, ntt);
-                let mut j = stride << 1;
-                while j < nseg {
-                    let t = ntt.twiddle(layer, j >> (b + 1));
-                    for u in j..j + stride {
-                        let (lo, hi) = cols.split_at_mut(u + stride);
-                        transpose_butterfly(lo[u], hi[0], t);
-                    }
-                    j += stride << 1;
-                }
-            }
-        });
-    }
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize) {
-    transpose_forward_ntt_dead(ntt, data, log_d, 0);
-}
-
-fn transpose_forward_ntt_dead(
-    ntt: &AdditiveNttF128,
-    data: &mut [F128],
-    log_d: usize,
-    dead_top: usize,
-) {
-    debug_assert_eq!(data.len(), 1usize << log_d);
-    debug_assert!(log_d <= ntt.log_domain_size());
-    transpose_forward_ntt_dense_layers_dead(ntt, data, log_d, dead_top.min(log_d));
-}
-
+/// `Fᵀ`-based fast path for [`induce_sumcheck_poly`]: scatter per-query weights
+/// into the codeword domain, apply `Fᵀ`, keep the low `2^log_msg_cols` outputs.
+/// Byte-identical output to [`induce_sumcheck_poly`].
 pub(crate) fn induce_sumcheck_poly_via_ntt(
     log_msg_cols: usize,
     log_inv_rate: usize,
@@ -2025,1896 +2118,39 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
         c
     } else {
         let ntt = AdditiveNttF128::standard(log_block);
-        transpose_forward_ntt_sparse_dead(
-            &ntt,
-            queries,
-            &alpha_pows,
-            log_block,
-            lig_tntt_dead_top(log_inv_rate),
-        )
+        transpose_forward_ntt_sparse(&ntt, queries, &alpha_pows, log_block)
     };
     coeffs.truncate(n);
     (coeffs, enforced_sum)
 }
 
-struct SparseDualL0 {
-    ntt: AdditiveNttF128,
-    log_d: usize,
-    log_inv_rate: usize,
-    depth: usize,
-    cache_len: usize,
-    queries: Vec<usize>,
-    alpha_pows: Vec<F128>,
-    w0_pows: Vec<F128>,
-    w2_pows: Vec<F128>,
-    folded_k: usize,
-    inverse_local_blocks: Vec<[F128; 32]>,
-    rows: Vec<[F128; 16]>,
-    round0_msg: SumcheckMessage,
-    snapshots: bool,
-    lane_x4: bool,
-}
-
-const SPARSE_DUAL_MAX_DEPTH: usize = 4;
-
-#[inline(always)]
-fn sparse_dual_one_plus_scale(
-    ntt: &AdditiveNttF128,
-    log_d: usize,
-    s: usize,
-    query: usize,
-) -> F128 {
-    let mut val = ntt.twiddle(log_d - 1 - s, query >> (s + 1));
-    if (query >> s) & 1 == 0 {
-        val += F128::ONE;
-    }
-    val
-}
-
-fn lig_sparse_dual_snapshot_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_LIG_SPARSE_DUAL_SNAPSHOT").is_none()
-    });
-    *ON
-}
-
-fn lig_sparse_dual_lane_x4_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_LIG_SPARSE_DUAL_LANE_X4").is_none()
-    });
-    *ON
-}
-
-#[inline]
-fn sparse_dual_lane_fold(row: &[F128], weights: &[F128], x4: bool) -> F128 {
-    debug_assert_eq!(row.len(), weights.len());
-    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-    if x4 {
-        if row.len().is_multiple_of(4) {
-            return unsafe { sparse_dual_lane_fold_avx512(row, weights) };
-        }
-        if row.len() == 2 {
-            return unsafe { sparse_dual_lane_fold_pair_avx512(row, weights) };
-        }
-    }
-    let _ = x4;
-    row.iter()
-        .zip(weights)
-        .map(|(&v, &w)| v * w)
-        .fold(F128::ZERO, |x, y| x + y)
-}
-
-#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn sparse_dual_lane_fold_pair_avx512(row: &[F128], weights: &[F128]) -> F128 {
-    use crate::field::gf2_128::x86_64::WideGhashX4;
-    use core::arch::x86_64::*;
-    unsafe {
-        let r256 = _mm256_loadu_si256(row.as_ptr() as *const __m256i);
-        let w256 = _mm256_loadu_si256(weights.as_ptr() as *const __m256i);
-        let mut acc = WideGhashX4::zero();
-        acc.mul_acc(_mm512_zextsi256_si512(r256), _mm512_zextsi256_si512(w256));
-        acc.fold().reduce()
-    }
-}
-
-#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn sparse_dual_lane_fold_avx512(row: &[F128], weights: &[F128]) -> F128 {
-    use crate::field::gf2_128::x86_64::WideGhashX4;
-    use core::arch::x86_64::*;
-    unsafe {
-        let mut acc = WideGhashX4::zero();
-        let r_ptr = row.as_ptr();
-        let w_ptr = weights.as_ptr();
-        if row.len() == 8 {
-            acc.mul_acc(
-                _mm512_loadu_si512(r_ptr as *const __m512i),
-                _mm512_loadu_si512(w_ptr as *const __m512i),
-            );
-            acc.mul_acc(
-                _mm512_loadu_si512(r_ptr.add(4) as *const __m512i),
-                _mm512_loadu_si512(w_ptr.add(4) as *const __m512i),
-            );
-        } else {
-            let mut i = 0usize;
-            while i < row.len() {
-                acc.mul_acc(
-                    _mm512_loadu_si512(r_ptr.add(i) as *const __m512i),
-                    _mm512_loadu_si512(w_ptr.add(i) as *const __m512i),
-                );
-                i += 4;
-            }
-        }
-        acc.fold().reduce()
-    }
-}
-
-#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn sparse_dual_lane_fold_block_avx512(
-    block: &[F128],
-    weights: &[F128],
-    out: &mut [F128],
-) {
-    use crate::field::gf2_128::x86_64::WideGhashX4;
-    use core::arch::x86_64::*;
-    let num_interleaved = weights.len();
-    let cache_len = out.len();
-    debug_assert_eq!(block.len(), cache_len * num_interleaved);
-    debug_assert!(num_interleaved.is_multiple_of(4));
-    unsafe {
-        let b_ptr = block.as_ptr();
-        let w_ptr = weights.as_ptr();
-        if num_interleaved == 8 {
-            let vw0 = _mm512_loadu_si512(w_ptr as *const __m512i);
-            let vw1 = _mm512_loadu_si512(w_ptr.add(4) as *const __m512i);
-            let mut j = 0usize;
-            while j + 4 <= cache_len {
-                let r0 = b_ptr.add(j * 8);
-                let r1 = b_ptr.add((j + 1) * 8);
-                let r2 = b_ptr.add((j + 2) * 8);
-                let r3 = b_ptr.add((j + 3) * 8);
-                let mut a0 = WideGhashX4::from_mul(_mm512_loadu_si512(r0 as *const __m512i), vw0);
-                let mut a1 = WideGhashX4::from_mul(_mm512_loadu_si512(r1 as *const __m512i), vw0);
-                let mut a2 = WideGhashX4::from_mul(_mm512_loadu_si512(r2 as *const __m512i), vw0);
-                let mut a3 = WideGhashX4::from_mul(_mm512_loadu_si512(r3 as *const __m512i), vw0);
-                a0.mul_acc(_mm512_loadu_si512(r0.add(4) as *const __m512i), vw1);
-                a1.mul_acc(_mm512_loadu_si512(r1.add(4) as *const __m512i), vw1);
-                a2.mul_acc(_mm512_loadu_si512(r2.add(4) as *const __m512i), vw1);
-                a3.mul_acc(_mm512_loadu_si512(r3.add(4) as *const __m512i), vw1);
-                _mm512_storeu_si512(
-                    out.as_mut_ptr().add(j) as *mut __m512i,
-                    WideGhashX4::fold4_and_reduce(a0, a1, a2, a3),
-                );
-                j += 4;
-            }
-            while j < cache_len {
-                let r = b_ptr.add(j * 8);
-                let mut a = WideGhashX4::from_mul(_mm512_loadu_si512(r as *const __m512i), vw0);
-                a.mul_acc(_mm512_loadu_si512(r.add(4) as *const __m512i), vw1);
-                *out.get_unchecked_mut(j) = a.fold().reduce();
-                j += 1;
-            }
-        } else {
-            let mut j = 0usize;
-            while j + 4 <= cache_len {
-                let r0 = b_ptr.add(j * num_interleaved);
-                let r1 = b_ptr.add((j + 1) * num_interleaved);
-                let r2 = b_ptr.add((j + 2) * num_interleaved);
-                let r3 = b_ptr.add((j + 3) * num_interleaved);
-                let vw0 = _mm512_loadu_si512(w_ptr as *const __m512i);
-                let mut a0 = WideGhashX4::from_mul(_mm512_loadu_si512(r0 as *const __m512i), vw0);
-                let mut a1 = WideGhashX4::from_mul(_mm512_loadu_si512(r1 as *const __m512i), vw0);
-                let mut a2 = WideGhashX4::from_mul(_mm512_loadu_si512(r2 as *const __m512i), vw0);
-                let mut a3 = WideGhashX4::from_mul(_mm512_loadu_si512(r3 as *const __m512i), vw0);
-                let mut i = 4usize;
-                while i + 8 <= num_interleaved {
-                    let vw_a = _mm512_loadu_si512(w_ptr.add(i) as *const __m512i);
-                    let vw_b = _mm512_loadu_si512(w_ptr.add(i + 4) as *const __m512i);
-                    a0.mul_acc2(
-                        _mm512_loadu_si512(r0.add(i) as *const __m512i),
-                        vw_a,
-                        _mm512_loadu_si512(r0.add(i + 4) as *const __m512i),
-                        vw_b,
-                    );
-                    a1.mul_acc2(
-                        _mm512_loadu_si512(r1.add(i) as *const __m512i),
-                        vw_a,
-                        _mm512_loadu_si512(r1.add(i + 4) as *const __m512i),
-                        vw_b,
-                    );
-                    a2.mul_acc2(
-                        _mm512_loadu_si512(r2.add(i) as *const __m512i),
-                        vw_a,
-                        _mm512_loadu_si512(r2.add(i + 4) as *const __m512i),
-                        vw_b,
-                    );
-                    a3.mul_acc2(
-                        _mm512_loadu_si512(r3.add(i) as *const __m512i),
-                        vw_a,
-                        _mm512_loadu_si512(r3.add(i + 4) as *const __m512i),
-                        vw_b,
-                    );
-                    i += 8;
-                }
-                while i < num_interleaved {
-                    let vw = _mm512_loadu_si512(w_ptr.add(i) as *const __m512i);
-                    a0.mul_acc(_mm512_loadu_si512(r0.add(i) as *const __m512i), vw);
-                    a1.mul_acc(_mm512_loadu_si512(r1.add(i) as *const __m512i), vw);
-                    a2.mul_acc(_mm512_loadu_si512(r2.add(i) as *const __m512i), vw);
-                    a3.mul_acc(_mm512_loadu_si512(r3.add(i) as *const __m512i), vw);
-                    i += 4;
-                }
-                _mm512_storeu_si512(
-                    out.as_mut_ptr().add(j) as *mut __m512i,
-                    WideGhashX4::fold4_and_reduce(a0, a1, a2, a3),
-                );
-                j += 4;
-            }
-            while j < cache_len {
-                let r = b_ptr.add(j * num_interleaved);
-                let mut a = WideGhashX4::zero();
-                let mut i = 0usize;
-                while i < num_interleaved {
-                    let vw = _mm512_loadu_si512(w_ptr.add(i) as *const __m512i);
-                    a.mul_acc(_mm512_loadu_si512(r.add(i) as *const __m512i), vw);
-                    i += 4;
-                }
-                *out.get_unchecked_mut(j) = a.fold().reduce();
-                j += 1;
-            }
-        }
-    }
-}
-
-#[inline]
-fn sparse_dual_lane_fold_block(
-    block: &[F128],
-    weights: &[F128],
-    out: &mut [F128],
-    x4: bool,
-) {
-    let num_interleaved = weights.len();
-    debug_assert_eq!(block.len(), out.len() * num_interleaved);
-    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-    if x4 && num_interleaved.is_multiple_of(4) {
-        unsafe { sparse_dual_lane_fold_block_avx512(block, weights, out) };
-        return;
-    }
-    for (j, value) in out.iter_mut().enumerate() {
-        let row = &block[j * num_interleaved..(j + 1) * num_interleaved];
-        *value = sparse_dual_lane_fold(row, weights, x4);
-    }
-}
-
-#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn sparse_dual_round_dots_half2_pre_avx512(
-    local: &[F128],
-    vw: core::arch::x86_64::__m512i,
-    vw_x64: core::arch::x86_64::__m512i,
-) -> (F128, F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4_split;
-    use core::arch::x86_64::*;
-    unsafe {
-        let vl = _mm512_loadu_si512(local.as_ptr() as *const __m512i);
-        let pl = ghash_mul_x4_split(vl, vw, vw_x64);
-        let lo256 = _mm512_castsi512_si256(pl);
-        let hi256 = _mm512_extracti64x4_epi64::<1>(pl);
-        let f0_xmm = _mm_xor_si128(
-            _mm256_castsi256_si128(lo256),
-            _mm256_extracti128_si256::<1>(lo256),
-        );
-        let sum256 = _mm256_xor_si256(lo256, hi256);
-        let pair_xmm = _mm_xor_si128(
-            _mm256_castsi256_si128(sum256),
-            _mm256_extracti128_si256::<1>(sum256),
-        );
-        (
-            F128 {
-                lo: _mm_extract_epi64::<0>(f0_xmm) as u64,
-                hi: _mm_extract_epi64::<1>(f0_xmm) as u64,
-            },
-            F128 {
-                lo: _mm_extract_epi64::<0>(pair_xmm) as u64,
-                hi: _mm_extract_epi64::<1>(pair_xmm) as u64,
-            },
-        )
-    }
-}
-
-#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn sparse_dual_round_dots_half2_avx512(
-    local: &[F128],
-    weights: &[F128],
-) -> (F128, F128) {
-    use crate::field::gf2_128::x86_64::ghash_shift64_x4;
-    use core::arch::x86_64::*;
-    unsafe {
-        let w256 = _mm256_loadu_si256(weights.as_ptr() as *const __m256i);
-        let vw = _mm512_broadcast_i64x4(w256);
-        let vw_x64 = ghash_shift64_x4(vw);
-        sparse_dual_round_dots_half2_pre_avx512(local, vw, vw_x64)
-    }
-}
-
-#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn sparse_dual_round_dots_avx512(
-    local: &[F128],
-    weights: &[F128],
-    half: usize,
-) -> (F128, F128) {
-    use crate::field::gf2_128::x86_64::{WideGhashX4, ghash_reduce_acc_x4};
-    use core::arch::x86_64::*;
-    unsafe {
-        let local0_ptr = local.as_ptr();
-        let local1_ptr = local0_ptr.add(half);
-        let w_ptr = weights.as_ptr();
-        let vw0 = _mm512_loadu_si512(w_ptr as *const __m512i);
-        let vl0_0 = _mm512_loadu_si512(local0_ptr as *const __m512i);
-        let vl1_0 = _mm512_loadu_si512(local1_ptr as *const __m512i);
-        let mut acc_f0 = WideGhashX4::from_mul(vl0_0, vw0);
-        let mut acc_f1 = WideGhashX4::from_mul(vl1_0, vw0);
-        let mut i = 4usize;
-        while i < half {
-            let vw = _mm512_loadu_si512(w_ptr.add(i) as *const __m512i);
-            let vl0 = _mm512_loadu_si512(local0_ptr.add(i) as *const __m512i);
-            let vl1 = _mm512_loadu_si512(local1_ptr.add(i) as *const __m512i);
-            acc_f0.mul_acc(vl0, vw);
-            acc_f1.mul_acc(vl1, vw);
-            i += 4;
-        }
-        let lo = _mm512_xor_si512(
-            _mm512_shuffle_i64x2::<0x44>(acc_f0.lo, acc_f1.lo),
-            _mm512_shuffle_i64x2::<0xEE>(acc_f0.lo, acc_f1.lo),
-        );
-        let mid = _mm512_xor_si512(
-            _mm512_shuffle_i64x2::<0x44>(acc_f0.mid, acc_f1.mid),
-            _mm512_shuffle_i64x2::<0xEE>(acc_f0.mid, acc_f1.mid),
-        );
-        let hi = _mm512_xor_si512(
-            _mm512_shuffle_i64x2::<0x44>(acc_f0.hi, acc_f1.hi),
-            _mm512_shuffle_i64x2::<0xEE>(acc_f0.hi, acc_f1.hi),
-        );
-        let pl = ghash_reduce_acc_x4(lo, mid, hi);
-        let lo256 = _mm512_castsi512_si256(pl);
-        let hi256 = _mm512_extracti64x4_epi64::<1>(pl);
-        let f0_xmm = _mm_xor_si128(
-            _mm256_castsi256_si128(lo256),
-            _mm256_extracti128_si256::<1>(lo256),
-        );
-        let sum256 = _mm256_xor_si256(lo256, hi256);
-        let pair_xmm = _mm_xor_si128(
-            _mm256_castsi256_si128(sum256),
-            _mm256_extracti128_si256::<1>(sum256),
-        );
-        (
-            F128 {
-                lo: _mm_extract_epi64::<0>(f0_xmm) as u64,
-                hi: _mm_extract_epi64::<1>(f0_xmm) as u64,
-            },
-            F128 {
-                lo: _mm_extract_epi64::<0>(pair_xmm) as u64,
-                hi: _mm_extract_epi64::<1>(pair_xmm) as u64,
-            },
-        )
-    }
-}
-
-#[inline(always)]
-fn inverse_ntt_butterfly_local(top: &mut [F128], bot: &mut [F128], t: F128) {
-    debug_assert_eq!(top.len(), bot.len());
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    if top.len() >= 4 {
-        use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
-        use core::arch::x86_64::*;
-        unsafe {
-            let tb = _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64));
-            let tb_x64 = ghash_shift64_x4(tb);
-            let lanes = top.len() & !3;
-            let mut j = 0usize;
-            while j < lanes {
-                let vy0 = _mm512_loadu_si512(top.as_ptr().add(j) as *const __m512i);
-                let vy1 = _mm512_loadu_si512(bot.as_ptr().add(j) as *const __m512i);
-                let vv = _mm512_xor_si512(vy0, vy1);
-                let vu = _mm512_xor_si512(vy0, ghash_mul_x4_split(vv, tb, tb_x64));
-                _mm512_storeu_si512(top.as_mut_ptr().add(j) as *mut __m512i, vu);
-                _mm512_storeu_si512(bot.as_mut_ptr().add(j) as *mut __m512i, vv);
-                j += 4;
-            }
-            while j < top.len() {
-                let y0 = top[j];
-                let v = y0 + bot[j];
-                top[j] = y0 + v * t;
-                bot[j] = v;
-                j += 1;
-            }
-        }
-        return;
-    }
-    for (y0_ref, y1_ref) in top.iter_mut().zip(bot.iter_mut()) {
-        let y0 = *y0_ref;
-        let v = y0 + *y1_ref;
-        *y0_ref = y0 + v * t;
-        *y1_ref = v;
-    }
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-#[inline]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn inverse_ntt_layer_half1_avx512(
-    ntt: &AdditiveNttF128,
-    layer: usize,
-    global_base: usize,
-    data: &mut [F128],
-) {
-    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
-    use core::arch::x86_64::*;
-    debug_assert!(data.len().is_multiple_of(8));
-    unsafe {
-        let idx_top = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
-        let idx_bot = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
-        let idx_zip0 = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
-        let idx_zip1 = _mm512_set_epi64(15, 14, 7, 6, 13, 12, 5, 4);
-        let ptr = data.as_mut_ptr();
-        let base_block = global_base >> 1;
-        let mut off = 0usize;
-        while off < data.len() {
-            let v0 = _mm512_loadu_si512(ptr.add(off) as *const __m512i);
-            let v1 = _mm512_loadu_si512(ptr.add(off + 4) as *const __m512i);
-            let y0 = _mm512_permutex2var_epi64(v0, idx_top, v1);
-            let y1 = _mm512_permutex2var_epi64(v0, idx_bot, v1);
-            let b = base_block + (off >> 1);
-            let vt = f128x4_set(
-                ntt.twiddle(layer, b),
-                ntt.twiddle(layer, b + 1),
-                ntt.twiddle(layer, b + 2),
-                ntt.twiddle(layer, b + 3),
-            );
-            let vv = _mm512_xor_si512(y0, y1);
-            let vu = _mm512_xor_si512(y0, ghash_mul_x4(vv, vt));
-            let out0 = _mm512_permutex2var_epi64(vu, idx_zip0, vv);
-            let out1 = _mm512_permutex2var_epi64(vu, idx_zip1, vv);
-            _mm512_storeu_si512(ptr.add(off) as *mut __m512i, out0);
-            _mm512_storeu_si512(ptr.add(off + 4) as *mut __m512i, out1);
-            off += 8;
-        }
-    }
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-#[inline]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn inverse_ntt_layer_half2_avx512(
-    ntt: &AdditiveNttF128,
-    layer: usize,
-    global_base: usize,
-    data: &mut [F128],
-) {
-    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
-    use core::arch::x86_64::*;
-    debug_assert!(data.len().is_multiple_of(8));
-    unsafe {
-        let idx_top = _mm512_set_epi64(11, 10, 9, 8, 3, 2, 1, 0);
-        let idx_bot = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
-        let ptr = data.as_mut_ptr();
-        let base_block = global_base >> 2;
-        let mut off = 0usize;
-        while off < data.len() {
-            let v0 = _mm512_loadu_si512(ptr.add(off) as *const __m512i);
-            let v1 = _mm512_loadu_si512(ptr.add(off + 4) as *const __m512i);
-            let y0 = _mm512_permutex2var_epi64(v0, idx_top, v1);
-            let y1 = _mm512_permutex2var_epi64(v0, idx_bot, v1);
-            let b = base_block + (off >> 2);
-            let t0 = ntt.twiddle(layer, b);
-            let t1 = ntt.twiddle(layer, b + 1);
-            let vt = f128x4_set(t0, t0, t1, t1);
-            let vv = _mm512_xor_si512(y0, y1);
-            let vu = _mm512_xor_si512(y0, ghash_mul_x4(vv, vt));
-            let out0 = _mm512_permutex2var_epi64(vu, idx_top, vv);
-            let out1 = _mm512_permutex2var_epi64(vu, idx_bot, vv);
-            _mm512_storeu_si512(ptr.add(off) as *mut __m512i, out0);
-            _mm512_storeu_si512(ptr.add(off + 4) as *mut __m512i, out1);
-            off += 8;
-        }
-    }
-}
-
-#[inline]
-fn sparse_dual_row_stride(depth: usize) -> usize {
-    match depth {
-        1 | 2 => 1,
-        3 => 2,
-        4 => 4,
-        _ => unreachable!(),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn inverse_ntt_final_layers_local_staged(
-    ntt: &AdditiveNttF128,
-    log_d: usize,
-    global_base: usize,
-    data: &mut [F128],
-    qoff: usize,
-    depth: usize,
-    alpha: F128,
-    qscales: &[F128; 4],
-    out_rows: &mut [[F128; 16]],
-) -> (crate::field::F256Unreduced, crate::field::F256Unreduced) {
-    let log_s = data.len().trailing_zeros() as usize;
-    debug_assert_eq!(data.len(), 1usize << log_s);
-    debug_assert_eq!(global_base & (data.len() - 1), 0);
-    debug_assert!(depth < log_s && depth <= SPARSE_DUAL_MAX_DEPTH);
-    debug_assert!(qoff < data.len());
-    out_rows[0][12..16].copy_from_slice(qscales);
-    let mut u0 = crate::field::F256Unreduced::ZERO;
-    let mut u2 = crate::field::F256Unreduced::ZERO;
-    for (stage, layer) in ((log_d - log_s)..log_d).rev().enumerate() {
-        let block_size = 1usize << (log_d - layer);
-        let half = block_size >> 1;
-        let mut handled = false;
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq"
-        ))]
-        if data.len() >= 8 && (half == 1 || half == 2) {
-            unsafe {
-                if half == 1 {
-                    inverse_ntt_layer_half1_avx512(ntt, layer, global_base, data);
-                } else {
-                    inverse_ntt_layer_half2_avx512(ntt, layer, global_base, data);
-                }
-            }
-            handled = true;
-        }
-        if !handled {
-            for off in (0..data.len()).step_by(block_size) {
-                let block = (global_base + off) / block_size;
-                let twiddle = ntt.twiddle(layer, block);
-                let (top, bot) = data[off..off + block_size].split_at_mut(half);
-                inverse_ntt_butterfly_local(top, bot, twiddle);
-            }
-        }
-        let len = 2usize << stage;
-        let start = qoff & !(len - 1);
-        match stage {
-            0 => {
-                let f0 = data[start];
-                let f1 = data[start + 1];
-                let a2 = alpha * (f0 + f1);
-                u0 = alpha.mul_unreduced(f0);
-                u2 = a2.mul_unreduced(qscales[0]);
-            }
-            1 => {
-                out_rows[0][0..4].copy_from_slice(&data[start..start + 4]);
-            }
-            2 => {
-                out_rows[0][4..12].copy_from_slice(&data[start..start + 8]);
-            }
-            3 => {
-                out_rows[1].copy_from_slice(&data[start..start + 16]);
-            }
-            4 => {
-                out_rows[2].copy_from_slice(&data[start..start + 16]);
-                out_rows[3].copy_from_slice(&data[start + 16..start + 32]);
-            }
-            _ => unreachable!(),
-        }
-    }
-    (u0, u2)
-}
-
-fn forward_ntt_local_until(
-    ntt: &AdditiveNttF128,
-    log_d: usize,
-    global_base: usize,
-    data: &mut [F128],
-    end_layer: usize,
-) {
-    let log_s = data.len().trailing_zeros() as usize;
-    let start_layer = log_d - log_s;
-    debug_assert!((start_layer..=log_d).contains(&end_layer));
-    debug_assert_eq!(global_base & (data.len() - 1), 0);
-    for layer in start_layer..end_layer {
-        let block_size = 1usize << (log_d - layer);
-        let half = block_size >> 1;
-        for off in (0..data.len()).step_by(block_size) {
-            let block = (global_base + off) / block_size;
-            let twiddle = ntt.twiddle(layer, block);
-            for j in 0..half {
-                let v = data[off + half + j];
-                let u = data[off + j] + v * twiddle;
-                data[off + j] = u;
-                data[off + half + j] = v + u;
-            }
-        }
-    }
-}
-
-fn inverse_ntt_final_layers_local(
-    ntt: &AdditiveNttF128,
-    log_d: usize,
-    global_base: usize,
-    data: &mut [F128],
-) {
-    let log_s = data.len().trailing_zeros() as usize;
-    debug_assert_eq!(data.len(), 1usize << log_s);
-    debug_assert_eq!(global_base & (data.len() - 1), 0);
-    for layer in ((log_d - log_s)..log_d).rev() {
-        let block_size = 1usize << (log_d - layer);
-        let half = block_size >> 1;
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq"
-        ))]
-        if data.len() >= 8 && (half == 1 || half == 2) {
-            unsafe {
-                if half == 1 {
-                    inverse_ntt_layer_half1_avx512(ntt, layer, global_base, data);
-                } else {
-                    inverse_ntt_layer_half2_avx512(ntt, layer, global_base, data);
-                }
-            }
-            continue;
-        }
-        for off in (0..data.len()).step_by(block_size) {
-            let block = (global_base + off) / block_size;
-            let twiddle = ntt.twiddle(layer, block);
-            let (top, bot) = data[off..off + block_size].split_at_mut(half);
-            inverse_ntt_butterfly_local(top, bot, twiddle);
-        }
-    }
-}
-
-/// Lane gl2: `FLOCK_NO_GL2_STREAM=1` keeps the sparse dual's per-query work
-/// after query sampling (incumbent). Default: the alpha-independent part of
-/// every query (lane fold of its codeword block, the staged inverse-NTT
-/// snapshot rows, the scale factors and the stage-0 values) runs on helper
-/// workers WHILE the owner is still drawing the later queries; after alpha
-/// only the alpha-weighted sums and the move into sorted order remain.
-/// Read once.
-fn od_dual_team(chunks: usize) -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OD_DUALTEAM").is_none());
-    *ON && (2..=64).contains(&chunks)
-        && crate::flat_par::team_enabled()
-        && crate::flat_par::team_ready()
-}
-
-fn gl2_stream_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL2_STREAM").is_none());
-    *ON
-}
-
-/// Shared state of one streamed sparse dual (see [`gl2_stream_enabled`]).
-/// Slots are indexed by DRAW order (the order distinct queries were sampled).
-/// Aligned so the `Arc` counts (bumped by spinners when they re-read the
-/// side list) never share a line with the fields the owner reads per draw.
-#[repr(align(128))]
-struct Gl2DualStream {
-    count: usize,
-    log_d: usize,
-    depth: usize,
-    cache_len: usize,
-    stride: usize,
-    num_interleaved: usize,
-    lane_x4: bool,
-    ntt: AdditiveNttF128,
-    lane_weights: Vec<F128>,
-    codeword: Gl2Ptr<F128>,
-    /// Draw slot d holds the d-th distinct query once `produced > d`. The
-    /// owner publishes whole 64-byte lines (8 slots) at a time, so it never
-    /// stores into a line a helper has read; helpers poll `produced` with a
-    /// pause backoff so the owner's publishing store rarely meets sharers.
-    qlines: std::cell::UnsafeCell<Vec<Gl2Line>>,
-    produced: Gl2Pad,
-    next: Gl2Pad,
-    done: Gl2Pad,
-    poll: usize,
-    side: std::sync::Mutex<Option<crate::hot_pool::side::Task>>,
-    /// Per draw slot: `stride` snapshot rows, then (cached[qoff], f0, f0+f1, qscale0).
-    rows: std::cell::UnsafeCell<Vec<[F128; 16]>>,
-    vals: std::cell::UnsafeCell<Vec<[F128; 4]>>,
-    owner_sibling: Option<usize>,
-}
-
-// SAFETY: every draw slot of `rows` / `vals` is written by exactly one thread
-// (the one that claimed its index from `next`) and read by the owner only
-// after `done == count` (acquire); the codeword outlives the stream's use
-// (the owner waits for `done == count` before returning).
-unsafe impl Sync for Gl2DualStream {}
-unsafe impl Send for Gl2DualStream {}
-
-impl Gl2DualStream {
-    #[allow(clippy::too_many_arguments)]
-    fn start(
-        depth: usize,
-        log_d: usize,
-        codeword: &[F128],
-        num_interleaved: usize,
-        lane_challenges: &[F128],
-        count: usize,
-    ) -> std::sync::Arc<Self> {
-        assert!((1..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
-        assert_eq!(num_interleaved, 1usize << lane_challenges.len());
-        assert_eq!(codeword.len(), (1usize << log_d) * num_interleaved);
-        let cache_len = 1usize << (depth + 1);
-        let stride = sparse_dual_row_stride(depth);
-        let owner = rayon::current_thread_index();
-        let n = rayon::current_num_threads();
-        let st = std::sync::Arc::new(Self {
-            count,
-            log_d,
-            depth,
-            cache_len,
-            stride,
-            num_interleaved,
-            lane_x4: lig_sparse_dual_lane_x4_enabled(),
-            ntt: AdditiveNttF128::standard(log_d),
-            lane_weights: build_eq_table(lane_challenges),
-            codeword: Gl2Ptr::of(codeword),
-            qlines: std::cell::UnsafeCell::new(vec![Gl2Line([0; 8]); count.div_ceil(8)]),
-            produced: Gl2Pad(std::sync::atomic::AtomicUsize::new(0)),
-            next: Gl2Pad(std::sync::atomic::AtomicUsize::new(0)),
-            done: Gl2Pad(std::sync::atomic::AtomicUsize::new(0)),
-            poll: gl2_stream_knobs().1,
-            side: std::sync::Mutex::new(None),
-            rows: std::cell::UnsafeCell::new(crate::alloc_uninit_vec::<[F128; 16]>(count * stride)),
-            vals: std::cell::UnsafeCell::new(crate::alloc_uninit_vec::<[F128; 4]>(count)),
-            owner_sibling: owner.map(|o| (o + n / 2) % n.max(1)),
-        });
-        let helpers = n.saturating_sub(2).min(count).min(gl2_stream_knobs().0);
-        if gl2_side_enabled() {
-            // Joined by idle hot-pool spinners (not the owner's sibling: the
-            // draws are a latency-bound BLAKE3 chain on the owner's core).
-            let active = std::sync::Arc::new(Gl2Pad(std::sync::atomic::AtomicUsize::new(0)));
-            let h = st.clone();
-            let t: crate::hot_pool::side::Task = std::sync::Arc::new(move |sib: bool| {
-                use std::sync::atomic::Ordering;
-                // Loads only until there is work: a finished stream costs a
-                // spinner one shared-line load per poll.
-                if sib || h.next.0.load(Ordering::Relaxed) >= h.count {
-                    return;
-                }
-                if active.0.fetch_add(1, Ordering::AcqRel) < helpers {
-                    h.work(true);
-                }
-                active.0.fetch_sub(1, Ordering::AcqRel);
-            });
-            *st.side.lock().unwrap_or_else(|e| e.into_inner()) = Some(t.clone());
-            crate::hot_pool::side::register(t);
-        } else {
-            for _ in 0..helpers {
-                let h = st.clone();
-                rayon::spawn(move || {
-                    if h.owner_sibling.is_some() && rayon::current_thread_index() == h.owner_sibling {
-                        return;
-                    }
-                    h.work(true);
-                });
-            }
-        }
-        st
-    }
-
-    /// Record distinct query number `d` (owner only, draw order); publish
-    /// every completed 64-byte line. The owner keeps `d` itself: a counter
-    /// in this struct would share a line with fields every helper reads.
-    #[inline]
-    fn push(&self, d: usize, q: usize) {
-        use std::sync::atomic::Ordering;
-        // SAFETY: unpublished lines are touched only by the owner; helpers
-        // read a line only after its release below.
-        unsafe {
-            (*self.qlines.get()).as_mut_ptr().add(d / 8).cast::<usize>().add(d % 8).write(q);
-            if (d + 1) % 8 == 0 || d + 1 == self.count {
-                self.produced.0.store(d + 1, Ordering::Release);
-            }
-        }
-    }
-
-    /// Claim and process draw slots until all are claimed.
-    fn work(&self, helper: bool) {
-        use std::sync::atomic::Ordering;
-        loop {
-            let d = self.next.0.load(Ordering::Relaxed);
-            if d >= self.count {
-                return;
-            }
-            if self.produced.0.load(Ordering::Acquire) <= d {
-                for _ in 0..self.poll {
-                    std::hint::spin_loop();
-                }
-                continue;
-            }
-            if self.next.0.compare_exchange_weak(d, d + 1, Ordering::AcqRel, Ordering::Relaxed).is_err() {
-                continue;
-            }
-            // SAFETY: slot d < produced (acquire above): its line is final.
-            let q = unsafe { (*self.qlines.get()).as_ptr().add(d / 8).cast::<usize>().add(d % 8).read() };
-            self.one(d, q);
-            self.done.0.fetch_add(1, Ordering::AcqRel);
-            if helper {
-                crate::rstrace::evd("ds:q", d as u32);
-            }
-        }
-    }
-
-    fn one(&self, d: usize, query: usize) {
-        let (cache_len, ni, log_d) = (self.cache_len, self.num_interleaved, self.log_d);
-        // SAFETY: see the `Sync` impl.
-        let cw = unsafe { self.codeword.get() };
-        let base = query & !(cache_len - 1);
-        let qoff = query - base;
-        // Physical rows of the aligned run (page-blocked ranked codeword).
-        let pb = crate::ntt::additive_ntt_f128::L0Rows::of(cw).aligned_run(base, cache_len);
-        let block = &cw[pb * ni..(pb + cache_len) * ni];
-        let mut cached = [F128::ZERO; 32];
-        sparse_dual_lane_fold_block(block, &self.lane_weights, &mut cached[..cache_len], self.lane_x4);
-        let c = cached[qoff];
-        let mut qscales = [F128::ZERO; 4];
-        for (s, slot) in qscales.iter_mut().enumerate().take((self.depth + 1).min(4)) {
-            *slot = sparse_dual_one_plus_scale(&self.ntt, log_d, s, query);
-        }
-        // SAFETY: slot `d` is this thread's (claimed from `next`).
-        let out_rows = unsafe {
-            let rows = &mut *self.rows.get();
-            std::slice::from_raw_parts_mut(rows.as_mut_ptr().add(d * self.stride), self.stride)
-        };
-        let (f0, f1) = inverse_ntt_final_layers_local_staged_raw(
-            &self.ntt,
-            log_d,
-            base,
-            &mut cached[..cache_len],
-            qoff,
-            self.depth,
-            &qscales,
-            out_rows,
-        );
-        unsafe { (&mut *self.vals.get())[d] = [c, f0, f0 + f1, qscales[0]] };
-    }
-
-    /// Owner, after the last draw: help with unclaimed slots, then wait.
-    fn finish(&self) {
-        use std::sync::atomic::Ordering;
-        self.work(false);
-        while self.done.0.load(Ordering::Acquire) < self.count {
-            std::hint::spin_loop();
-        }
-    }
-
-    /// The side-list entry, for one batched removal at the end of the open.
-    fn take_side(&self) -> Option<crate::hot_pool::side::Task> {
-        self.side.lock().unwrap_or_else(|e| e.into_inner()).take()
-    }
-}
-
-/// [`inverse_ntt_final_layers_local_staged`] without the alpha-dependent
-/// stage-0 sums: returns the stage-0 pair `(f0, f1)` instead. Same layers,
-/// same snapshot rows.
-#[allow(clippy::too_many_arguments)]
-fn inverse_ntt_final_layers_local_staged_raw(
-    ntt: &AdditiveNttF128,
-    log_d: usize,
-    global_base: usize,
-    data: &mut [F128],
-    qoff: usize,
-    depth: usize,
-    qscales: &[F128; 4],
-    out_rows: &mut [[F128; 16]],
-) -> (F128, F128) {
-    let log_s = data.len().trailing_zeros() as usize;
-    debug_assert!(depth < log_s && depth <= SPARSE_DUAL_MAX_DEPTH);
-    out_rows[0][12..16].copy_from_slice(qscales);
-    let (mut f0, mut f1) = (F128::ZERO, F128::ZERO);
-    for (stage, layer) in ((log_d - log_s)..log_d).rev().enumerate() {
-        let block_size = 1usize << (log_d - layer);
-        let half = block_size >> 1;
-        let mut handled = false;
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq"
-        ))]
-        if data.len() >= 8 && (half == 1 || half == 2) {
-            unsafe {
-                if half == 1 {
-                    inverse_ntt_layer_half1_avx512(ntt, layer, global_base, data);
-                } else {
-                    inverse_ntt_layer_half2_avx512(ntt, layer, global_base, data);
-                }
-            }
-            handled = true;
-        }
-        if !handled {
-            for off in (0..data.len()).step_by(block_size) {
-                let block = (global_base + off) / block_size;
-                let twiddle = ntt.twiddle(layer, block);
-                let (top, bot) = data[off..off + block_size].split_at_mut(half);
-                inverse_ntt_butterfly_local(top, bot, twiddle);
-            }
-        }
-        let len = 2usize << stage;
-        let start = qoff & !(len - 1);
-        match stage {
-            0 => {
-                f0 = data[start];
-                f1 = data[start + 1];
-            }
-            1 => out_rows[0][0..4].copy_from_slice(&data[start..start + 4]),
-            2 => out_rows[0][4..12].copy_from_slice(&data[start..start + 8]),
-            3 => out_rows[1].copy_from_slice(&data[start..start + 16]),
-            4 => {
-                out_rows[2].copy_from_slice(&data[start..start + 16]);
-                out_rows[3].copy_from_slice(&data[start + 16..start + 32]);
-            }
-            _ => unreachable!(),
-        }
-    }
-    (f0, f1)
-}
-
-/// Lane gl2: [`sample_distinct_queries`] that also publishes each new
-/// distinct query to `stream` in draw order. Same draws, same result; also
-/// returns, per sorted position, the query's draw slot.
-fn sample_distinct_queries_streamed<Ch: Challenger>(
-    challenger: &mut Ch,
-    block_len: usize,
-    count: usize,
-    stream: &Gl2DualStream,
-) -> (Vec<usize>, Vec<u32>) {
-    assert!(count <= block_len);
-    assert_eq!(stream.count, count);
-    thread_local! {
-        static SEEN: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
-    }
-    let mut out: Vec<(usize, u32)> = Vec::with_capacity(count);
-    let small = count <= 256 && block_len < u32::MAX as usize;
-    if small {
-        Gl2QSet::with(|seen| {
-            crate::rstrace::evd("qs:begin", count as u32);
-            while out.len() < count {
-                let v = challenger.sample_f128();
-                let q = (v.lo as usize) % block_len;
-                if seen.insert(q) {
-                    stream.push(out.len(), q);
-                    out.push((q, out.len() as u32));
-                }
-            }
-            crate::rstrace::evd("qs:drawn", count as u32);
-        });
-    } else {
-        SEEN.with(|cell| {
-            let mut seen = cell.borrow_mut();
-            let words = block_len.div_ceil(64);
-            if seen.len() < words {
-                seen.resize(words, 0);
-            }
-            while out.len() < count {
-                let v = challenger.sample_f128();
-                let q = (v.lo as usize) % block_len;
-                let (w, b) = (q >> 6, 1u64 << (q & 63));
-                if seen[w] & b == 0 {
-                    seen[w] |= b;
-                    stream.push(out.len(), q);
-                    out.push((q, out.len() as u32));
-                }
-            }
-            for &(q, _) in &out {
-                seen[q >> 6] = 0;
-            }
-        });
-    }
-    out.sort_unstable();
-    crate::rstrace::evd("qs:sorted", count as u32);
-    out.into_iter().unzip()
-}
-
-impl SparseDualL0 {
-    /// Lane gl2: the [`Self::new`] result (snapshot path) from a finished
-    /// [`Gl2DualStream`]: identical fields and enforced sum, since every
-    /// alpha-weighted term is the same field product, summed in F256 before
-    /// one reduction exactly as in `new`.
-    #[allow(clippy::too_many_arguments)]
-    fn from_stream(
-        stream: &Gl2DualStream,
-        log_inv_rate: usize,
-        queries: Vec<usize>,
-        perm: &[u32],
-        alpha: &[F128],
-    ) -> (Self, F128) {
-        use rayon::prelude::*;
-        let (depth, log_d, stride, n_queries) = (stream.depth, stream.log_d, stream.stride, stream.count);
-        assert!(log_inv_rate + depth <= log_d);
-        assert_eq!(queries.len(), n_queries);
-        let alpha_pows: Vec<F128> = if queries.is_empty() {
-            Vec::new()
-        } else {
-            let mut table = build_eq_table(alpha);
-            table.truncate(queries.len());
-            table
-        };
-        assert_eq!(alpha_pows.len(), n_queries);
-        stream.finish();
-        crate::rstrace::evd("ds:done", 0);
-        // SAFETY: `finish` observed `done == count` (acquire): every slot is written.
-        let (src_rows, vals) = unsafe { (&*stream.rows.get(), &*stream.vals.get()) };
-        let mut rows = crate::alloc_uninit_vec::<[F128; 16]>(n_queries * stride);
-        let mut w2_pows = crate::alloc_uninit_vec::<F128>(n_queries);
-        const CH: usize = 16;
-        let zero = crate::field::F256Unreduced::ZERO;
-        let chunk = |c: usize, rows_c: &mut [[F128; 16]], w2_c: &mut [F128]| {
-            let (mut e, mut u0, mut u2) = (zero, zero, zero);
-            for (j, w2) in w2_c.iter_mut().enumerate() {
-                let i = c * CH + j;
-                let d = perm[i] as usize;
-                rows_c[j * stride..(j + 1) * stride]
-                    .copy_from_slice(&src_rows[d * stride..(d + 1) * stride]);
-                let [cq, f0, s, qs0] = vals[d];
-                let a = alpha_pows[i];
-                e ^= a.mul_unreduced(cq);
-                u0 ^= a.mul_unreduced(f0);
-                u2 ^= (a * s).mul_unreduced(qs0);
-                *w2 = a * qs0;
-            }
-            (e, u0, u2)
-        };
-        let n_chunks = n_queries.div_ceil(CH);
-        let (enf_acc, u0_acc, u2_acc) = if od_dual_team(n_chunks) {
-            let (rp, wp) = (rows.as_mut_ptr() as usize, w2_pows.as_mut_ptr() as usize);
-            crate::flat_par::team_map_reduce(
-                n_chunks,
-                |c| {
-                    let lo = c * CH;
-                    let len = CH.min(n_queries - lo);
-                    let (rows_c, w2_c) = unsafe {
-                        (
-                            std::slice::from_raw_parts_mut((rp as *mut [F128; 16]).add(lo * stride), len * stride),
-                            std::slice::from_raw_parts_mut((wp as *mut F128).add(lo), len),
-                        )
-                    };
-                    chunk(c, rows_c, w2_c)
-                },
-                || (zero, zero, zero),
-                |a, b| (a.0 ^ b.0, a.1 ^ b.1, a.2 ^ b.2),
-            )
-        } else {
-            rows.par_chunks_mut(stride * CH)
-                .zip(w2_pows.par_chunks_mut(CH))
-                .enumerate()
-                .map(|(c, (rows_c, w2_c))| chunk(c, rows_c, w2_c))
-                .reduce(|| (zero, zero, zero), |a, b| (a.0 ^ b.0, a.1 ^ b.1, a.2 ^ b.2))
-        };
-        let enforced_sum = enf_acc.reduce();
-        let round0_msg = SumcheckMessage {
-            u_0: u0_acc.reduce(),
-            u_2: u2_acc.reduce(),
-        };
-        (
-            Self {
-                ntt: AdditiveNttF128::standard(log_d),
-                log_d,
-                log_inv_rate,
-                depth,
-                cache_len: stream.cache_len,
-                queries,
-                w0_pows: alpha_pows.clone(),
-                alpha_pows,
-                w2_pows,
-                folded_k: 0,
-                inverse_local_blocks: Vec::new(),
-                rows,
-                round0_msg,
-                snapshots: true,
-                lane_x4: stream.lane_x4,
-            },
-            enforced_sum,
-        )
-    }
-
-    fn new(
-        depth: usize,
-        log_d: usize,
-        log_inv_rate: usize,
-        l0_codeword: &[F128],
-        num_interleaved: usize,
-        lane_challenges: &[F128],
-        queries: &[usize],
-        alpha: &[F128],
-    ) -> (Self, F128) {
-        use rayon::prelude::*;
-        assert!((1..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
-        assert!(log_inv_rate + depth <= log_d);
-        assert_eq!(num_interleaved, 1usize << lane_challenges.len());
-        assert_eq!(l0_codeword.len(), (1usize << log_d) * num_interleaved);
-        let lane_weights = build_eq_table(lane_challenges);
-        let alpha_pows: Vec<F128> = if queries.is_empty() {
-            Vec::new()
-        } else {
-            let mut table = build_eq_table(alpha);
-            table.truncate(queries.len());
-            table
-        };
-        assert_eq!(alpha_pows.len(), queries.len());
-        // Physical rows of each aligned query run (page-blocked ranked codeword).
-        let l0_layout = crate::ntt::additive_ntt_f128::L0Rows::of(l0_codeword);
-
-        let cache_len = 1usize << (depth + 1);
-        let ntt = AdditiveNttF128::standard(log_d);
-        let snapshots = lig_sparse_dual_snapshot_enabled();
-        let lane_x4 = lig_sparse_dual_lane_x4_enabled();
-        let n_queries = queries.len();
-        let stride = sparse_dual_row_stride(depth);
-        let mut inverse_local_blocks = if snapshots {
-            Vec::new()
-        } else {
-            crate::alloc_uninit_vec::<[F128; 32]>(n_queries)
-        };
-        let mut rows = if snapshots {
-            crate::alloc_uninit_vec::<[F128; 16]>(n_queries * stride)
-        } else {
-            Vec::new()
-        };
-        let w0_pows = if snapshots {
-            alpha_pows.clone()
-        } else {
-            Vec::new()
-        };
-        let mut w2_pows = if snapshots {
-            crate::alloc_uninit_vec::<F128>(n_queries)
-        } else {
-            Vec::new()
-        };
-        let use_par = crate::serial_par_enabled() && n_queries * cache_len * num_interleaved >= 16384;
-        let (enforced_sum, round0_msg) = if snapshots {
-            let (enf_acc, u0_acc, u2_acc) = if use_par {
-                queries
-                    .par_iter()
-                    .zip(&alpha_pows)
-                    .zip(w2_pows.par_iter_mut())
-                    .zip(rows.par_chunks_exact_mut(stride))
-                    .with_min_len(lf1_dual_minlen())
-                    .map(|(((&query, &alpha), w2_slot), out_rows)| {
-                        let base = query & !(cache_len - 1);
-                        let qoff = query - base;
-                        let pb = l0_layout.aligned_run(base, cache_len);
-                        let block = &l0_codeword[pb * num_interleaved..(pb + cache_len) * num_interleaved];
-                        let mut cached = [F128::ZERO; 32];
-                        sparse_dual_lane_fold_block(
-                            block,
-                            &lane_weights,
-                            &mut cached[..cache_len],
-                            lane_x4,
-                        );
-                        let enforced = alpha.mul_unreduced(cached[qoff]);
-                        let mut qscales = [F128::ZERO; 4];
-                        for (s, slot) in qscales.iter_mut().enumerate().take((depth + 1).min(4)) {
-                            *slot = sparse_dual_one_plus_scale(&ntt, log_d, s, query);
-                        }
-                        *w2_slot = alpha * qscales[0];
-                        let (u0, u2) = inverse_ntt_final_layers_local_staged(
-                            &ntt,
-                            log_d,
-                            base,
-                            &mut cached[..cache_len],
-                            qoff,
-                            depth,
-                            alpha,
-                            &qscales,
-                            out_rows,
-                        );
-                        (enforced, u0, u2)
-                    })
-                    .reduce(
-                        || {
-                            (
-                                crate::field::F256Unreduced::ZERO,
-                                crate::field::F256Unreduced::ZERO,
-                                crate::field::F256Unreduced::ZERO,
-                            )
-                        },
-                        |a, b| (a.0 ^ b.0, a.1 ^ b.1, a.2 ^ b.2),
-                    )
-            } else {
-                let mut enf_acc = crate::field::F256Unreduced::ZERO;
-                let mut u0_acc = crate::field::F256Unreduced::ZERO;
-                let mut u2_acc = crate::field::F256Unreduced::ZERO;
-                for (((&query, &alpha), w2_slot), out_rows) in queries
-                    .iter()
-                    .zip(&alpha_pows)
-                    .zip(w2_pows.iter_mut())
-                    .zip(rows.chunks_exact_mut(stride))
-                {
-                    let base = query & !(cache_len - 1);
-                    let qoff = query - base;
-                    let pb = l0_layout.aligned_run(base, cache_len);
-                    let block = &l0_codeword[pb * num_interleaved..(pb + cache_len) * num_interleaved];
-                    let mut cached = [F128::ZERO; 32];
-                    sparse_dual_lane_fold_block(
-                        block,
-                        &lane_weights,
-                        &mut cached[..cache_len],
-                        lane_x4,
-                    );
-                    enf_acc ^= alpha.mul_unreduced(cached[qoff]);
-                    let mut qscales = [F128::ZERO; 4];
-                    for (s, slot) in qscales.iter_mut().enumerate().take((depth + 1).min(4)) {
-                        *slot = sparse_dual_one_plus_scale(&ntt, log_d, s, query);
-                    }
-                    *w2_slot = alpha * qscales[0];
-                    let (u0, u2) = inverse_ntt_final_layers_local_staged(
-                        &ntt,
-                        log_d,
-                        base,
-                        &mut cached[..cache_len],
-                        qoff,
-                        depth,
-                        alpha,
-                        &qscales,
-                        out_rows,
-                    );
-                    u0_acc ^= u0;
-                    u2_acc ^= u2;
-                }
-                (enf_acc, u0_acc, u2_acc)
-            };
-            (
-                enf_acc.reduce(),
-                SumcheckMessage {
-                    u_0: u0_acc.reduce(),
-                    u_2: u2_acc.reduce(),
-                },
-            )
-        } else {
-            let enf = queries
-                .par_iter()
-                .zip(&alpha_pows)
-                .zip(inverse_local_blocks.par_iter_mut())
-                .map(|((&query, &alpha), cached)| {
-                    let base = query & !(cache_len - 1);
-                    let pb = l0_layout.aligned_run(base, cache_len);
-                    let block = &l0_codeword[pb * num_interleaved..(pb + cache_len) * num_interleaved];
-                    sparse_dual_lane_fold_block(
-                        block,
-                        &lane_weights,
-                        &mut cached[..cache_len],
-                        lane_x4,
-                    );
-                    let enforced = alpha * cached[query - base];
-                    inverse_ntt_final_layers_local(&ntt, log_d, base, &mut cached[..cache_len]);
-                    enforced
-                })
-                .reduce(|| F128::ZERO, |a, b| a + b);
-            (
-                enf,
-                SumcheckMessage {
-                    u_0: F128::ZERO,
-                    u_2: F128::ZERO,
-                },
-            )
-        };
-
-        (
-            Self {
-                ntt,
-                log_d,
-                log_inv_rate,
-                depth,
-                cache_len,
-                queries: queries.to_vec(),
-                alpha_pows,
-                w0_pows,
-                w2_pows,
-                folded_k: 0,
-                inverse_local_blocks,
-                rows,
-                round0_msg,
-                snapshots,
-                lane_x4,
-            },
-            enforced_sum,
-        )
-    }
-
-    fn round_msg_query_unreduced(
-        &self,
-        index: usize,
-        fold_challenges: &[F128],
-        fold_weights: &[F128],
-        log_s: usize,
-        block_len: usize,
-        stride: usize,
-    ) -> (crate::field::F256Unreduced, crate::field::F256Unreduced) {
-        let ntt = &self.ntt;
-        let query = self.queries[index];
-        let alpha = self.alpha_pows[index];
-        let cache_base = query & !(self.cache_len - 1);
-        let global_base = query & !(block_len - 1);
-        let cache_off = global_base - cache_base;
-        let mut residue: [F128; 32];
-        let local: &[F128] = if self.snapshots {
-            let base_row = index * stride;
-            match log_s {
-                2 => &self.rows[base_row][0..4],
-                3 => &self.rows[base_row][4..12],
-                4 => &self.rows[base_row + 1],
-                5 => unsafe {
-                    core::slice::from_raw_parts(self.rows[base_row + 2].as_ptr(), 32)
-                },
-                _ => unreachable!(),
-            }
-        } else {
-            residue = self.inverse_local_blocks[index];
-            forward_ntt_local_until(
-                ntt,
-                self.log_d,
-                cache_base,
-                &mut residue[..self.cache_len],
-                self.log_d - log_s,
-            );
-            &residue[cache_off..cache_off + block_len]
-        };
-
-        let (w0, w2) = if self.snapshots {
-            let scales = &self.rows[index * stride][12..16];
-            let mut d0 = F128::ONE + fold_challenges[0] * scales[0];
-            for (s, &r_s) in fold_challenges.iter().enumerate().skip(1) {
-                d0 *= F128::ONE + r_s * scales[s];
-            }
-            let top_scale = if log_s <= 4 {
-                scales[log_s - 1]
-            } else {
-                sparse_dual_one_plus_scale(ntt, self.log_d, log_s - 1, query)
-            };
-            let w0 = alpha * d0;
-            (w0, w0 * top_scale)
-        } else {
-            let mut d0 = F128::ONE;
-            for (s, &r_s) in fold_challenges.iter().enumerate() {
-                let one_plus_scale = sparse_dual_one_plus_scale(ntt, self.log_d, s, query);
-                d0 *= F128::ONE + r_s * one_plus_scale;
-            }
-            let one_plus_top = sparse_dual_one_plus_scale(ntt, self.log_d, log_s - 1, query);
-            let w0 = alpha * d0;
-            (w0, w0 * one_plus_top)
-        };
-
-        let half = block_len >> 1;
-        if self.lane_x4 && half == 1 {
-            let f0 = local[0];
-            let pair_sum = f0 + local[1];
-            return (w0.mul_unreduced(f0), w2.mul_unreduced(pair_sum));
-        }
-        #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-        if self.lane_x4 && half == 2 {
-            let (f0, pair_sum) =
-                unsafe { sparse_dual_round_dots_half2_avx512(local, fold_weights) };
-            return (w0.mul_unreduced(f0), w2.mul_unreduced(pair_sum));
-        }
-        #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-        if self.lane_x4 && half.is_multiple_of(4) {
-            let (f0, pair_sum) =
-                unsafe { sparse_dual_round_dots_avx512(local, fold_weights, half) };
-            return (w0.mul_unreduced(f0), w2.mul_unreduced(pair_sum));
-        }
-        let f0 = local[..half]
-            .iter()
-            .zip(fold_weights)
-            .map(|(&v, &w)| v * w)
-            .fold(F128::ZERO, |x, y| x + y);
-        let f1 = local[half..]
-            .iter()
-            .zip(fold_weights)
-            .map(|(&v, &w)| v * w)
-            .fold(F128::ZERO, |x, y| x + y);
-        let pair_sum = f0 + f1;
-
-        (w0.mul_unreduced(f0), w2.mul_unreduced(pair_sum))
-    }
-
-    fn round_msg_impl(&self, fold_challenges: &[F128], chunked: bool) -> SumcheckMessage {
-        use rayon::prelude::*;
-        assert!(fold_challenges.len() <= self.depth);
-        if self.snapshots && fold_challenges.is_empty() {
-            return self.round0_msg;
-        }
-        let log_s = fold_challenges.len() + 1;
-        let block_len = 1usize << log_s;
-        let stride = sparse_dual_row_stride(self.depth);
-        let mut weights = [F128::ZERO; 16];
-        weights[0] = F128::ONE;
-        let mut weights_len = 1usize;
-        for &challenge in fold_challenges {
-            for i in 0..weights_len {
-                let value = weights[i];
-                let hi = value * challenge;
-                weights[weights_len + i] = hi;
-                weights[i] = value + hi;
-            }
-            weights_len <<= 1;
-        }
-        let fold_weights = &weights[..weights_len];
-        let (u0_acc, u2_acc) = if chunked {
-            (0..self.queries.len())
-                .into_par_iter()
-                .with_min_len(32)
-                .map(|index| {
-                    self.round_msg_query_unreduced(
-                        index,
-                        fold_challenges,
-                        fold_weights,
-                        log_s,
-                        block_len,
-                        stride,
-                    )
-                })
-                .reduce(
-                    || {
-                        (
-                            crate::field::F256Unreduced::ZERO,
-                            crate::field::F256Unreduced::ZERO,
-                        )
-                    },
-                    |a, b| (a.0 ^ b.0, a.1 ^ b.1),
-                )
-        } else {
-            let mut u0 = crate::field::F256Unreduced::ZERO;
-            let mut u2 = crate::field::F256Unreduced::ZERO;
-            for index in 0..self.queries.len() {
-                let (du0, du2) = self.round_msg_query_unreduced(
-                    index,
-                    fold_challenges,
-                    fold_weights,
-                    log_s,
-                    block_len,
-                    stride,
-                );
-                u0 ^= du0;
-                u2 ^= du2;
-            }
-            (u0, u2)
-        };
-        SumcheckMessage {
-            u_0: u0_acc.reduce(),
-            u_2: u2_acc.reduce(),
-        }
-    }
-
-    fn round_msg(&self, fold_challenges: &[F128]) -> SumcheckMessage {
-        self.round_msg_impl(fold_challenges, false)
-    }
-
-    fn round_msg_step(&mut self, fold_challenges: &[F128]) -> SumcheckMessage {
-        assert!(fold_challenges.len() <= self.depth);
-        if !self.snapshots
-            || fold_challenges.is_empty()
-            || fold_challenges.len() != self.folded_k + 1
-        {
-            return self.round_msg(fold_challenges);
-        }
-        let k = fold_challenges.len();
-        let r_last = fold_challenges[k - 1];
-        let log_s = k + 1;
-        let block_len = 1usize << log_s;
-        let half = block_len >> 1;
-        let stride = sparse_dual_row_stride(self.depth);
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq"
-        ))]
-        unsafe {
-            use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
-            use core::arch::x86_64::*;
-            let rv = _mm512_broadcast_i32x4(_mm_set_epi64x(r_last.hi as i64, r_last.lo as i64));
-            let rv64 = ghash_shift64_x4(rv);
-            let lanes = self.w0_pows.len() & !3;
-            let w0_ptr = self.w0_pows.as_mut_ptr();
-            let w2_ptr = self.w2_pows.as_ptr();
-            let mut i = 0usize;
-            while i < lanes {
-                let vw0 = _mm512_loadu_si512(w0_ptr.add(i) as *const __m512i);
-                let vw2 = _mm512_loadu_si512(w2_ptr.add(i) as *const __m512i);
-                let p = ghash_mul_x4_split(vw2, rv, rv64);
-                _mm512_storeu_si512(w0_ptr.add(i) as *mut __m512i, _mm512_xor_si512(vw0, p));
-                i += 4;
-            }
-            while i < self.w0_pows.len() {
-                self.w0_pows[i] += r_last * self.w2_pows[i];
-                i += 1;
-            }
-        }
-        #[cfg(not(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq"
-        )))]
-        for (w0, &w2) in self.w0_pows.iter_mut().zip(&self.w2_pows) {
-            *w0 += r_last * w2;
-        }
-        self.folded_k = k;
-
-        let mut weights = [F128::ZERO; 16];
-        weights[0] = F128::ONE;
-        let mut weights_len = 1usize;
-        for &challenge in fold_challenges {
-            for i in 0..weights_len {
-                let value = weights[i];
-                let hi = value * challenge;
-                weights[weights_len + i] = hi;
-                weights[i] = value + hi;
-            }
-            weights_len <<= 1;
-        }
-        let fold_weights = &weights[..weights_len];
-        let mut u0 = crate::field::F256Unreduced::ZERO;
-        let mut u2 = crate::field::F256Unreduced::ZERO;
-        for index in 0..self.queries.len() {
-            let base_row = index * stride;
-            let local: &[F128] = match log_s {
-                2 => &self.rows[base_row][0..4],
-                3 => &self.rows[base_row][4..12],
-                4 => &self.rows[base_row + 1],
-                5 => unsafe {
-                    core::slice::from_raw_parts(self.rows[base_row + 2].as_ptr(), 32)
-                },
-                _ => unreachable!(),
-            };
-            let w0 = self.w0_pows[index];
-            let top_scale = if log_s <= 4 {
-                self.rows[base_row][12 + log_s - 1]
-            } else {
-                sparse_dual_one_plus_scale(&self.ntt, self.log_d, log_s - 1, self.queries[index])
-            };
-            let w2 = w0 * top_scale;
-            if k < self.depth {
-                self.w2_pows[index] = w2;
-            }
-            #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-            if self.lane_x4 && half == 2 {
-                let (f0, pair_sum) =
-                    unsafe { sparse_dual_round_dots_half2_avx512(local, fold_weights) };
-                u0 ^= w0.mul_unreduced(f0);
-                u2 ^= w2.mul_unreduced(pair_sum);
-                continue;
-            }
-            #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-            if self.lane_x4 && half.is_multiple_of(4) {
-                let (f0, pair_sum) =
-                    unsafe { sparse_dual_round_dots_avx512(local, fold_weights, half) };
-                u0 ^= w0.mul_unreduced(f0);
-                u2 ^= w2.mul_unreduced(pair_sum);
-                continue;
-            }
-            let f0 = local[..half]
-                .iter()
-                .zip(fold_weights)
-                .map(|(&v, &w)| v * w)
-                .fold(F128::ZERO, |x, y| x + y);
-            let f1 = local[half..]
-                .iter()
-                .zip(fold_weights)
-                .map(|(&v, &w)| v * w)
-                .fold(F128::ZERO, |x, y| x + y);
-            u0 ^= w0.mul_unreduced(f0);
-            u2 ^= w2.mul_unreduced(f0 + f1);
-        }
-        SumcheckMessage {
-            u_0: u0.reduce(),
-            u_2: u2.reduce(),
-        }
-    }
-
-    #[cfg(test)]
-    fn round_msg_chunked(&self, fold_challenges: &[F128]) -> SumcheckMessage {
-        self.round_msg_impl(fold_challenges, true)
-    }
-
-    fn scale(&mut self, alpha: F128) {
-        self.round0_msg.u_0 *= alpha;
-        self.round0_msg.u_2 *= alpha;
-        self.folded_k = 0;
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq"
-        ))]
-        {
-            use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
-            use core::arch::x86_64::*;
-            unsafe {
-                let ax = _mm512_broadcast_i32x4(_mm_set_epi64x(alpha.hi as i64, alpha.lo as i64));
-                let ax64 = ghash_shift64_x4(ax);
-                let lanes = self.alpha_pows.len() & !3;
-                let ptr = self.alpha_pows.as_mut_ptr();
-                let mut i = 0usize;
-                while i < lanes {
-                    let v = _mm512_loadu_si512(ptr.add(i) as *const __m512i);
-                    let p = ghash_mul_x4_split(v, ax, ax64);
-                    _mm512_storeu_si512(ptr.add(i) as *mut __m512i, p);
-                    i += 4;
-                }
-                while i < self.alpha_pows.len() {
-                    self.alpha_pows[i] *= alpha;
-                    i += 1;
-                }
-                if self.snapshots {
-                    self.w0_pows.copy_from_slice(&self.alpha_pows);
-                    let w2_ptr = self.w2_pows.as_mut_ptr();
-                    let mut j = 0usize;
-                    while j < lanes {
-                        let v = _mm512_loadu_si512(w2_ptr.add(j) as *const __m512i);
-                        let p = ghash_mul_x4_split(v, ax, ax64);
-                        _mm512_storeu_si512(w2_ptr.add(j) as *mut __m512i, p);
-                        j += 4;
-                    }
-                    while j < self.w2_pows.len() {
-                        self.w2_pows[j] *= alpha;
-                        j += 1;
-                    }
-                }
-            }
-            return;
-        }
-        #[cfg(not(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq"
-        )))]
-        {
-            for value in &mut self.alpha_pows {
-                *value *= alpha;
-            }
-            if self.snapshots {
-                self.w0_pows.copy_from_slice(&self.alpha_pows);
-                for value in &mut self.w2_pows {
-                    *value *= alpha;
-                }
-            }
-        }
-    }
-
-    fn materialize_after_folds(&self, fold_challenges: &[F128]) -> Vec<F128> {
-        let k = fold_challenges.len();
-        assert!(k > 0 && k == self.depth && k <= SPARSE_DUAL_MAX_DEPTH);
-        let full_ntt = &self.ntt;
-        let n_queries = self.queries.len();
-        let stride = sparse_dual_row_stride(self.depth);
-        let reduced_log_d = self.log_d - k;
-        if self.snapshots && self.folded_k == k && n_queries <= 256 {
-            let mut pos_stack = [0usize; 256];
-            for (dst, &query) in pos_stack[..n_queries].iter_mut().zip(&self.queries) {
-                *dst = query >> k;
-            }
-            let mut folded = transpose_forward_ntt_sparse_dead(
-                full_ntt,
-                &pos_stack[..n_queries],
-                &self.w0_pows,
-                reduced_log_d,
-                lig_tntt_dead_top(self.log_inv_rate),
-            );
-            folded.truncate(1usize << (reduced_log_d - self.log_inv_rate));
-            return folded;
-        }
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq"
-        ))]
-        if self.snapshots && self.lane_x4 && n_queries <= 256 {
-            use crate::field::gf2_128::x86_64::{
-                f128x4_set, ghash_mul_x4, ghash_mul_x4_split, ghash_shift64_x4,
-            };
-            use core::arch::x86_64::*;
-            let mut pos_stack = [0usize; 256];
-            let mut val_stack = [F128::ZERO; 256];
-            for (dst, &query) in pos_stack[..n_queries].iter_mut().zip(&self.queries) {
-                *dst = query >> k;
-            }
-            unsafe {
-                let v_one = _mm512_broadcast_i32x4(_mm_set_epi64x(0, 1));
-                let mut vr = [_mm512_setzero_si512(); SPARSE_DUAL_MAX_DEPTH];
-                let mut vr_x64 = [_mm512_setzero_si512(); SPARSE_DUAL_MAX_DEPTH];
-                for (s, &r_s) in fold_challenges.iter().enumerate() {
-                    let v = _mm512_broadcast_i32x4(_mm_set_epi64x(r_s.hi as i64, r_s.lo as i64));
-                    vr[s] = v;
-                    vr_x64[s] = ghash_shift64_x4(v);
-                }
-                let lanes = n_queries & !3;
-                let a_ptr = self.alpha_pows.as_ptr();
-                let v_ptr = val_stack.as_mut_ptr();
-                let mut idx = 0usize;
-                while idx < lanes {
-                    let s0 = &self.rows.get_unchecked(idx * stride)[12..16];
-                    let s1 = &self.rows.get_unchecked((idx + 1) * stride)[12..16];
-                    let s2 = &self.rows.get_unchecked((idx + 2) * stride)[12..16];
-                    let s3 = &self.rows.get_unchecked((idx + 3) * stride)[12..16];
-                    let mut acc = _mm512_loadu_si512(a_ptr.add(idx) as *const __m512i);
-                    for s in 0..k {
-                        let vs = f128x4_set(s0[s], s1[s], s2[s], s3[s]);
-                        let factor =
-                            _mm512_xor_si512(v_one, ghash_mul_x4_split(vs, vr[s], vr_x64[s]));
-                        acc = ghash_mul_x4(acc, factor);
-                    }
-                    _mm512_storeu_si512(v_ptr.add(idx) as *mut __m512i, acc);
-                    idx += 4;
-                }
-                while idx < n_queries {
-                    let scales = &self.rows[idx * stride][12..16];
-                    let mut v = self.alpha_pows[idx];
-                    for (s, &r_s) in fold_challenges.iter().enumerate() {
-                        v *= F128::ONE + r_s * scales[s];
-                    }
-                    *v_ptr.add(idx) = v;
-                    idx += 1;
-                }
-            }
-            let mut folded = transpose_forward_ntt_sparse_dead(
-                full_ntt,
-                &pos_stack[..n_queries],
-                &val_stack[..n_queries],
-                reduced_log_d,
-                lig_tntt_dead_top(self.log_inv_rate),
-            );
-            folded.truncate(1usize << (reduced_log_d - self.log_inv_rate));
-            return folded;
-        }
-        let mut positions = Vec::with_capacity(n_queries);
-        let mut values: Vec<F128> = Vec::with_capacity(n_queries);
-        for (index, &query) in self.queries.iter().enumerate() {
-            let mut local_value = self.alpha_pows[index];
-            if self.snapshots {
-                let scales = &self.rows[index * stride][12..16];
-                for (s, &r_s) in fold_challenges.iter().enumerate() {
-                    local_value *= F128::ONE + r_s * scales[s];
-                }
-            } else {
-                for (s, &r_s) in fold_challenges.iter().enumerate() {
-                    let one_plus_scale =
-                        sparse_dual_one_plus_scale(full_ntt, self.log_d, s, query);
-                    local_value *= F128::ONE + r_s * one_plus_scale;
-                }
-            }
-            positions.push(query >> k);
-            values.push(local_value);
-        }
-        let mut folded = transpose_forward_ntt_sparse_dead(
-            full_ntt,
-            &positions,
-            &values,
-            reduced_log_d,
-            lig_tntt_dead_top(self.log_inv_rate),
-        );
-        folded.truncate(1usize << (reduced_log_d - self.log_inv_rate));
-        folded
-    }
-}
-
-fn eq_split_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_EQ_SPLIT").is_none());
-    *ON
-}
-
-#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-fn eq_split_x4_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_EQ_SPLIT_X4").is_none());
-    *ON
-}
-
-#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn eq_expand_block_x4(out: &mut [F128], lo: &[F128], e: F128) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
-    use core::arch::x86_64::*;
-    debug_assert_eq!(out.len(), lo.len());
-    unsafe {
-        let eb = _mm512_broadcast_i32x4(_mm_set_epi64x(e.hi as i64, e.lo as i64));
-        let eb_x64 = ghash_shift64_x4(eb);
-        let lanes = out.len() & !3;
-        let mut i = 0usize;
-        while i < lanes {
-            let v = _mm512_loadu_si512(lo.as_ptr().add(i) as *const __m512i);
-            _mm512_storeu_si512(
-                out.as_mut_ptr().add(i) as *mut __m512i,
-                ghash_mul_x4_split(v, eb, eb_x64),
-            );
-            i += 4;
-        }
-        while i < out.len() {
-            out[i] = lo[i] * e;
-            i += 1;
-        }
-    }
-}
-
-fn build_eq_table_split(point: &[F128]) -> Vec<F128> {
-    use rayon::prelude::*;
-    const SPLIT_MIN_LOG: usize = 17;
-    const SPLIT_MIN_LOG_FILL: usize = 13;
-    let split_min = if open_fill_enabled() {
-        SPLIT_MIN_LOG_FILL
-    } else {
-        SPLIT_MIN_LOG
-    };
-    let d = point.len();
-    if !eq_split_enabled() || d < split_min {
-        return build_eq_table(point);
-    }
-    let n_threads = rayon::current_num_threads().max(1);
-    let log_blocks = (ceil_log2(n_threads) + 2).min(d - 1);
-    let h = d - log_blocks;
-    let lo = build_eq_table(&point[..h]);
-    let hi = build_eq_table(&point[h..]);
-    debug_assert_eq!(lo.len(), 1usize << h);
-    debug_assert_eq!(hi.len(), 1usize << log_blocks);
-    let mut out = crate::alloc_uninit_vec::<F128>(1usize << d);
-    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-    let x4 = eq_split_x4_enabled();
-    out.par_chunks_mut(1usize << h)
-        .zip(hi.par_iter())
-        .for_each(|(chunk, &e)| {
-            #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-            if x4 {
-                unsafe { eq_expand_block_x4(chunk, &lo, e) };
-                return;
-            }
-            for (o, &l) in chunk.iter_mut().zip(lo.iter()) {
-                *o = l * e;
-            }
-        });
-    out
-}
-
-pub(crate) fn induce_sched_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_INDUCE_SCHED").is_none());
-    *ON
-}
-
-fn induce_lazy_sks_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_INDUCE_LAZY_SKS").is_none());
-    *ON
-}
-
-fn induce_ntt_crossover_c() -> usize {
-    if induce_sched_enabled() { 1 } else { 4 }
-}
-
+/// Cost-based dispatch between the dense [`induce_sumcheck_poly`] and the
+/// sparse-NTT [`induce_sumcheck_poly_via_ntt`].
+///
+/// The dense path costs `O(n_queries · 2^log_msg_cols)`; the NTT path costs one
+/// pass over the `2^(log_msg_cols+log_inv_rate)` codeword domain, `O(2^log_block
+/// · log_block)`. The `2^log_msg_cols` factor cancels, so the NTT wins exactly
+/// when there are enough queries to amortize the codeword pass against the rate
+/// blow-up and depth:
+///   `n_queries  >  C · 2^log_inv_rate · log_block`   (C≈4: the NTT is ~2×
+/// costlier per op — memory-bound, multi-pass — plus margin so we only switch
+/// when clearly ahead). In the recursive PCS this fires only at the top level
+/// (large message domain, many queries); deeper levels stay dense.
+///
+/// Both paths are byte-identical (see `induce_sumcheck_poly_via_ntt_matches_dense`),
+/// so a mis-dispatch only costs time. Tuned/validated at blake m=30.
 pub(crate) fn induce_sumcheck_poly_auto(
     log_msg_cols: usize,
     log_inv_rate: usize,
-    sks_vks: Option<&[F128]>,
+    sks_vks: &[F128],
     opened_rows: &[Vec<F128>],
     v_challenges: &[F128],
     queries: &[usize],
     alpha: &[F128],
 ) -> (Vec<F128>, F128) {
     let log_block = log_msg_cols + log_inv_rate;
-    let use_ntt = log_msg_cols >= 12
-        && queries.len() > induce_ntt_crossover_c() * (1usize << log_inv_rate) * log_block.max(1);
+    let use_ntt =
+        log_msg_cols >= 12 && queries.len() > 4 * (1usize << log_inv_rate) * log_block.max(1);
     if use_ntt {
         induce_sumcheck_poly_via_ntt(
             log_msg_cols,
@@ -3925,14 +2161,6 @@ pub(crate) fn induce_sumcheck_poly_auto(
             alpha,
         )
     } else {
-        let computed;
-        let sks_vks = match sks_vks {
-            Some(table) => table,
-            None => {
-                computed = eval_sk_at_vks(log_msg_cols);
-                &computed
-            }
-        };
         induce_sumcheck_poly(
             log_msg_cols,
             sks_vks,
@@ -3944,467 +2172,24 @@ pub(crate) fn induce_sumcheck_poly_auto(
     }
 }
 
-fn induce_fused_densify_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_INDUCE_FUSED_DENSIFY").is_none());
-    *ON
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn window_slots(nwin: usize, processed: Vec<(usize, Vec<F128>)>) -> Vec<Option<Vec<F128>>> {
-    let mut slots: Vec<Option<Vec<F128>>> = (0..nwin).map(|_| None).collect();
-    for (w, buf) in processed {
-        debug_assert!(w < nwin);
-        debug_assert!(slots[w].is_none(), "window {w} densified twice");
-        slots[w] = Some(buf);
-    }
-    slots
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn densify_windows_fused(n: usize, k: usize, slots: Vec<Option<Vec<F128>>>) -> Vec<F128> {
-    use rayon::prelude::*;
-    debug_assert_eq!(slots.len(), n >> k);
-    let mut data: Vec<F128> = crate::alloc_uninit_vec(n);
-    data.par_chunks_mut(1usize << k)
-        .zip(slots.into_par_iter())
-        .for_each(|(dst, src)| match src {
-            Some(buf) => dst.copy_from_slice(&buf),
-            None => dst.fill(F128::ZERO),
-        });
-    data
-}
-
-#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-#[inline]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn transpose_butterfly_blocks_bsh1(p: *mut F128, t0: F128, t1: F128) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
-    use core::arch::x86_64::*;
-    unsafe {
-        let ta = _mm512_broadcast_i32x4(_mm_set_epi64x(t0.hi as i64, t0.lo as i64));
-        let tb = _mm512_broadcast_i32x4(_mm_set_epi64x(t1.hi as i64, t1.lo as i64));
-        let tv = _mm512_mask_blend_epi64(0xF0, ta, tb);
-        let tv_x64 = ghash_shift64_x4(tv);
-        let v = _mm512_loadu_si512(p as *const __m512i);
-        let sw = _mm512_shuffle_i64x2::<0xB1>(v, v);
-        let s = _mm512_xor_si512(v, sw);
-        let nb = _mm512_xor_si512(v, ghash_mul_x4_split(s, tv, tv_x64));
-        _mm512_storeu_si512(p as *mut __m512i, _mm512_mask_blend_epi64(0x33, nb, s));
-    }
-}
-
-#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-#[inline]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn transpose_butterfly_blocks_bsh2(p: *mut F128, t: F128) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
-    use core::arch::x86_64::*;
-    unsafe {
-        let tb = _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64));
-        let tb_x64 = ghash_shift64_x4(tb);
-        let v = _mm512_loadu_si512(p as *const __m512i);
-        let sw = _mm512_shuffle_i64x2::<0x4E>(v, v);
-        let s = _mm512_xor_si512(v, sw);
-        let nb = _mm512_xor_si512(v, ghash_mul_x4_split(s, tb, tb_x64));
-        _mm512_storeu_si512(p as *mut __m512i, _mm512_mask_blend_epi64(0x0F, nb, s));
-    }
-}
-
-#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-#[inline]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn transpose_butterfly_blocks_bsh1_pair(
-    p: *mut F128,
-    t0: F128,
-    t1: F128,
-    t2: F128,
-    t3: F128,
-) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
-    use core::arch::x86_64::*;
-    unsafe {
-        let ta = _mm512_broadcast_i32x4(_mm_set_epi64x(t0.hi as i64, t0.lo as i64));
-        let tb = _mm512_broadcast_i32x4(_mm_set_epi64x(t1.hi as i64, t1.lo as i64));
-        let tc = _mm512_broadcast_i32x4(_mm_set_epi64x(t2.hi as i64, t2.lo as i64));
-        let td = _mm512_broadcast_i32x4(_mm_set_epi64x(t3.hi as i64, t3.lo as i64));
-        let tv = _mm512_mask_blend_epi64(0xF0, ta, tb);
-        let tw = _mm512_mask_blend_epi64(0xF0, tc, td);
-        let tv_x64 = ghash_shift64_x4(tv);
-        let tw_x64 = ghash_shift64_x4(tw);
-        let v0 = _mm512_loadu_si512(p as *const __m512i);
-        let v1 = _mm512_loadu_si512(p.add(4) as *const __m512i);
-        let s0 = _mm512_xor_si512(v0, _mm512_shuffle_i64x2::<0xB1>(v0, v0));
-        let s1 = _mm512_xor_si512(v1, _mm512_shuffle_i64x2::<0xB1>(v1, v1));
-        let m0 = ghash_mul_x4_split(s0, tv, tv_x64);
-        let m1 = ghash_mul_x4_split(s1, tw, tw_x64);
-        _mm512_storeu_si512(
-            p as *mut __m512i,
-            _mm512_mask_blend_epi64(0x33, _mm512_xor_si512(v0, m0), s0),
-        );
-        _mm512_storeu_si512(
-            p.add(4) as *mut __m512i,
-            _mm512_mask_blend_epi64(0x33, _mm512_xor_si512(v1, m1), s1),
-        );
-    }
-}
-
-#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-#[inline]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn transpose_butterfly_blocks_bsh2_pair(p: *mut F128, t0: F128, t1: F128) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
-    use core::arch::x86_64::*;
-    unsafe {
-        let tb0 = _mm512_broadcast_i32x4(_mm_set_epi64x(t0.hi as i64, t0.lo as i64));
-        let tb1 = _mm512_broadcast_i32x4(_mm_set_epi64x(t1.hi as i64, t1.lo as i64));
-        let tb0_x64 = ghash_shift64_x4(tb0);
-        let tb1_x64 = ghash_shift64_x4(tb1);
-        let v0 = _mm512_loadu_si512(p as *const __m512i);
-        let v1 = _mm512_loadu_si512(p.add(4) as *const __m512i);
-        let s0 = _mm512_xor_si512(v0, _mm512_shuffle_i64x2::<0x4E>(v0, v0));
-        let s1 = _mm512_xor_si512(v1, _mm512_shuffle_i64x2::<0x4E>(v1, v1));
-        let m0 = ghash_mul_x4_split(s0, tb0, tb0_x64);
-        let m1 = ghash_mul_x4_split(s1, tb1, tb1_x64);
-        _mm512_storeu_si512(
-            p as *mut __m512i,
-            _mm512_mask_blend_epi64(0x0F, _mm512_xor_si512(v0, m0), s0),
-        );
-        _mm512_storeu_si512(
-            p.add(4) as *mut __m512i,
-            _mm512_mask_blend_epi64(0x0F, _mm512_xor_si512(v1, m1), s1),
-        );
-    }
-}
-
-#[inline]
-fn transpose_forward_ntt_window_dense_slice(
-    ntt: &AdditiveNttF128,
-    log_d: usize,
-    k: usize,
-    w: usize,
-    buf: &mut [F128],
-) {
-    debug_assert_eq!(buf.len(), 1usize << k);
-    for s in 0..k {
-        let layer = log_d - 1 - s;
-        let bsh = 1usize << s;
-        let block_size = bsh << 1;
-        let nblocks = (1usize << k) / block_size;
-        #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-        {
-            let block_base = w << (k - s - 1);
-            if bsh == 1 {
-                let mut jb = 0;
-                while jb + 3 < nblocks {
-                    let t0 = ntt.twiddle(layer, block_base + jb);
-                    let t1 = ntt.twiddle(layer, block_base + jb + 1);
-                    let t2 = ntt.twiddle(layer, block_base + jb + 2);
-                    let t3 = ntt.twiddle(layer, block_base + jb + 3);
-                    unsafe {
-                        transpose_butterfly_blocks_bsh1_pair(
-                            buf.as_mut_ptr().add(jb * 2),
-                            t0,
-                            t1,
-                            t2,
-                            t3,
-                        )
-                    };
-                    jb += 4;
-                }
-                while jb + 1 < nblocks {
-                    let t0 = ntt.twiddle(layer, block_base + jb);
-                    let t1 = ntt.twiddle(layer, block_base + jb + 1);
-                    unsafe {
-                        transpose_butterfly_blocks_bsh1(buf.as_mut_ptr().add(jb * 2), t0, t1)
-                    };
-                    jb += 2;
-                }
-                if jb < nblocks {
-                    let t = ntt.twiddle(layer, block_base + jb);
-                    let base = jb * 2;
-                    let (top_h, bot) = buf[base..base + 2].split_at_mut(1);
-                    transpose_butterfly(top_h, bot, t);
-                }
-                continue;
-            }
-            if bsh == 2 {
-                let mut jb = 0;
-                while jb + 1 < nblocks {
-                    let t0 = ntt.twiddle(layer, block_base + jb);
-                    let t1 = ntt.twiddle(layer, block_base + jb + 1);
-                    unsafe {
-                        transpose_butterfly_blocks_bsh2_pair(
-                            buf.as_mut_ptr().add(jb * 4),
-                            t0,
-                            t1,
-                        )
-                    };
-                    jb += 2;
-                }
-                if jb < nblocks {
-                    let t = ntt.twiddle(layer, block_base + jb);
-                    unsafe { transpose_butterfly_blocks_bsh2(buf.as_mut_ptr().add(jb * 4), t) };
-                }
-                continue;
-            }
-        }
-        for jb in 0..nblocks {
-            let t = ntt.twiddle(layer, (w << (k - s - 1)) + jb);
-            let base = jb * block_size;
-            let (top_h, bot) = buf[base..base + block_size].split_at_mut(bsh);
-            transpose_butterfly(top_h, bot, t);
-        }
-    }
-}
-
-#[inline]
-fn transpose_forward_ntt_window_dense(
-    ntt: &AdditiveNttF128,
-    log_d: usize,
-    k: usize,
-    w: usize,
-    mut buf: Vec<F128>,
-) -> (usize, Vec<F128>) {
-    transpose_forward_ntt_window_dense_slice(ntt, log_d, k, w, &mut buf);
-    (w, buf)
-}
-
-fn singleton_uninit_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LIG_SINGLETON_UNINIT").is_none());
-    *ON
-}
-
-fn take_singleton_buf(k: usize) -> Vec<F128> {
-    if singleton_uninit_enabled() {
-        crate::alloc_uninit_vec::<F128>(1usize << k)
-    } else {
-        vec![F128::ZERO; 1usize << k]
-    }
-}
-
-fn expand_singleton_into(
-    ntt: &AdditiveNttF128,
-    log_d: usize,
-    k: usize,
-    w: usize,
-    p: usize,
-    value: F128,
-    out: &mut [F128],
-) {
-    assert!(k > 0 && k <= log_d);
-    assert!(p < 1usize << k);
-    assert_eq!(out.len(), 1usize << k);
-    let mut scale0 = ntt.twiddle(log_d - 1, (w << (k - 1)) + (p >> 1));
-    if p & 1 != 0 {
-        scale0 += F128::ONE;
-    }
-    let v0 = value;
-    let v1 = if value == F128::ONE {
-        scale0
-    } else {
-        value * scale0
-    };
-    if k == 1 {
-        out[0] = v0;
-        out[1] = v1;
-        return;
-    }
-    let mut scale1 = ntt.twiddle(log_d - 2, (w << (k - 2)) + (p >> 2));
-    if (p >> 1) & 1 != 0 {
-        scale1 += F128::ONE;
-    }
-    let v2 = if value == F128::ONE {
-        scale1
-    } else {
-        v0 * scale1
-    };
-    let v3 = v1 * scale1;
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    {
-        use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4_split, ghash_shift64_x4};
-        use core::arch::x86_64::*;
-        unsafe {
-            let v_lo = f128x4_set(v0, v1, v2, v3);
-            _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, v_lo);
-            if k == 2 {
-                return;
-            }
-            let mut scale2 = ntt.twiddle(log_d - 3, (w << (k - 3)) + (p >> 3));
-            if (p >> 2) & 1 != 0 {
-                scale2 += F128::ONE;
-            }
-            let e2 = _mm512_broadcast_i32x4(_mm_set_epi64x(scale2.hi as i64, scale2.lo as i64));
-            let e2_x64 = ghash_shift64_x4(e2);
-            let v_hi = ghash_mul_x4_split(v_lo, e2, e2_x64);
-            _mm512_storeu_si512(out.as_mut_ptr().add(4) as *mut __m512i, v_hi);
-        }
-        let mut len = 8usize;
-        for s in 3..k {
-            let layer = log_d - 1 - s;
-            let jb = p >> (s + 1);
-            let mut scale = ntt.twiddle(layer, (w << (k - s - 1)) + jb);
-            if (p >> s) & 1 != 0 {
-                scale += F128::ONE;
-            }
-            let (current, rest) = out[..2 * len].split_at_mut(len);
-            unsafe { eq_expand_block_x4(&mut rest[..len], current, scale) };
-            len <<= 1;
-        }
-        return;
-    }
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    )))]
-    {
-        out[0] = v0;
-        out[1] = v1;
-        out[2] = v2;
-        out[3] = v3;
-        let mut len = 4usize;
-        for s in 2..k {
-            let layer = log_d - 1 - s;
-            let jb = p >> (s + 1);
-            let mut scale = ntt.twiddle(layer, (w << (k - s - 1)) + jb);
-            if (p >> s) & 1 != 0 {
-                scale += F128::ONE;
-            }
-            let (current, rest) = out[..2 * len].split_at_mut(len);
-            for (dst, &src) in rest[..len].iter_mut().zip(current.iter()) {
-                *dst = src * scale;
-            }
-            len <<= 1;
-        }
-    }
-}
-
-#[allow(dead_code)] // Retained singleton expansion oracle.
-fn transpose_forward_ntt_window_singleton(
-    ntt: &AdditiveNttF128,
-    log_d: usize,
-    k: usize,
-    w: usize,
-    p: usize,
-    value: F128,
-) -> (usize, Vec<F128>) {
-    let mut buf = take_singleton_buf(k);
-    expand_singleton_into(ntt, log_d, k, w, p, value, &mut buf);
-    (w, buf)
-}
-
-fn lig_induce_singleton_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LIG_INDUCE_SINGLETON").is_none());
-    *ON
-}
-
-const INDUCE_K_MAX_MEM: usize = 12;
-
-fn induce_window_k(log_d: usize, n_queries: usize, threads: usize, singleton: bool) -> usize {
-    if log_d < 12 || n_queries == 0 {
-        return 0;
-    }
-    if !singleton {
-        return 8usize.min(log_d);
-    }
-    let k_par = log_d.saturating_sub(ceil_log2(threads.max(1)) + 2);
-    let hi = INDUCE_K_MAX_MEM.min(k_par).min(log_d).max(8);
-    let cost = |k: usize| -> u128 {
-        (n_queries as u128) * ((1u128 << k) - 1) + (((log_d - k) as u128) << (log_d - 1))
-    };
-    (8..=hi).min_by_key(|&k| cost(k)).unwrap_or(8)
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct InduceSingletonStats {
-    singleton_hits: usize,
-    multi_hits: usize,
-    collision_fallbacks: usize,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
+/// Sparse-prefix variant of [`transpose_forward_ntt`]: exploits that the input
+/// has only `positions.len()` nonzeros and that the first `k` transpose steps
+/// (forward layers `log_d-1 .. log_d-k`, pairing distances `1 .. 2^(k-1)`) mix
+/// only **within** `2^k`-aligned windows. We process just the windows that
+/// contain a nonzero (a dense `2^k` transpose each), densify, then run the
+/// remaining steps as full dense sweeps. Output is identical to
+/// `transpose_forward_ntt` applied to the scattered input.
 fn transpose_forward_ntt_sparse(
     ntt: &AdditiveNttF128,
     positions: &[usize],
     values: &[F128],
     log_d: usize,
 ) -> Vec<F128> {
-    transpose_forward_ntt_sparse_inner(ntt, positions, values, log_d, None, None).0
-}
-
-fn lig_tntt_dead_top(log_inv_rate: usize) -> usize {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LIG_TNTT_DEAD_BOT").is_none());
-    if *ON { log_inv_rate } else { 0 }
-}
-
-fn transpose_forward_ntt_sparse_dead(
-    ntt: &AdditiveNttF128,
-    positions: &[usize],
-    values: &[F128],
-    log_d: usize,
-    dead_top: usize,
-) -> Vec<F128> {
-    transpose_forward_ntt_sparse_inner_dead(ntt, positions, values, log_d, None, None, dead_top).0
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn transpose_forward_ntt_sparse_inner(
-    ntt: &AdditiveNttF128,
-    positions: &[usize],
-    values: &[F128],
-    log_d: usize,
-    singleton_override: Option<bool>,
-    k_override: Option<usize>,
-) -> (Vec<F128>, InduceSingletonStats) {
-    transpose_forward_ntt_sparse_inner_dead(
-        ntt,
-        positions,
-        values,
-        log_d,
-        singleton_override,
-        k_override,
-        0,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn transpose_forward_ntt_sparse_inner_dead(
-    ntt: &AdditiveNttF128,
-    positions: &[usize],
-    values: &[F128],
-    log_d: usize,
-    singleton_override: Option<bool>,
-    k_override: Option<usize>,
-    dead_top: usize,
-) -> (Vec<F128>, InduceSingletonStats) {
     use rayon::prelude::*;
     use std::collections::HashMap;
     let n = 1usize << log_d;
-    assert_eq!(positions.len(), values.len());
-    let fill = open_fill_enabled();
-    let singleton_on = fill && singleton_override.unwrap_or_else(lig_induce_singleton_enabled);
-    let sparse_trie = singleton_on && sparse_window::enabled();
-    let k = if log_d < 12 || positions.is_empty() {
-        0
-    } else {
-        match k_override {
-            Some(v) => v.clamp(1, log_d),
-            None => induce_window_k(
-                log_d,
-                positions.len(),
-                rayon::current_num_threads(),
-                singleton_on,
-            ),
-        }
-    };
+    // No prefix for small domains — just scatter + full dense transpose.
+    let k = if log_d >= 12 { 8usize.min(log_d) } else { 0 };
 
     if k == 0 {
         let mut data = vec![F128::ZERO; n];
@@ -4412,262 +2197,104 @@ fn transpose_forward_ntt_sparse_inner_dead(
             data[p] += v;
         }
         if log_d > 0 {
-            transpose_forward_ntt_dead(ntt, &mut data, log_d, dead_top);
+            transpose_forward_ntt(ntt, &mut data, log_d);
         }
-        return (data, InduceSingletonStats::default());
+        return data;
     }
 
     let wmask = (1usize << k) - 1;
-    let mut win_vec: Vec<(usize, Vec<F128>)> = Vec::new();
-    let mut runs: Vec<(usize, usize)> = Vec::new();
-    let mut order: Vec<u32> = Vec::new();
-    if fill {
-        order.extend(0..positions.len() as u32);
-        if sparse_trie {
-            if !positions.windows(2).all(|w| w[0] <= w[1]) {
-                order.sort_by_key(|&i| positions[i as usize]);
-            }
-        } else if !positions.windows(2).all(|w| (w[0] >> k) <= (w[1] >> k)) {
-            order.sort_by_key(|&i| positions[i as usize] >> k);
-        }
-        let mut s = 0usize;
-        while s < order.len() {
-            let w = positions[order[s] as usize] >> k;
-            let mut e = s + 1;
-            while e < order.len() && positions[order[e] as usize] >> k == w {
-                e += 1;
-            }
-            runs.push((s, e));
-            s = e;
-        }
-    } else {
-        let mut windows: HashMap<usize, Vec<F128>> = HashMap::new();
-        for (&p, &v) in positions.iter().zip(values) {
-            let buf = windows
-                .entry(p >> k)
-                .or_insert_with(|| vec![F128::ZERO; 1 << k]);
-            buf[p & wmask] += v;
-        }
-        win_vec = windows.into_iter().collect();
+    // Group nonzeros into 2^k windows.
+    let mut windows: HashMap<usize, Vec<F128>> = HashMap::new();
+    for (&p, &v) in positions.iter().zip(values) {
+        let buf = windows
+            .entry(p >> k)
+            .or_insert_with(|| vec![F128::ZERO; 1 << k]);
+        buf[p & wmask] += v;
     }
 
-    let multi_max = k / 2;
-    let singleton_stats = if singleton_on && fill {
-        InduceSingletonStats {
-            singleton_hits: runs.iter().filter(|(s, e)| e - s == 1).count(),
-            multi_hits: runs
-                .iter()
-                .filter(|(s, e)| e - s > 1 && e - s <= multi_max)
-                .count(),
-            collision_fallbacks: runs.iter().filter(|(s, e)| e - s > multi_max).count(),
-        }
-    } else {
-        InduceSingletonStats::default()
-    };
-
-    let top = log_d - k;
-    let mut dense_top = top;
-    let nwins = if fill { runs.len() } else { win_vec.len() };
-    let ot = open_timing();
-    let mf0 = if ot { minor_faults() } else { 0 };
-    let _tw = std::time::Instant::now();
-    let (mut data, win_ms, alloc_ms, dens_ms) = if fill && induce_fused_densify_enabled() {
-        let nwin = n >> k;
-        let mut win_run: Vec<(u32, u32)> = vec![(0, 0); nwin];
-        for &(rs, re) in &runs {
-            let w = positions[order[rs] as usize] >> k;
-            win_run[w] = (rs as u32, re as u32);
-        }
-        let alloc_ms = _tw.elapsed().as_secs_f64() * 1e3;
-        let _td = std::time::Instant::now();
-        let mut data: Vec<F128> = crate::alloc_uninit_vec(n);
-        let n_threads = rayon::current_num_threads().max(1);
-        // Lane opus-pcs: site-18 chunk log, default 16 (incumbent).
-        let chunk_log = opus_tntt_chunk_log(18);
-        let split = log_d
-            .saturating_sub(chunk_log)
-            .max(ceil_log2(n_threads))
-            .min(top);
-        let fuse_pass_a = tntt_block_enabled() && top > split;
-        let wins_per_chunk_log = if fuse_pass_a { top - split } else { 0 };
-        let wins_per_chunk = 1usize << wins_per_chunk_log;
-        let chunk_len = 1usize << (k + wins_per_chunk_log);
-        if fuse_pass_a {
-            dense_top = split;
-        }
-        data.par_chunks_mut(chunk_len)
-            .zip(win_run.par_chunks(wins_per_chunk))
-            .enumerate()
-            .for_each_init(Vec::<F128>::new, |scratch, (c, (chunk, wr_chunk))| {
-                let w_base = c << wins_per_chunk_log;
-                for (wi, (dst, &(rs, re))) in chunk
-                    .chunks_exact_mut(1usize << k)
-                    .zip(wr_chunk.iter())
-                    .enumerate()
-                {
-                    let w = w_base + wi;
-                    let rs = rs as usize;
-                    let re = re as usize;
-                    let nnz = re - rs;
-                    if nnz == 0 {
-                        dst.fill(F128::ZERO);
-                        continue;
-                    }
-                    let first = order[rs] as usize;
-                    if sparse_trie {
-                        sparse_window::expand(
-                            ntt, log_d, k, w, positions, values, &order[rs..re], dst,
-                        );
-                    } else if singleton_on && nnz <= multi_max {
-                        expand_singleton_into(
-                            ntt,
-                            log_d,
-                            k,
-                            w,
-                            positions[first] & wmask,
-                            values[first],
-                            dst,
-                        );
-                        if nnz > 1 {
-                            if scratch.len() < 1usize << k {
-                                *scratch = take_singleton_buf(k);
-                            }
-                            let scratch = &mut scratch[..1usize << k];
-                            for &i in &order[rs + 1..re] {
-                                let i = i as usize;
-                                expand_singleton_into(
-                                    ntt,
-                                    log_d,
-                                    k,
-                                    w,
-                                    positions[i] & wmask,
-                                    values[i],
-                                    scratch,
-                                );
-                                transpose_top_only(dst, scratch);
-                            }
-                        }
-                    } else {
-                        dst.fill(F128::ZERO);
-                        for &i in &order[rs..re] {
-                            let i = i as usize;
-                            dst[positions[i] & wmask] += values[i];
-                        }
-                        transpose_forward_ntt_window_dense_slice(ntt, log_d, k, w, dst);
+    // Steps s = 0..k-1 within each active window, in parallel (windows disjoint).
+    let win_vec: Vec<(usize, Vec<F128>)> = windows.into_iter().collect();
+    let processed: Vec<(usize, Vec<F128>)> = win_vec
+        .into_par_iter()
+        .map(|(w, mut buf)| {
+            for s in 0..k {
+                let layer = log_d - 1 - s;
+                let bsh = 1usize << s; // pairing distance
+                let block_size = bsh << 1;
+                let nblocks = (1usize << k) / block_size;
+                for jb in 0..nblocks {
+                    // global block index = ((w<<k) + jb*block_size) >> (s+1).
+                    let t = ntt.twiddle(layer, (w << (k - s - 1)) + jb);
+                    let base = jb * block_size;
+                    for r in 0..bsh {
+                        let a = buf[base + r];
+                        let b = buf[base + r + bsh];
+                        let sab = a + b;
+                        buf[base + r] = sab;
+                        buf[base + r + bsh] = t * sab + b;
                     }
                 }
-                if fuse_pass_a {
-                    for layer in (split..top).rev() {
-                        let nb = 1usize << (layer - split);
-                        let block_size = 1usize << (log_d - layer);
-                        let bsh = block_size >> 1;
-                        for jb in 0..nb {
-                            let t = ntt.twiddle(layer, (c << (layer - split)) + jb);
-                            let (top_h, bot) =
-                                chunk[jb * block_size..(jb + 1) * block_size].split_at_mut(bsh);
-                            transpose_butterfly(top_h, bot, t);
-                        }
-                    }
-                }
-            });
-        let dens_ms = _td.elapsed().as_secs_f64() * 1e3;
-        (data, 0.0, alloc_ms, dens_ms)
-    } else {
-        let processed: Vec<(usize, Vec<F128>)> = if fill {
-            runs.par_iter()
-                .map_init(Vec::<F128>::new, |scratch, &(rs, re)| {
-                    let first = order[rs] as usize;
-                    let w = positions[first] >> k;
-                    let nnz = re - rs;
-                    if sparse_trie {
-                        let mut buf = take_singleton_buf(k);
-                        sparse_window::expand(
-                            ntt, log_d, k, w, positions, values, &order[rs..re], &mut buf,
-                        );
-                        return (w, buf);
-                    } else if singleton_on && nnz <= multi_max {
-                        let mut buf = take_singleton_buf(k);
-                        expand_singleton_into(
-                            ntt,
-                            log_d,
-                            k,
-                            w,
-                            positions[first] & wmask,
-                            values[first],
-                            &mut buf,
-                        );
-                        if nnz > 1 {
-                            if scratch.len() < 1usize << k {
-                                *scratch = take_singleton_buf(k);
-                            }
-                            let scratch = &mut scratch[..1usize << k];
-                            for &i in &order[rs + 1..re] {
-                                let i = i as usize;
-                                expand_singleton_into(
-                                    ntt,
-                                    log_d,
-                                    k,
-                                    w,
-                                    positions[i] & wmask,
-                                    values[i],
-                                    scratch,
-                                );
-                                transpose_top_only(&mut buf, scratch);
-                            }
-                        }
-                        return (w, buf);
-                    }
-                    let mut buf = vec![F128::ZERO; 1 << k];
-                    for &i in &order[rs..re] {
-                        let i = i as usize;
-                        buf[positions[i] & wmask] += values[i];
-                    }
-                    transpose_forward_ntt_window_dense(ntt, log_d, k, w, buf)
-                })
-                .collect()
-        } else {
-            win_vec
-                .into_par_iter()
-                .map(|(w, buf)| transpose_forward_ntt_window_dense(ntt, log_d, k, w, buf))
-                .collect()
-        };
-        let win_ms = _tw.elapsed().as_secs_f64() * 1e3;
-
-        let _ta = std::time::Instant::now();
-        let (data, alloc_ms, dens_ms) = if induce_fused_densify_enabled() {
-            let slots = window_slots(n >> k, processed);
-            let alloc_ms = _ta.elapsed().as_secs_f64() * 1e3;
-            let _td = std::time::Instant::now();
-            let data = densify_windows_fused(n, k, slots);
-            (data, alloc_ms, _td.elapsed().as_secs_f64() * 1e3)
-        } else {
-            let mut data = vec![F128::ZERO; n];
-            let alloc_ms = _ta.elapsed().as_secs_f64() * 1e3;
-            let _td = std::time::Instant::now();
-            for (w, buf) in processed {
-                data[(w << k)..((w + 1) << k)].copy_from_slice(&buf);
             }
-            (data, alloc_ms, _td.elapsed().as_secs_f64() * 1e3)
-        };
-        (data, win_ms, alloc_ms, dens_ms)
-    };
+            (w, buf)
+        })
+        .collect();
 
-    let _ts = std::time::Instant::now();
-    transpose_forward_ntt_dense_layers_dead(ntt, &mut data, dense_top, dead_top.min(dense_top));
-    if ot {
-        eprintln!(
-            "      [sparse-ntt] log_d={log_d} k={k} wins={nwin} win-phase {win_ms:.2} ms  alloc(zeroed 2^{log_d}) {alloc_ms:.2} ms  densify {dens_ms:.2} ms  dense({dl} layers) {ds:.2} ms  minflt +{mf}",
-            nwin = nwins,
-            win_ms = win_ms,
-            dl = dense_top,
-            ds = _ts.elapsed().as_secs_f64() * 1e3,
-            mf = minor_faults() - mf0,
-        );
+    // Densify (active windows only; the rest stay zero, which is the correct
+    // post-step-(k-1) state for an all-zero window).
+    let mut data = vec![F128::ZERO; n];
+    for (w, buf) in processed {
+        data[(w << k)..((w + 1) << k)].copy_from_slice(&buf);
     }
-    (data, singleton_stats)
+
+    // Remaining steps s = k..log_d-1 = forward layers (log_d-1-k) .. 0, dense.
+    let n_threads = rayon::current_num_threads().max(1);
+    for layer in (0..(log_d - k)).rev() {
+        let num_blocks = 1usize << layer;
+        let block_size = 1usize << (log_d - layer);
+        let bsh = block_size >> 1;
+        if num_blocks >= n_threads {
+            data.par_chunks_mut(block_size)
+                .enumerate()
+                .for_each(|(block, chunk)| {
+                    let t = ntt.twiddle(layer, block);
+                    let (top, bot) = chunk.split_at_mut(bsh);
+                    for (a_ref, b_ref) in top.iter_mut().zip(bot.iter_mut()) {
+                        let a = *a_ref;
+                        let b = *b_ref;
+                        let sab = a + b;
+                        *a_ref = sab;
+                        *b_ref = t * sab + b;
+                    }
+                });
+        } else {
+            for block in 0..num_blocks {
+                let t = ntt.twiddle(layer, block);
+                let chunk = &mut data[block * block_size..(block + 1) * block_size];
+                let (top, bot) = chunk.split_at_mut(bsh);
+                top.par_iter_mut()
+                    .zip(bot.par_iter_mut())
+                    .for_each(|(a_ref, b_ref)| {
+                        let a = *a_ref;
+                        let b = *b_ref;
+                        let sab = a + b;
+                        *a_ref = sab;
+                        *b_ref = t * sab + b;
+                    });
+            }
+        }
+    }
+    data
 }
 
+// ===================================================================
+// ligero_commit
+// ===================================================================
 
+/// Codeword + Merkle tree for one Ligerito commitment level.
+///
+/// `mat` is row-major: `mat[pos * num_interleaved + lane]` for
+/// `pos ∈ [0, block_len)`, `lane ∈ [0, num_interleaved)`. Each row
+/// (one `pos` across all lanes) is one Merkle leaf.
 pub(crate) struct LigeroWitness {
     pub mat: Vec<F128>,
     pub tree: Vec<Hash>,
@@ -4675,21 +2302,20 @@ pub(crate) struct LigeroWitness {
     pub num_interleaved: usize,
 }
 
+// Recycle the codeword matrix (128 MB for L1 at m=29) through the scratch
+// pool when a level's witness is replaced/dropped.
 impl Drop for LigeroWitness {
     fn drop(&mut self) {
         crate::scratch::give_f128(std::mem::take(&mut self.mat));
-        crate::pcs::commit::give_tree(std::mem::take(&mut self.tree));
     }
 }
 
+// SumcheckProver owns the two witness-sized polynomials of the open (the
+// packed witness `f` and the γ-combined basis) — recycle both on drop.
 impl Drop for SumcheckProver {
     fn drop(&mut self) {
-        if let FoldBuf::Owned(v) = std::mem::take(&mut self.f) {
-            crate::scratch::give_f128(v);
-        }
-        if let FoldBuf::Owned(v) = std::mem::take(&mut self.combined_basis) {
-            crate::scratch::give_f128(v);
-        }
+        crate::scratch::give_f128(std::mem::take(&mut self.f));
+        crate::scratch::give_f128(std::mem::take(&mut self.combined_basis));
     }
 }
 
@@ -4706,47 +2332,15 @@ impl LigeroWitness {
     }
 }
 
-#[cfg(unix)]
-fn minor_faults() -> u64 {
-    #[repr(C)]
-    struct Timeval {
-        tv_sec: i64,
-        tv_usec: i64,
-    }
-    #[repr(C)]
-    struct Rusage {
-        ru_utime: Timeval,
-        ru_stime: Timeval,
-        ru_maxrss: i64,
-        ru_ixrss: i64,
-        ru_idrss: i64,
-        ru_isrss: i64,
-        ru_minflt: i64,
-        ru_majflt: i64,
-        ru_nswap: i64,
-        ru_inblock: i64,
-        ru_oublock: i64,
-        ru_msgsnd: i64,
-        ru_msgrcv: i64,
-        ru_nsignals: i64,
-        ru_nvcsw: i64,
-        ru_nivcsw: i64,
-    }
-    unsafe extern "C" {
-        fn getrusage(who: i32, usage: *mut Rusage) -> i32;
-    }
-    let mut ru = std::mem::MaybeUninit::<Rusage>::uninit();
-    let rc = unsafe { getrusage(0, ru.as_mut_ptr()) };
-    if rc != 0 {
-        return 0;
-    }
-    unsafe { ru.assume_init() }.ru_minflt as u64
-}
-#[cfg(not(unix))]
-fn minor_faults() -> u64 {
-    0
-}
-
+/// Reshape `poly` (length `num_interleaved · msg_cols`) into a
+/// `block_len × num_interleaved` SoA matrix, RS-encode each lane via the
+/// LCH additive NTT (non-systematic: pad message with zeros to `block_len`,
+/// then forward-transform), and Merkle-commit the rows.
+///
+/// `poly` layout: **LSB-first lane index** — `poly[col * num_interleaved + lane]`.
+/// The first `log_num_interleaved` LSB variables of the multilinear poly are the
+/// lane indices, so `partial_eval_lsb(poly, lane_challenges)` produces the
+/// next-level poly directly. This composes cleanly with sumcheck folds.
 pub(crate) fn ligero_commit(
     poly: &[F128],
     log_msg_cols: usize,
@@ -4762,57 +2356,20 @@ pub(crate) fn ligero_commit(
     assert_eq!(poly.len(), num_interleaved * msg_cols);
     assert!(log_block_len <= ntt.log_domain_size());
 
+    // LSB-lane layout: input matches the SoA layout `data[pos * num_interleaved + lane]`
+    // directly. The first `log_inv_rate` NTT layers on the zero-padded
+    // coefficients are pure copies, so fill the matrix with 2^log_inv_rate
+    // replicas of `poly` (same write cost as copy + zero-fill) and start the
+    // transform past those layers — see `pcs::commit::replicate_message_fill`.
     let codeword_len = block_len * num_interleaved;
-    let ot = open_timing();
-    let t_alloc = std::time::Instant::now();
     let mut mat = crate::scratch::take_f128(codeword_len);
-    let mat_alloc_ms = t_alloc.elapsed().as_secs_f64() * 1e3;
+    super::commit::replicate_message_fill(&mut mat, poly);
+
+    // RS-encode every lane in one call (each lane is one independent NTT).
+    ntt.forward_transform_interleaved_from_layer(&mut mat, num_interleaved, log_inv_rate);
+
+    // Merkle over rows. One leaf = `num_interleaved` consecutive F128 = 16·num_interleaved bytes.
     let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
-
-    if crate::pcs::commit::lig_fused_commit_enabled() && !crate::gpu::merkle::available() {
-        crate::rstrace::ev("lc:start", log_block_len as u32);
-        let faults_before = if ot { minor_faults() } else { 0 };
-        let mat_cap = mat.capacity();
-        let t_encode = std::time::Instant::now();
-        let mut tree = crate::pcs::commit::take_tree(2 * block_len - 1);
-        let folded = crate::pcs::commit::fused_encode_leaves_subtree(
-            ntt,
-            poly,
-            &mut mat,
-            num_interleaved,
-            &mut tree,
-            block_len,
-            leaf_size_bytes,
-            kind,
-        );
-        let fused_ms = t_encode.elapsed().as_secs_f64() * 1e3;
-        let t_upper = std::time::Instant::now();
-        crate::rstrace::ev("lc:fused", log_block_len as u32);
-        crate::pcs::commit::build_upper_levels(&mut tree, block_len, block_len >> folded, kind);
-        crate::rstrace::ev("lc:end", log_block_len as u32);
-        if ot {
-            eprintln!(
-                "[open-timing] ligero_commit: leaves=2^{log_block_len} leaf={leaf_size_bytes}B \
-                 ({:.1} MiB) mat-alloc {mat_alloc_ms:.2} ms (cap {} F128, tree cap {}) FUSED \
-                 encode+leaves+subtree({folded}) {fused_ms:.2} ms upper {:.2} ms minflt +{}",
-                (codeword_len * 16) as f64 / (1024.0 * 1024.0),
-                mat_cap,
-                tree.capacity(),
-                t_upper.elapsed().as_secs_f64() * 1e3,
-                minor_faults().saturating_sub(faults_before),
-            );
-        }
-        return LigeroWitness {
-            mat,
-            tree,
-            block_len,
-            num_interleaved,
-        };
-    }
-
-    let t_encode = std::time::Instant::now();
-    ntt.rs_encode_interleaved(poly, &mut mat, num_interleaved);
-    let encode_ms = t_encode.elapsed().as_secs_f64() * 1e3;
     let data_bytes: &[u8] = unsafe {
         core::slice::from_raw_parts(
             mat.as_ptr() as *const u8,
@@ -4820,44 +2377,7 @@ pub(crate) fn ligero_commit(
         )
     };
     debug_assert_eq!(data_bytes.len(), block_len * leaf_size_bytes);
-    let t_merkle = std::time::Instant::now();
-    let mut gpu_busy_ms = 0.0f64;
-    let gpu_tree = if kind == HashKind::Blake3
-        && block_len >= gpu_open_merkle_min_leaves()
-        && merkle::blake3_leaf_size_is_batchable(leaf_size_bytes)
-        && crate::gpu::merkle::available()
-    {
-        gpu_merkle_tree_for_open(data_bytes, block_len, leaf_size_bytes, &mut gpu_busy_ms)
-    } else {
-        None
-    };
-    let on_gpu = gpu_tree.is_some();
-    let mut tree_alloc_ms = 0.0f64;
-    let mut leaves_ms = 0.0f64;
-    let tree = gpu_tree.unwrap_or_else(|| {
-        let t_ta = std::time::Instant::now();
-        let mut tree = crate::pcs::commit::take_tree(2 * block_len - 1);
-        tree_alloc_ms = t_ta.elapsed().as_secs_f64() * 1e3;
-        if ot {
-            let t_l = std::time::Instant::now();
-            merkle::hash_leaves(data_bytes, leaf_size_bytes, &mut tree[..block_len], kind);
-            leaves_ms = t_l.elapsed().as_secs_f64() * 1e3;
-            crate::pcs::commit::build_upper_levels(&mut tree, block_len, block_len, kind);
-        } else {
-            merkle::fill_merkle_tree(&mut tree, data_bytes, block_len, kind);
-        }
-        tree
-    });
-    if ot {
-        eprintln!(
-            "[open-timing] ligero_commit: leaves=2^{log_block_len} leaf={leaf_size_bytes}B \
-             ({:.1} MiB) mat-alloc {mat_alloc_ms:.2} ms encode {encode_ms:.2} ms merkle({}) {:.2} ms \
-             [tree-alloc {tree_alloc_ms:.2} leaves {leaves_ms:.2}] (gpu busy {gpu_busy_ms:.2} ms)",
-            (codeword_len * 16) as f64 / (1024.0 * 1024.0),
-            if on_gpu { "gpu" } else { "cpu" },
-            t_merkle.elapsed().as_secs_f64() * 1e3,
-        );
-    }
+    let tree = merkle::merkle_tree(data_bytes, block_len, kind);
 
     LigeroWitness {
         mat,
@@ -4867,64 +2387,35 @@ pub(crate) fn ligero_commit(
     }
 }
 
-fn gpu_open_merkle_min_leaves() -> usize {
-    static MIN: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        if std::env::var_os("FLOCK_NO_GPU_OPEN_MERKLE").is_some() {
-            return usize::MAX;
-        }
-        match std::env::var("FLOCK_GPU_OPEN_MERKLE_MIN_LOG2") {
-            Ok(s) => s.parse::<u32>().map(|l| 1usize << l).unwrap_or(usize::MAX),
-            Err(_) if std::env::var_os("FLOCK_GPU_OPEN_MERKLE").is_some() => 1usize << 18,
-            Err(_) => usize::MAX,
-        }
-    });
-    *MIN
-}
+// ===================================================================
+// Stateful sumcheck — Flock (u_0, u_2) convention
+// ===================================================================
+//
+// Per-round quadratic q(X) = u_0 + u_1·X + u_2·X² with the sumcheck constraint
+//   q(0) + q(1) = T_r          (T_r = running sum-claim entering this round)
+// Verifier derives u_1 = T_r + u_2 (char 2). Round eval at challenge r:
+//   q(r) = u_0 + r·(T_r + u_2) + r²·u_2 = u_0 + r·T_r + (r + r²)·u_2
+//
+// Ligerito extends plain sumcheck with two ops at recursive-level boundaries:
+//
+//   introduce_new(b_new, h):
+//     Prover commits to a new basis poly b_new with its own claimed sum h
+//     (verifier-computable from the open-rows induce step). Sends (u_0, u_2)
+//     for the inner product f·b_new at the current (already-folded) dim.
+//
+//   glue(α):
+//     Combine the running round-quadratic with the introduced one as
+//     running := running + α·to_glue. New sum-claim becomes T_r + α·h.
 
-const GPU_OPEN_STOP_NODES: usize = 1 << 10;
-
-const GPU_OPEN_TREE_PAD_NODES: usize = 512;
-
-fn gpu_merkle_tree_for_open(
-    data_bytes: &[u8],
-    block_len: usize,
-    leaf_size: usize,
-    busy_ms: &mut f64,
-) -> Option<Vec<Hash>> {
-    let total_nodes = 2 * block_len - 1;
-    let mut tree: Vec<Hash> = crate::alloc_uninit_vec(total_nodes + GPU_OPEN_TREE_PAD_NODES);
-    let mut session = unsafe {
-        crate::gpu::merkle::begin(
-            data_bytes,
-            leaf_size,
-            tree.as_mut_ptr(),
-            tree.len(),
-            GPU_OPEN_STOP_NODES,
-        )
-    }?;
-    if !session.commit_leaves(0, block_len) || !session.commit_parent_levels() {
-        session.finish();
-        return None;
-    }
-    *busy_ms = session.finish()? * 1e3;
-    let from_nodes = if GPU_OPEN_STOP_NODES <= block_len / 2 {
-        GPU_OPEN_STOP_NODES
-    } else {
-        block_len
-    };
-    crate::pcs::commit::build_upper_levels(&mut tree, block_len, from_nodes, HashKind::Blake3);
-    tree.truncate(total_nodes);
-    Some(tree)
-}
-
-
-#[repr(C)]
+/// (u_0, u_2) per round — what the prover sends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SumcheckMessage {
     pub u_0: F128,
     pub u_2: F128,
 }
 
+/// Round-quadratic in coefficient form `c + b·X + a·X²`. Used by the verifier
+/// to track the running quadratic across fold / introduce_new / glue.
 #[derive(Clone, Copy, Debug)]
 struct RoundQuad {
     c: F128, // u_0
@@ -4955,95 +2446,66 @@ impl RoundQuad {
     }
 }
 
+/// Compute `(u_0, u_2)` for `u(X) = Σ_x f(X, x) · b(X, x)` where `X` is the
+/// LSB variable. Parallel reduction across pair indices.
+///
+/// Uses a SINGLE combined basis poly. (Previously took `&[Vec<F128>]` and
+/// summed at every pair index; collapsing to one basis happens at glue time.)
 fn round_msg_lsb(f: &[F128], b: &[F128]) -> SumcheckMessage {
     use rayon::prelude::*;
     let n = f.len();
     debug_assert!(n.is_power_of_two() && n >= 2);
     debug_assert_eq!(b.len(), n);
 
-    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-    {
-        const PAR_THRESHOLD: usize = 4096;
-        if n < PAR_THRESHOLD {
-            let (u_0, u_2) = unsafe { msg_reduce_avx512(f, b) };
-            return SumcheckMessage { u_0, u_2 };
+    const PAR_THRESHOLD: usize = 4096;
+    let half = n / 2;
+    if half < PAR_THRESHOLD {
+        let mut u_0 = F128::ZERO;
+        let mut u_2 = F128::ZERO;
+        for j in 0..half {
+            let f0 = f[2 * j];
+            let f1 = f[2 * j + 1];
+            let b0 = b[2 * j];
+            let b1 = b[2 * j + 1];
+            u_0 += f0 * b0;
+            u_2 += (f0 + f1) * (b0 + b1);
         }
-        const CHUNK: usize = 1024;
-        let (u_0, u_2) = f
-            .par_chunks(CHUNK)
-            .zip(b.par_chunks(CHUNK))
-            .map(|(fc, bc)| {
-                unsafe { msg_reduce_avx512(fc, bc) }
-            })
-            .reduce(
-                || (F128::ZERO, F128::ZERO),
-                |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2),
-            );
         return SumcheckMessage { u_0, u_2 };
     }
 
-    #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
-    {
-        const PAR_THRESHOLD: usize = 4096;
-        let half = n / 2;
-        if half < PAR_THRESHOLD {
-            let mut u_0 = F128::ZERO;
-            let mut u_2 = F128::ZERO;
-            for j in 0..half {
-                let f0 = f[2 * j];
-                let f1 = f[2 * j + 1];
-                let b0 = b[2 * j];
-                let b1 = b[2 * j + 1];
-                u_0 += f0 * b0;
-                u_2 += (f0 + f1) * (b0 + b1);
-            }
-            return SumcheckMessage { u_0, u_2 };
-        }
-
-        let (u_0, u_2) = (0..half)
-            .into_par_iter()
-            .with_min_len(PAR_THRESHOLD / 4)
-            .map(|j| {
-                let f0 = f[2 * j];
-                let f1 = f[2 * j + 1];
-                let b0 = b[2 * j];
-                let b1 = b[2 * j + 1];
-                (f0 * b0, (f0 + f1) * (b0 + b1))
-            })
-            .reduce(
-                || (F128::ZERO, F128::ZERO),
-                |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2),
-            );
-        SumcheckMessage { u_0, u_2 }
-    }
+    let (u_0, u_2) = (0..half)
+        .into_par_iter()
+        .with_min_len(PAR_THRESHOLD / 4)
+        .map(|j| {
+            let f0 = f[2 * j];
+            let f1 = f[2 * j + 1];
+            let b0 = b[2 * j];
+            let b1 = b[2 * j + 1];
+            (f0 * b0, (f0 + f1) * (b0 + b1))
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2),
+        );
+    SumcheckMessage { u_0, u_2 }
 }
 
+/// Fused round message + full inner product: returns `round_msg_lsb(f, b)`
+/// alongside `y = Σ_x f(x)·b(x)`, computed in a single pass over `(f, b)`.
+///
+/// Used by OOD binding, where `b = eq_table(z)` and `y` is the claimed MLE
+/// eval `f̂(z)`. Folding `f` against `z` separately (`mle_eval_inline`) then
+/// re-reading `f` against `b` in `round_msg_lsb` costs two passes over the
+/// 2^n witness; this collapses them into one (the phase is memory-bandwidth
+/// bound, so a saved pass is a near-proportional win). The `u_0` term `f0·b0`
+/// is shared between the message and the eval, so `y` costs one extra mul per
+/// pair. Bit-identical to the unfused path: F128 sums are exact and order-
+/// independent, so `y == mle_eval_inline(f, z)`.
 fn round_msg_and_eval_lsb(f: &[F128], b: &[F128]) -> (SumcheckMessage, F128) {
     use rayon::prelude::*;
     let n = f.len();
     debug_assert!(n.is_power_of_two() && n >= 2);
     debug_assert_eq!(b.len(), n);
-
-    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-    if open_ood_x4_enabled() {
-        const PAR_THRESHOLD: usize = 4096;
-        if n < PAR_THRESHOLD {
-            let (u_0, u_2, y) = unsafe { msg_reduce_eval_avx512(f, b) };
-            return (SumcheckMessage { u_0, u_2 }, y);
-        }
-        const CHUNK: usize = 1024;
-        let (u_0, u_2, y) = f
-            .par_chunks(CHUNK)
-            .zip(b.par_chunks(CHUNK))
-            .map(|(fc, bc)| {
-                unsafe { msg_reduce_eval_avx512(fc, bc) }
-            })
-            .reduce(
-                || (F128::ZERO, F128::ZERO, F128::ZERO),
-                |(a0, a2, ay), (c0, c2, cy)| (a0 + c0, a2 + c2, ay + cy),
-            );
-        return (SumcheckMessage { u_0, u_2 }, y);
-    }
 
     const PAR_THRESHOLD: usize = 4096;
     let half = n / 2;
@@ -5053,6 +2515,7 @@ fn round_msg_and_eval_lsb(f: &[F128], b: &[F128]) -> (SumcheckMessage, F128) {
         let b0 = b[2 * j];
         let b1 = b[2 * j + 1];
         let e0 = f0 * b0;
+        // (u_0 term, u_2 term, y term = f0·b0 + f1·b1).
         (e0, (f0 + f1) * (b0 + b1), e0 + f1 * b1)
     };
     if half < PAR_THRESHOLD {
@@ -5077,114 +2540,9 @@ fn round_msg_and_eval_lsb(f: &[F128], b: &[F128]) -> (SumcheckMessage, F128) {
     (SumcheckMessage { u_0, u_2 }, y)
 }
 
-const LAZY_OOD_EQ_SPLIT_LOW_LOG: usize = 11;
-
-#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn factorized_eq_round0_avx512(f: &[F128], weights: &[F128]) -> (F128, F128) {
-    use crate::field::gf2_128::x86_64::WideGhashX4;
-    use core::arch::x86_64::*;
-
-    unsafe {
-        debug_assert_eq!(f.len(), 2 * weights.len());
-        let mut a_acc = WideGhashX4::zero();
-        let mut s_acc = WideGhashX4::zero();
-        let lanes = weights.len() & !3;
-        let mut j = 0usize;
-        while j < lanes {
-            let f0 = _mm512_loadu_si512(f.as_ptr().add(2 * j) as *const __m512i);
-            let f1 = _mm512_loadu_si512(f.as_ptr().add(2 * j + 4) as *const __m512i);
-            let w = _mm512_loadu_si512(weights.as_ptr().add(j) as *const __m512i);
-            let even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
-            let f0_sum = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
-            let f1_sum = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
-            let sum = _mm512_shuffle_i32x4::<0x88>(f0_sum, f1_sum);
-            a_acc.mul_acc(even, w);
-            s_acc.mul_acc(sum, w);
-            j += 4;
-        }
-        let mut a = a_acc.fold().reduce();
-        let mut s = s_acc.fold().reduce();
-        while j < weights.len() {
-            a += f[2 * j] * weights[j];
-            s += (f[2 * j] + f[2 * j + 1]) * weights[j];
-            j += 1;
-        }
-        (a, s)
-    }
-}
-
-#[inline]
-fn factorized_eq_round0(f: &[F128], weights: &[F128]) -> (F128, F128) {
-    assert_eq!(f.len(), 2 * weights.len());
-    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-    unsafe {
-        factorized_eq_round0_avx512(f, weights)
-    }
-    #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
-    {
-        let mut a = F128::ZERO;
-        let mut s = F128::ZERO;
-        for (pair, &weight) in f.chunks_exact(2).zip(weights) {
-            a += pair[0] * weight;
-            s += (pair[0] + pair[1]) * weight;
-        }
-        (a, s)
-    }
-}
-
-fn round_msg_and_eval_lsb_factorized_eq(
-    f: &[F128],
-    eq_lo: &[F128],
-    eq_hi: &[F128],
-    z_0: F128,
-) -> (SumcheckMessage, F128) {
-    use rayon::prelude::*;
-
-    assert!(eq_lo.len().is_power_of_two() && eq_lo.len() >= 2);
-    assert!(eq_hi.len().is_power_of_two());
-    let tail_len = eq_lo
-        .len()
-        .checked_mul(eq_hi.len())
-        .expect("factorized OOD tail overflow");
-    assert_eq!(f.len(), 2 * tail_len);
-
-    let chunk_len = 2 * eq_lo.len();
-    let (a, s) = if op_ood_team(eq_hi.len()) {
-        // Lane op: the deep levels' OOD pass (<= 64 chunks) as a hot-pool
-        // team region: the owner claims chunks itself and waits by spinning,
-        // so it never stalls in an unrelated stolen job (the background
-        // sparse-dual materialization). Same per-chunk values, XOR-summed.
-        crate::flat_par::team_map_reduce(
-            eq_hi.len(),
-            |c| {
-                let (a, s) = factorized_eq_round0(&f[c * chunk_len..(c + 1) * chunk_len], eq_lo);
-                (a * eq_hi[c], s * eq_hi[c])
-            },
-            || (F128::ZERO, F128::ZERO),
-            |(a0, s0), (a1, s1)| (a0 + a1, s0 + s1),
-        )
-    } else {
-        f.par_chunks(chunk_len)
-            .zip(eq_hi.par_iter())
-            .map(|(chunk, &hi)| {
-                let (a, s) = factorized_eq_round0(chunk, eq_lo);
-                (a * hi, s * hi)
-            })
-            .reduce(
-                || (F128::ZERO, F128::ZERO),
-                |(a0, s0), (a1, s1)| (a0 + a1, s0 + s1),
-            )
-    };
-    (
-        SumcheckMessage {
-            u_0: (F128::ONE + z_0) * a,
-            u_2: s,
-        },
-        a + z_0 * s,
-    )
-}
-
+/// Partially evaluate `evals` at LSB variable = `r`, in place. Halves length.
+/// Parallel for large arrays. Test oracle for the fused fold below; the
+/// production path uses `fold_and_msg_lsb` instead.
 #[cfg(test)]
 fn partial_eval_lsb_one(evals: &mut Vec<F128>, r: F128) {
     use rayon::prelude::*;
@@ -5204,6 +2562,9 @@ fn partial_eval_lsb_one(evals: &mut Vec<F128>, r: F128) {
         return;
     }
 
+    // Parallel: produce a fresh halved Vec then swap in. Doing it in-place with
+    // par_iter on overlapping indices is dicey; allocate the halved output and
+    // swap (cheap vs the fold itself).
     let folded: Vec<F128> = (0..half)
         .into_par_iter()
         .with_min_len(PAR_THRESHOLD / 4)
@@ -5212,842 +2573,91 @@ fn partial_eval_lsb_one(evals: &mut Vec<F128>, r: F128) {
     *evals = folded;
 }
 
-#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-pub(crate) unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128) {
-    use crate::field::gf2_128::x86_64::WideGhashX4;
-    use core::arch::x86_64::*;
-
-    let len = fc.len();
-    debug_assert_eq!(bc.len(), len);
-    let lanes = len & !7;
-    unsafe {
-        let mut u0_acc = WideGhashX4::zero();
-        let mut u2_acc = WideGhashX4::zero();
-
-        let mut k = 0;
-        while k < lanes {
-            let f0 = _mm512_loadu_si512(fc.as_ptr().add(k) as *const __m512i);
-            let f1 = _mm512_loadu_si512(fc.as_ptr().add(k + 4) as *const __m512i);
-            let b0 = _mm512_loadu_si512(bc.as_ptr().add(k) as *const __m512i);
-            let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
-
-            let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
-            let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
-            u0_acc.mul_acc(f_even, b_even);
-
-            let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
-            let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
-            let f_sum = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
-            let b0s = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
-            let b1s = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
-            let b_sum = _mm512_shuffle_i32x4::<0x88>(b0s, b1s);
-            u2_acc.mul_acc(f_sum, b_sum);
-
-            k += 8;
-        }
-
-        let mut u0 = u0_acc.fold().reduce();
-        let mut u2 = u2_acc.fold().reduce();
-
-        while k + 1 < len {
-            let f0 = fc[k];
-            let f1 = fc[k + 1];
-            let b0 = bc[k];
-            let b1 = bc[k + 1];
-            u0 += f0 * b0;
-            u2 += (f0 + f1) * (b0 + b1);
-            k += 2;
-        }
-
-        (u0, u2)
-    }
-}
-
-/// Lane opus-pcs: the vector body of [`msg_reduce_avx512`] over one
-/// eight-aligned span, accumulating into caller-held raw Karatsuba streams
-/// (no fold/reduce). Feeding consecutive spans of a block in order and then
-/// folding once reproduces `msg_reduce_avx512` on the whole block exactly:
-/// same products, same accumulator sequence.
-#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-#[inline]
-#[allow(dead_code)] // Consumed only by the ranked AVX-512 GFNI route.
-unsafe fn msg_accumulate_avx512(
-    fc: &[F128],
-    bc: &[F128],
-    u0_acc: &mut crate::field::gf2_128::x86_64::WideGhashX4,
-    u2_acc: &mut crate::field::gf2_128::x86_64::WideGhashX4,
-) {
-    use core::arch::x86_64::*;
-    let len = fc.len();
-    debug_assert_eq!(bc.len(), len);
-    debug_assert!(len.is_multiple_of(8));
-    unsafe {
-        let mut k = 0;
-        while k < len {
-            let f0 = _mm512_loadu_si512(fc.as_ptr().add(k) as *const __m512i);
-            let f1 = _mm512_loadu_si512(fc.as_ptr().add(k + 4) as *const __m512i);
-            let b0 = _mm512_loadu_si512(bc.as_ptr().add(k) as *const __m512i);
-            let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
-
-            let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
-            let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
-            u0_acc.mul_acc(f_even, b_even);
-
-            let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
-            let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
-            let f_sum = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
-            let b0s = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
-            let b1s = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
-            let b_sum = _mm512_shuffle_i32x4::<0x88>(b0s, b1s);
-            u2_acc.mul_acc(f_sum, b_sum);
-
-            k += 8;
-        }
-    }
-}
-
-#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn msg_reduce_eval_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128, F128) {
-    use crate::field::gf2_128::x86_64::WideGhashX4;
-    use core::arch::x86_64::*;
-
-    let len = fc.len();
-    debug_assert_eq!(bc.len(), len);
-    let lanes = len & !7;
-    unsafe {
-        let mut u0_acc = WideGhashX4::zero();
-        let mut u2_acc = WideGhashX4::zero();
-        let mut y_acc = WideGhashX4::zero();
-
-        let mut k = 0;
-        while k < lanes {
-            let f0 = _mm512_loadu_si512(fc.as_ptr().add(k) as *const __m512i);
-            let f1 = _mm512_loadu_si512(fc.as_ptr().add(k + 4) as *const __m512i);
-            let b0 = _mm512_loadu_si512(bc.as_ptr().add(k) as *const __m512i);
-            let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
-
-            let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
-            let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
-            u0_acc.mul_acc(f_even, b_even);
-
-            let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
-            let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
-            let f_sum = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
-            let b0s = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
-            let b1s = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
-            let b_sum = _mm512_shuffle_i32x4::<0x88>(b0s, b1s);
-            u2_acc.mul_acc(f_sum, b_sum);
-
-            y_acc.mul_acc(f0, b0);
-            y_acc.mul_acc(f1, b1);
-
-            k += 8;
-        }
-
-        let mut u0 = u0_acc.fold().reduce();
-        let mut u2 = u2_acc.fold().reduce();
-        let mut y = y_acc.fold().reduce();
-
-        while k + 1 < len {
-            let f0 = fc[k];
-            let f1 = fc[k + 1];
-            let b0 = bc[k];
-            let b1 = bc[k + 1];
-            let e0 = f0 * b0;
-            u0 += e0;
-            u2 += (f0 + f1) * (b0 + b1);
-            y += e0 + f1 * b1;
-            k += 2;
-        }
-
-        (u0, u2, y)
-    }
-}
-
-#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn glue_block_x4(acc: &mut [F128], src: &[F128], alpha: F128) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
-    use core::arch::x86_64::*;
-    debug_assert_eq!(acc.len(), src.len());
-    unsafe {
-        let ab = _mm512_broadcast_i32x4(_mm_set_epi64x(alpha.hi as i64, alpha.lo as i64));
-        let ab_x64 = ghash_shift64_x4(ab);
-        let lanes = acc.len() & !3;
-        let mut i = 0usize;
-        while i < lanes {
-            let a = _mm512_loadu_si512(acc.as_ptr().add(i) as *const __m512i);
-            let v = _mm512_loadu_si512(src.as_ptr().add(i) as *const __m512i);
-            _mm512_storeu_si512(
-                acc.as_mut_ptr().add(i) as *mut __m512i,
-                _mm512_xor_si512(a, ghash_mul_x4_split(v, ab, ab_x64)),
-            );
-            i += 4;
-        }
-        while i < acc.len() {
-            acc[i] += alpha * src[i];
-            i += 1;
-        }
-    }
-}
-
-#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-fn open_ood_x4_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_OOD_X4").is_none());
-    *ON
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
-    f: &[F128],
-    b: &[F128],
-    base: usize,
-    fc: &mut [F128],
-    bc: &mut [F128],
-    r: F128,
-    r_x4: core::arch::x86_64::__m512i,
-    r_x64: core::arch::x86_64::__m512i,
-    stream: bool,
-    deferred: Option<(&[F128], F128)>,
-    ood: Option<(&[F128], F128)>,
-) -> (F128, F128) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, WideGhashX4};
-    use core::arch::x86_64::*;
-
-    let len = fc.len();
-    debug_assert_eq!(bc.len(), len);
-    debug_assert!(len.is_multiple_of(2));
-    if CORR {
-        if let Some((basis, _)) = deferred {
-            debug_assert!(basis.len() >= 2 * (base + len));
-        }
-        if let Some((eq_lo, _)) = ood {
-            debug_assert!(eq_lo.len() >= len);
-        }
-    }
-
-    unsafe {
-        let mut u0_acc = WideGhashX4::zero();
-        let mut u2_acc = WideGhashX4::zero();
-        let f_ptr = f.as_ptr();
-        let b_ptr = b.as_ptr();
-        let fc_ptr = fc.as_mut_ptr();
-        let bc_ptr = bc.as_mut_ptr();
-        let dst_aligned =
-            (fc_ptr as usize).is_multiple_of(16) && (bc_ptr as usize).is_multiple_of(16);
-
-        let deferred_vec = if CORR {
-            use crate::field::gf2_128::x86_64::ghash_shift64_x4;
-            deferred.map(|(basis, alpha)| {
-                let ax = _mm512_broadcast_i32x4(_mm_set_epi64x(alpha.hi as i64, alpha.lo as i64));
-                (basis.as_ptr(), ax, ghash_shift64_x4(ax))
-            })
-        } else {
-            None
-        };
-        let ood_vec = if CORR {
-            use crate::field::gf2_128::x86_64::ghash_shift64_x4;
-            ood.map(|(eq_lo, scale)| {
-                let sx = _mm512_broadcast_i32x4(_mm_set_epi64x(scale.hi as i64, scale.lo as i64));
-                (eq_lo.as_ptr(), sx, ghash_shift64_x4(sx))
-            })
-        } else {
-            None
-        };
-
-        let fold4 = |ptr: *const F128, source: usize| -> __m512i {
-            let lo = _mm512_loadu_si512(ptr.add(source) as *const __m512i);
-            let hi = _mm512_loadu_si512(ptr.add(source + 4) as *const __m512i);
-            let even = _mm512_shuffle_i32x4::<0x88>(lo, hi);
-            let odd = _mm512_shuffle_i32x4::<0xDD>(lo, hi);
-            _mm512_xor_si512(
-                even,
-                ghash_mul_x4_split(_mm512_xor_si512(even, odd), r_x4, r_x64),
-            )
-        };
-        let store4 = |value: __m512i, ptr: *mut F128| {
-            if stream && dst_aligned {
-                _mm_stream_si128(
-                    ptr.cast::<__m128i>(),
-                    _mm512_extracti32x4_epi32::<0>(value),
-                );
-                _mm_stream_si128(
-                    ptr.add(1).cast::<__m128i>(),
-                    _mm512_extracti32x4_epi32::<1>(value),
-                );
-                _mm_stream_si128(
-                    ptr.add(2).cast::<__m128i>(),
-                    _mm512_extracti32x4_epi32::<2>(value),
-                );
-                _mm_stream_si128(
-                    ptr.add(3).cast::<__m128i>(),
-                    _mm512_extracti32x4_epi32::<3>(value),
-                );
-            } else {
-                _mm512_storeu_si512(ptr.cast::<__m512i>(), value);
-            }
-        };
-
-        let defer_one = if CORR {
-            deferred.and_then(|(basis, alpha)| {
-                (alpha == F128::ONE && open_defer_one_xor_enabled()).then_some(basis.as_ptr())
-            })
-        } else {
-            None
-        };
-        let fold4_sum = |p: *const F128, q: *const F128, source: usize| -> __m512i {
-            let lo = _mm512_xor_si512(
-                _mm512_loadu_si512(p.add(source) as *const __m512i),
-                _mm512_loadu_si512(q.add(source) as *const __m512i),
-            );
-            let hi = _mm512_xor_si512(
-                _mm512_loadu_si512(p.add(source + 4) as *const __m512i),
-                _mm512_loadu_si512(q.add(source + 4) as *const __m512i),
-            );
-            let even = _mm512_shuffle_i32x4::<0x88>(lo, hi);
-            let odd = _mm512_shuffle_i32x4::<0xDD>(lo, hi);
-            _mm512_xor_si512(
-                even,
-                ghash_mul_x4_split(_mm512_xor_si512(even, odd), r_x4, r_x64),
-            )
-        };
-
-        let mut t = 0usize;
-        while t + 8 <= len {
-            let f0 = fold4(f_ptr, 2 * (base + t));
-            let f1 = fold4(f_ptr, 2 * (base + t + 4));
-            let (mut b0, mut b1) = match defer_one {
-                Some(dptr) => (
-                    fold4_sum(b_ptr, dptr, 2 * (base + t)),
-                    fold4_sum(b_ptr, dptr, 2 * (base + t + 4)),
-                ),
-                None => (fold4(b_ptr, 2 * (base + t)), fold4(b_ptr, 2 * (base + t + 4))),
-            };
-            if CORR {
-                if let (None, Some((dptr, ax, ax64))) = (defer_one, deferred_vec) {
-                    b0 = _mm512_xor_si512(
-                        b0,
-                        ghash_mul_x4_split(fold4(dptr, 2 * (base + t)), ax, ax64),
-                    );
-                    b1 = _mm512_xor_si512(
-                        b1,
-                        ghash_mul_x4_split(fold4(dptr, 2 * (base + t + 4)), ax, ax64),
-                    );
-                }
-                if let Some((eptr, sx, sx64)) = ood_vec {
-                    let e0 = _mm512_loadu_si512(eptr.add(t) as *const __m512i);
-                    let e1 = _mm512_loadu_si512(eptr.add(t + 4) as *const __m512i);
-                    b0 = _mm512_xor_si512(b0, ghash_mul_x4_split(e0, sx, sx64));
-                    b1 = _mm512_xor_si512(b1, ghash_mul_x4_split(e1, sx, sx64));
-                }
-            }
-
-            let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
-            let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
-            u0_acc.mul_acc(f_even, b_even);
-
-            let f0_sum = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
-            let f1_sum = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
-            let f_sum = _mm512_shuffle_i32x4::<0x88>(f0_sum, f1_sum);
-            let b0_sum = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
-            let b1_sum = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
-            let b_sum = _mm512_shuffle_i32x4::<0x88>(b0_sum, b1_sum);
-            u2_acc.mul_acc(f_sum, b_sum);
-
-            store4(f0, fc_ptr.add(t));
-            store4(f1, fc_ptr.add(t + 4));
-            store4(b0, bc_ptr.add(t));
-            store4(b1, bc_ptr.add(t + 4));
-            t += 8;
-        }
-
-        let mut u0 = u0_acc.fold().reduce();
-        let mut u2 = u2_acc.fold().reduce();
-        while t + 1 < len {
-            let source = 2 * (base + t);
-            let f0 = *f_ptr.add(source) + r * (*f_ptr.add(source) + *f_ptr.add(source + 1));
-            let f1 = *f_ptr.add(source + 2) + r * (*f_ptr.add(source + 2) + *f_ptr.add(source + 3));
-            let mut b0 = *b_ptr.add(source) + r * (*b_ptr.add(source) + *b_ptr.add(source + 1));
-            let mut b1 = *b_ptr.add(source + 2) + r * (*b_ptr.add(source + 2) + *b_ptr.add(source + 3));
-            if CORR {
-                if let Some((basis, alpha)) = deferred {
-                    let dptr = basis.as_ptr();
-                    let d0 = *dptr.add(source) + r * (*dptr.add(source) + *dptr.add(source + 1));
-                    let d1 =
-                        *dptr.add(source + 2) + r * (*dptr.add(source + 2) + *dptr.add(source + 3));
-                    b0 += alpha * d0;
-                    b1 += alpha * d1;
-                }
-                if let Some((eq_lo, scale)) = ood {
-                    b0 += scale * *eq_lo.as_ptr().add(t);
-                    b1 += scale * *eq_lo.as_ptr().add(t + 1);
-                }
-            }
-            *fc_ptr.add(t) = f0;
-            *fc_ptr.add(t + 1) = f1;
-            *bc_ptr.add(t) = b0;
-            *bc_ptr.add(t + 1) = b1;
-            u0 += f0 * b0;
-            u2 += (f0 + f1) * (b0 + b1);
-            t += 2;
-        }
-        if stream && dst_aligned {
-            _mm_sfence();
-        }
-        (u0, u2)
-    }
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-fn c4_eq_reuse_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_C4_NO_EQREUSE").is_none());
-    *ON
-}
-
-thread_local! {
-    static C4_EQ_SPARE: std::cell::RefCell<Vec<Vec<F128>>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-fn c4_eq_spare_put(v: Vec<F128>) {
-    if c4_eq_reuse_enabled() && v.capacity() >= 64 {
-        C4_EQ_SPARE.with(|s| {
-            let mut s = s.borrow_mut();
-            if s.len() < 2 {
-                s.push(v);
-            }
-        });
-    }
-}
-
-fn c4_build_eq_table(point: &[F128]) -> Vec<F128> {
-    let n = 1usize << point.len();
-    if c4_eq_reuse_enabled() {
-        let spare = C4_EQ_SPARE.with(|s| {
-            let mut s = s.borrow_mut();
-            let i = s.iter().position(|v| v.capacity() >= n)?;
-            Some(s.swap_remove(i))
-        });
-        if let Some(mut v) = spare {
-            crate::lincheck::build_eq_table_into(point, &mut v);
-            return v;
-        }
-    }
-    build_eq_table(point)
-}
-
-fn c4_fold_team_max() -> usize {
-    static MAX: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        std::env::var("FLOCK_C4_FOLDTEAM_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(16)
-    });
-    *MAX
-}
-
-fn c4_small_sub() -> usize {
-    static SUB: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        std::env::var("FLOCK_C4_SMALL_SUB").ok().and_then(|v| v.parse().ok()).unwrap_or(512)
-    });
-    *SUB
-}
-
-#[inline]
-fn c4_fold_team(n_chunks: usize) -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_C4_NO_FOLDTEAM").is_none());
-    *ON && n_chunks >= 2
-        && n_chunks <= c4_fold_team_max()
-        && crate::flat_par::team_enabled()
-        && crate::flat_par::team_ready()
-}
-
-fn c4_fold_wants_team(f_len: usize) -> bool {
-    let half = f_len / 2;
-    if half >= 4096 {
-        half.div_ceil(2048) <= c4_fold_team_max()
-    } else {
-        let sub = c4_small_sub();
-        sub >= 2 && half.is_multiple_of(sub) && half / sub >= 2
-    }
-}
-
-fn c4_join_swap_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_C4_NO_JOINSWAP").is_none());
-    *ON
-}
-
-fn open_nt_min_half_x86() -> usize {
-    static MIN: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        if std::env::var_os("FLOCK_OPEN_NT_17").is_some() {
-            1usize << 17
-        } else {
-            1usize << 21
-        }
-    });
-    *MIN
-}
-
-fn open_defer_one_xor_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_DEFER_ONE_XOR").is_none());
-    *ON
-}
-
-fn fold_and_msg_lsb(
-    f: &[F128],
-    b: &[F128],
-    r: F128,
-    arena: Option<&mut FoldArena>,
-) -> (FoldBuf, FoldBuf, SumcheckMessage) {
-    fold_and_msg_lsb_inner(f, b, r, arena, None, None)
-}
-
-fn fold_and_msg_lsb_inner(
-    f: &[F128],
-    b: &[F128],
-    r: F128,
-    arena: Option<&mut FoldArena>,
-    lazy_ood: Option<(&[F128], &[F128], F128)>,
-    deferred_basis: Option<(&[F128], F128)>,
-) -> (FoldBuf, FoldBuf, SumcheckMessage) {
+/// Fused fold + next-round message in a SINGLE parallel pass.
+///
+/// Replaces the three separate passes a sumcheck fold otherwise needs
+/// (`partial_eval_lsb_one(f)` + `partial_eval_lsb_one(b)` + `round_msg_lsb`):
+/// each chunk folds its slice of `f` and `b` at `r` (LSB variable) AND
+/// accumulates that slice's `(u_0, u_2)` contribution to the message for the
+/// *next* round — over the freshly-folded values, computed while they are
+/// still in registers. One fork-join instead of three, and ~⅓ less memory
+/// traffic (the folded arrays are not re-read to build the message).
+///
+/// Returns `(folded_f, folded_b, next_msg)` where `next_msg = round_msg_lsb
+/// (folded_f, folded_b)`. Bit-identical to the unfused sequence.
+fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
     use rayon::prelude::*;
     let n = f.len();
     debug_assert!(n.is_power_of_two() && n >= 2);
     debug_assert_eq!(b.len(), n);
     let half = n / 2;
-    if let Some((eq_lo, eq_hi, _)) = lazy_ood {
-        assert!(eq_lo.len().is_power_of_two() && eq_lo.len() >= 2);
-        assert!(eq_hi.len().is_power_of_two());
-        assert_eq!(half, eq_lo.len() * eq_hi.len());
-    }
-    if let Some((basis, _)) = deferred_basis {
-        assert_eq!(basis.len(), n, "deferred basis fold shape changed");
-    }
+    let one_plus_r = F128::ONE + r;
+
     const PAR_THRESHOLD: usize = 4096;
     if half < PAR_THRESHOLD {
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq"
-        ))]
-        if half >= 2 && lazy_ood.is_none_or(|(eq_lo, eq_hi, _)| eq_hi.len() == 1 && eq_lo.len() >= half) {
-            let mut nf = crate::alloc_uninit_f128_vec(half);
-            let mut nb = crate::alloc_uninit_f128_vec(half);
-            let sub = c4_small_sub();
-            if sub >= 2 && sub.is_multiple_of(2) && half.is_multiple_of(sub) && half / sub >= 2 && c4_fold_team(half / sub) {
-                let (nf_addr, nb_addr) = (nf.as_mut_ptr() as usize, nb.as_mut_ptr() as usize);
-                let (u_0, u_2) = crate::flat_par::team_map_reduce(
-                    half / sub,
-                    |ci| unsafe {
-                        use crate::field::gf2_128::x86_64::ghash_shift64_x4;
-                        use core::arch::x86_64::*;
-                        let base = ci * sub;
-                        let fc = core::slice::from_raw_parts_mut((nf_addr as *mut F128).add(base), sub);
-                        let bc = core::slice::from_raw_parts_mut((nb_addr as *mut F128).add(base), sub);
-                        let r_x4 = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
-                        let r_x64 = ghash_shift64_x4(r_x4);
-                        if lazy_ood.is_none() && deferred_basis.is_none() {
-                            fold_and_msg_chunk_x86::<false>(f, b, base, fc, bc, r, r_x4, r_x64, false, None, None)
-                        } else {
-                            let ood = lazy_ood.map(|(eq_lo, eq_hi, gamma)| (&eq_lo[base..], gamma * eq_hi[0]));
-                            fold_and_msg_chunk_x86::<true>(f, b, base, fc, bc, r, r_x4, r_x64, false, deferred_basis, ood)
-                        }
-                    },
-                    || (F128::ZERO, F128::ZERO),
-                    |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
-                );
-                return (FoldBuf::Owned(nf), FoldBuf::Owned(nb), SumcheckMessage { u_0, u_2 });
-            }
-            let (u_0, u_2) = unsafe {
-                use crate::field::gf2_128::x86_64::ghash_shift64_x4;
-                use core::arch::x86_64::*;
-                let r_x4 = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
-                let r_x64 = ghash_shift64_x4(r_x4);
-                if lazy_ood.is_none() && deferred_basis.is_none() {
-                    fold_and_msg_chunk_x86::<false>(
-                        f, b, 0, &mut nf, &mut nb, r, r_x4, r_x64, false, None, None,
-                    )
-                } else {
-                    let ood = lazy_ood.map(|(eq_lo, eq_hi, gamma)| (eq_lo, gamma * eq_hi[0]));
-                    fold_and_msg_chunk_x86::<true>(
-                        f,
-                        b,
-                        0,
-                        &mut nf,
-                        &mut nb,
-                        r,
-                        r_x4,
-                        r_x64,
-                        false,
-                        deferred_basis,
-                        ood,
-                    )
-                }
-            };
-            return (
-                FoldBuf::Owned(nf),
-                FoldBuf::Owned(nb),
-                SumcheckMessage { u_0, u_2 },
-            );
-        }
         let mut nf = Vec::with_capacity(half);
         let mut nb = Vec::with_capacity(half);
-        let defer_one = deferred_basis
-            .filter(|&(_, alpha)| alpha == F128::ONE && open_defer_one_xor_enabled())
-            .map(|(basis, _)| basis);
         for j in 0..half {
-            let f0 = f[2 * j];
-            let f1 = f[2 * j + 1];
-            let b0 = b[2 * j];
-            let b1 = b[2 * j + 1];
-            nf.push(f0 + r * (f0 + f1));
-            if let Some(basis) = defer_one {
-                let s0 = b0 + basis[2 * j];
-                let s1 = b1 + basis[2 * j + 1];
-                nb.push(s0 + r * (s0 + s1));
-                continue;
-            }
-            let mut folded_b = b0 + r * (b0 + b1);
-            if let Some((basis, alpha)) = deferred_basis {
-                let d0 = basis[2 * j];
-                let d1 = basis[2 * j + 1];
-                folded_b += alpha * (d0 + r * (d0 + d1));
-            }
-            nb.push(folded_b);
+            nf.push(f[2 * j] * one_plus_r + f[2 * j + 1] * r);
+            nb.push(b[2 * j] * one_plus_r + b[2 * j + 1] * r);
         }
-        if let Some((eq_lo, eq_hi, gamma)) = lazy_ood {
-            for (j, value) in nb.iter_mut().enumerate() {
-                *value += gamma * eq_hi[j / eq_lo.len()] * eq_lo[j % eq_lo.len()];
-            }
+        let mut u_0 = F128::ZERO;
+        let mut u_2 = F128::ZERO;
+        let mut k = 0;
+        while k + 1 < half {
+            let f0 = nf[k];
+            let f1 = nf[k + 1];
+            let b0 = nb[k];
+            let b1 = nb[k + 1];
+            u_0 += f0 * b0;
+            u_2 += (f0 + f1) * (b0 + b1);
+            k += 2;
         }
-        #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-        let (u_0, u_2) = unsafe { msg_reduce_avx512(&nf, &nb) };
-        #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
-        let (u_0, u_2) = {
-            let mut u_0 = F128::ZERO;
-            let mut u_2 = F128::ZERO;
-            let mut k = 0;
-            while k + 1 < half {
-                let f0 = nf[k];
-                let f1 = nf[k + 1];
-                let b0 = nb[k];
-                let b1 = nb[k + 1];
-                u_0 += f0 * b0;
-                u_2 += (f0 + f1) * (b0 + b1);
-                k += 2;
-            }
-            (u_0, u_2)
-        };
-        return (
-            FoldBuf::Owned(nf),
-            FoldBuf::Owned(nb),
-            SumcheckMessage { u_0, u_2 },
-        );
+        return (nf, nb, SumcheckMessage { u_0, u_2 });
     }
 
+    // Parallel path: `half` is a power of two ≥ PAR_THRESHOLD and CHUNK is a
+    // power of two, so every chunk has even length and starts at an even
+    // global index — message pairs (2k, 2k+1) never straddle a chunk boundary.
     const CHUNK: usize = 2048;
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    let use_nt = lazy_ood.is_none()
-        && deferred_basis.is_none()
-        && half >= (1usize << 21)
-        && !crate::sl2_env_set!("FLOCK_NO_OPEN_NT");
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    let use_nt = lazy_ood.is_none()
-        && deferred_basis.is_none()
-        && half >= open_nt_min_half_x86()
-        && !crate::sl2_env_set!("FLOCK_NO_OPEN_NT");
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    let (r_x4, r_x64) = unsafe {
-        use crate::field::gf2_128::x86_64::ghash_shift64_x4;
-        use core::arch::x86_64::*;
-        let r_x4 = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
-        (r_x4, ghash_shift64_x4(r_x4))
-    };
-
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    let use_soa =
-        lazy_ood.is_none() && deferred_basis.is_none() && cfg!(target_feature = "sha3") && {
-            static SOA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-                std::env::var_os("FLOCK_NO_OPEN_SUMCHECK_OPT").is_none()
-            });
-            *SOA
-        };
-    let (mut nf, mut nb) = match arena.and_then(|a| a.carve_pair(half)) {
-        Some(pair) => pair,
-        None => {
-            #[cfg(target_arch = "x86_64")]
-            {
-                (
-                    FoldBuf::Owned(crate::scratch::take_f128(half)),
-                    FoldBuf::Owned(crate::scratch::take_f128(half)),
-                )
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                (
-                    FoldBuf::Owned(crate::alloc_uninit_f128_vec(half)),
-                    FoldBuf::Owned(crate::alloc_uninit_f128_vec(half)),
-                )
-            }
-        }
-    };
-    let (nf_s, nb_s): (&mut [F128], &mut [F128]) = (&mut nf, &mut nb);
-    if let Some((eq_lo, _, _)) = lazy_ood {
-        assert_eq!(eq_lo.len(), CHUNK, "ranked lazy OOD chunk width changed");
-    }
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    {
-        let n_chunks = half.div_ceil(CHUNK);
-        if c4_fold_team(n_chunks) {
-            let (nf_addr, nb_addr) = (nf_s.as_mut_ptr() as usize, nb_s.as_mut_ptr() as usize);
-            let (u_0, u_2) = crate::flat_par::team_map_reduce(
-                n_chunks,
-                |ci| {
-                    let base = ci * CHUNK;
-                    let len = CHUNK.min(half - base);
-                    let (fc, bc) = unsafe {
-                        (
-                            core::slice::from_raw_parts_mut((nf_addr as *mut F128).add(base), len),
-                            core::slice::from_raw_parts_mut((nb_addr as *mut F128).add(base), len),
-                        )
-                    };
-                    unsafe {
-                        if lazy_ood.is_none() && deferred_basis.is_none() {
-                            fold_and_msg_chunk_x86::<false>(
-                                f, b, base, fc, bc, r, r_x4, r_x64, use_nt, None, None,
-                            )
-                        } else {
-                            let ood = lazy_ood.map(|(eq_lo, eq_hi, gamma)| (eq_lo, gamma * eq_hi[ci]));
-                            fold_and_msg_chunk_x86::<true>(
-                                f, b, base, fc, bc, r, r_x4, r_x64, false, deferred_basis, ood,
-                            )
-                        }
-                    }
-                },
-                || (F128::ZERO, F128::ZERO),
-                |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
-            );
-            return (nf, nb, SumcheckMessage { u_0, u_2 });
-        }
-    }
-    let (u_0, u_2) = nf_s
+    // On x86_64, pull the fold outputs from the prewarmed scratch pool (the
+    // prover gives the previous round's buffers back in `SumcheckProver::fold`),
+    // so the initial sumcheck reuses resident pages instead of faulting ~128 MB
+    // of fresh memory every round. On aarch64 this pooling measured slower, so
+    // there we allocate fresh each round.
+    #[cfg(target_arch = "x86_64")]
+    let (mut nf, mut nb) = (
+        crate::scratch::take_f128(half),
+        crate::scratch::take_f128(half),
+    );
+    #[cfg(not(target_arch = "x86_64"))]
+    let (mut nf, mut nb) = (
+        crate::alloc_uninit_f128_vec(half),
+        crate::alloc_uninit_f128_vec(half),
+    );
+    let (u_0, u_2) = nf
         .par_chunks_mut(CHUNK)
-        .zip(nb_s.par_chunks_mut(CHUNK))
+        .zip(nb.par_chunks_mut(CHUNK))
         .enumerate()
         .map(|(ci, (fc, bc))| {
             let base = ci * CHUNK;
-            #[cfg(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            ))]
-            {
-                if lazy_ood.is_none() && deferred_basis.is_none() {
-                    return unsafe {
-                        fold_and_msg_chunk_x86::<false>(
-                            f, b, base, fc, bc, r, r_x4, r_x64, use_nt, None, None,
-                        )
-                    };
-                }
-                return unsafe {
-                    let ood = lazy_ood.map(|(eq_lo, eq_hi, gamma)| (eq_lo, gamma * eq_hi[ci]));
-                    fold_and_msg_chunk_x86::<true>(
-                        f,
-                        b,
-                        base,
-                        fc,
-                        bc,
-                        r,
-                        r_x4,
-                        r_x64,
-                        false,
-                        deferred_basis,
-                        ood,
-                    )
-                };
+            let len = fc.len();
+            let mut u0 = F128::ZERO;
+            let mut u2 = F128::ZERO;
+            // Fold this slice, then pair up the just-folded values for the msg.
+            crate::field::f128_slice::fold_pairs(f, base, fc, r);
+            crate::field::f128_slice::fold_pairs(b, base, bc, r);
+            let mut k = 0;
+            while k + 1 < len {
+                let f0 = fc[k];
+                let f1 = fc[k + 1];
+                let b0 = bc[k];
+                let b1 = bc[k + 1];
+                u0 += f0 * b0;
+                u2 += (f0 + f1) * (b0 + b1);
+                k += 2;
             }
-            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-            {
-                if use_soa {
-                    return unsafe {
-                        if use_nt {
-                            fold_and_msg_chunk_nt_neon_soa::<true>(f, b, base, fc, bc, r)
-                        } else {
-                            fold_and_msg_chunk_nt_neon_soa::<false>(f, b, base, fc, bc, r)
-                        }
-                    };
-                }
-                if use_nt {
-                    return unsafe { fold_and_msg_chunk_nt_neon(f, b, base, fc, bc, r) };
-                }
-
-            }
-            #[cfg(not(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            )))]
-            {
-                let len = fc.len();
-                crate::field::f128_slice::fold_pairs(f, base, fc, r);
-                if let Some((basis, alpha)) = deferred_basis {
-                    crate::field::f128_slice::fold_pairs_with_scaled_addend(
-                        b, basis, base, bc, r, alpha,
-                    );
-                } else {
-                    crate::field::f128_slice::fold_pairs(b, base, bc, r);
-                }
-                if let Some((eq_lo, eq_hi, gamma)) = lazy_ood {
-                    let scale = gamma * eq_hi[ci];
-                    crate::field::f128_slice::add_scaled(bc, &eq_lo[..len], scale);
-                }
-                #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-                {
-                    let (u0, u2) = unsafe { msg_reduce_avx512(fc, bc) };
-                    (u0, u2)
-                }
-                #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
-                {
-                    let mut u0 = F128::ZERO;
-                    let mut u2 = F128::ZERO;
-                    let mut k = 0;
-                    while k + 1 < len {
-                        let f0 = fc[k];
-                        let f1 = fc[k + 1];
-                        let b0 = bc[k];
-                        let b1 = bc[k + 1];
-                        u0 += f0 * b0;
-                        u2 += (f0 + f1) * (b0 + b1);
-                        k += 2;
-                    }
-                    (u0, u2)
-                }
-            }
+            (u0, u2)
         })
         .reduce(
             || (F128::ZERO, F128::ZERO),
@@ -6056,2878 +2666,38 @@ fn fold_and_msg_lsb_inner(
     (nf, nb, SumcheckMessage { u_0, u_2 })
 }
 
-#[inline]
-fn eval_lookahead(coeffs: &[F128; 6], challenge: F128) -> SumcheckMessage {
-    let challenge_sq = challenge * challenge;
-    SumcheckMessage {
-        u_0: coeffs[0] + coeffs[1] * challenge + coeffs[2] * challenge_sq,
-        u_2: coeffs[3] + coeffs[4] * challenge + coeffs[5] * challenge_sq,
-    }
-}
-
-#[inline]
-fn eval_quadratic_tensor(coefficients: &[F128], challenges: &[F128]) -> F128 {
-    debug_assert_eq!(coefficients.len(), 3usize.pow(challenges.len() as u32));
-    coefficients
-        .iter()
-        .enumerate()
-        .fold(F128::ZERO, |sum, (mut index, &coefficient)| {
-            let mut weight = F128::ONE;
-            for &challenge in challenges.iter().rev() {
-                weight *= match index % 3 {
-                    0 => F128::ONE,
-                    1 => challenge,
-                    2 => challenge * challenge,
-                    _ => unreachable!(),
-                };
-                index /= 3;
-            }
-            sum + coefficient * weight
-        })
-}
-
-#[inline]
-fn eval_fold4_lookahead2(
-    coefficients: &super::Fold4Lookahead2,
-    r0: F128,
-    r1: F128,
-) -> SumcheckMessage {
-    SumcheckMessage {
-        u_0: eval_quadratic_tensor(&coefficients[..9], &[r0, r1]),
-        u_2: eval_quadratic_tensor(&coefficients[9..], &[r0, r1]),
-    }
-}
-
-#[inline]
-fn eval_fold4_lookahead3(
-    coefficients: &super::Fold4Lookahead3,
-    r0: F128,
-    r1: F128,
-    r2: F128,
-) -> SumcheckMessage {
-    SumcheckMessage {
-        u_0: eval_quadratic_tensor(&coefficients[..27], &[r0, r1, r2]),
-        u_2: eval_quadratic_tensor(&coefficients[27..], &[r0, r1, r2]),
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-fn mdf4_pf_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MDF4_PF").is_none());
-    *ON
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-#[inline]
-fn direct_fold4_b_gfni_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_FOLD4_B_GFNI").is_none());
-    *ON
-}
-
-#[cfg(any(
-    test,
-    all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    )
-))]
-#[inline]
-fn direct_fold4_b_gfni_shape(claims_len: usize, has_ordinary: bool, block_len: usize) -> bool {
-    claims_len == 2 && !has_ordinary && block_len.is_multiple_of(64)
-}
-
-#[inline]
-#[allow(dead_code)] // Reserved for the rollback DirectFold8 lookahead path.
-fn eval_fold8_lookahead4(
-    coefficients: &super::Fold8Lookahead4,
-    r0: F128,
-    r1: F128,
-    r2: F128,
-    r3: F128,
-) -> SumcheckMessage {
-    SumcheckMessage {
-        u_0: eval_quadratic_tensor(&coefficients[..81], &[r0, r1, r2, r3]),
-        u_2: eval_quadratic_tensor(&coefficients[81..], &[r0, r1, r2, r3]),
-    }
-}
-
-#[inline]
-#[allow(dead_code)] // Reserved for the rollback DirectFold8 lookahead path.
-fn eval_fold8_lookahead5(
-    coefficients: &super::Fold8Lookahead5,
-    r0: F128,
-    r1: F128,
-    r2: F128,
-    r3: F128,
-    r4: F128,
-) -> SumcheckMessage {
-    SumcheckMessage {
-        u_0: eval_quadratic_tensor(&coefficients[..243], &[r0, r1, r2, r3, r4]),
-        u_2: eval_quadratic_tensor(&coefficients[243..], &[r0, r1, r2, r3, r4]),
-    }
-}
-
-fn materialize_direct_fold4(
-    packed_witness: Vec<F128>,
-    ordinary_basis: Vec<F128>,
-    claims: &[super::ring_switch::DirectFold4Factors],
-    challenges: [F128; 4],
-) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
-    use rayon::prelude::*;
-
-    assert!(!claims.is_empty());
-    let has_ordinary = !ordinary_basis.is_empty();
-    assert!(!has_ordinary || ordinary_basis.len() == packed_witness.len());
-    assert!(packed_witness.len().is_multiple_of(16));
-    let [r0, r1, r2, r3] = challenges;
-
-    let fold_weight: [F128; 16] = std::array::from_fn(|bank| {
-        let mut weight = F128::ONE;
-        for (bit, &challenge) in challenges.iter().enumerate() {
-            weight *= if (bank >> bit) & 1 == 0 {
-                F128::ONE + challenge
-            } else {
-                challenge
-            };
-        }
-        weight
-    });
-    let direct_tables: Vec<Vec<F128>> = claims
-        .par_iter()
-        .map(|claim| {
-            super::ring_switch::build_direct_fold4_table(&claim.low_eq, &fold_weight, &claim.table)
-        })
-        .collect();
-
-    let out_len = packed_witness.len() / 16;
-    let block_len = claims[0].eq_lo.len();
-    assert!(block_len.is_multiple_of(4));
-    assert!(claims.iter().all(|claim| {
-        claim.eq_lo.len() == block_len && out_len == block_len * claim.eq_hi.len()
-    }));
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))]
-    let b_gfni_on = direct_fold4_b_gfni_enabled()
-        && direct_fold4_b_gfni_shape(claims.len(), has_ordinary, block_len);
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    )))]
-    let b_gfni_on = false;
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))]
-    let direct_gfni_rows: Vec<(Vec<u64>, Vec<u64>)> = if b_gfni_on {
-        claims
-            .par_iter()
-            .map(|claim| {
-                (
-                    claim.eq_lo.iter().map(|x| x.lo).collect(),
-                    claim.eq_lo.iter().map(|x| x.hi).collect(),
-                )
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))]
-    let direct_gfni_mats: Vec<super::ring_switch::GfniDirectFoldMap> = if b_gfni_on {
-        direct_tables
-            .par_iter()
-            .map(|table| super::ring_switch::build_gfni_direct_fold_map_from_table(table))
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    let table_len = super::ring_switch::FOLD_TABLE_TOTAL;
-    const SUB: usize = 256;
-    let deferred_reduce = super::fold_deferred_reduce_enabled();
-    let mut folded_f = crate::scratch::take_f128(out_len);
-    let mut folded_b = crate::scratch::take_f128(out_len);
-    let mid_len = if has_ordinary || !deferred_reduce {
-        4 * SUB
-    } else {
-        0
-    };
-    #[cfg(target_arch = "x86_64")]
-    let pf_on = mdf4_pf_enabled();
-    #[cfg(target_arch = "x86_64")]
-    let n_blocks = out_len / block_len;
-    let (u_0, u_2) = folded_b
-        .par_chunks_mut(block_len)
-        .zip(folded_f.par_chunks_mut(block_len))
-        .enumerate()
-        .map_init(
-            || {
-                (
-                    vec![F128::ZERO; if b_gfni_on { 0 } else { table_len }],
-                    vec![F128::ZERO; mid_len],
-                )
-            },
-            |(scratch, mid), (block, (b_out, f_out))| {
-                let start = 16 * block * block_len;
-                let f_in = &packed_witness[start..start + 16 * block_len];
-                #[cfg(target_arch = "x86_64")]
-                let (pf_base, pf_span) = if pf_on && block + 1 < n_blocks {
-                    let p = unsafe { packed_witness.as_ptr().add(start + 16 * block_len) };
-                    (
-                        p.cast::<u8>(),
-                        16 * block_len * core::mem::size_of::<F128>(),
-                    )
-                } else {
-                    (core::ptr::null::<u8>(), 0usize)
-                };
-                #[cfg(target_arch = "x86_64")]
-                let mut pf_at = 0usize;
-                if deferred_reduce {
-                    crate::field::f128_slice::fold16_banked(f_in, f_out, &fold_weight);
-                } else {
-                    let mut slot = 0usize;
-                    while slot < block_len {
-                        let n = SUB.min(block_len - slot);
-                        let mid = &mut mid[..4 * n];
-                        crate::field::f128_slice::fold4_nested(
-                            &f_in[16 * slot..16 * (slot + n)],
-                            mid,
-                            r0,
-                            r1,
-                        );
-                        crate::field::f128_slice::fold4_nested(
-                            mid,
-                            &mut f_out[slot..slot + n],
-                            r2,
-                            r3,
-                        );
-                        slot += n;
-                    }
-                }
-                if has_ordinary {
-                    let b_in = &ordinary_basis[start..start + 16 * block_len];
-                    let mut slot = 0usize;
-                    while slot < block_len {
-                        let n = SUB.min(block_len - slot);
-                        let mid = &mut mid[..4 * n];
-                        crate::field::f128_slice::fold4_nested(
-                            &b_in[16 * slot..16 * (slot + n)],
-                            mid,
-                            r0,
-                            r1,
-                        );
-                        crate::field::f128_slice::fold4_nested(
-                            mid,
-                            &mut b_out[slot..slot + n],
-                            r2,
-                            r3,
-                        );
-                        slot += n;
-                    }
-                }
-                #[cfg(all(
-                    target_arch = "x86_64",
-                    target_feature = "avx512f",
-                    target_feature = "avx512vbmi",
-                    target_feature = "vpclmulqdq",
-                    target_feature = "gfni"
-                ))]
-                if b_gfni_on {
-                    use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_four_maps_staged;
-                    use core::arch::x86_64::_mm512_setzero_si512;
-
-                    let (claim0, claim1) = (&claims[0], &claims[1]);
-                    let mut mats0_lo = core::mem::MaybeUninit::<[u64; 128]>::uninit();
-                    let mut mats0_hi = core::mem::MaybeUninit::<[u64; 128]>::uninit();
-                    let mut mats1_lo = core::mem::MaybeUninit::<[u64; 128]>::uninit();
-                    let mut mats1_hi = core::mem::MaybeUninit::<[u64; 128]>::uninit();
-                    unsafe {
-                        super::ring_switch::compose_block_mats_gfni_into(
-                            &direct_gfni_mats[0],
-                            claim0.eq_hi[block],
-                            &mut *mats0_lo.as_mut_ptr(),
-                            &mut *mats0_hi.as_mut_ptr(),
-                        );
-                        super::ring_switch::compose_block_mats_gfni_into(
-                            &direct_gfni_mats[1],
-                            claim1.eq_hi[block],
-                            &mut *mats1_lo.as_mut_ptr(),
-                            &mut *mats1_hi.as_mut_ptr(),
-                        );
-                    }
-                    let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
-                    let mut planes = unsafe { [_mm512_setzero_si512(); 16] };
-                    for slot in (0..block_len).step_by(64) {
-                        unsafe {
-                            gfni_fold64_four_maps_staged(
-                                rows0.0.as_ptr().add(slot).cast::<u8>(),
-                                &*mats0_lo.as_ptr(),
-                                rows0.1.as_ptr().add(slot).cast::<u8>(),
-                                &*mats0_hi.as_ptr(),
-                                rows1.0.as_ptr().add(slot).cast::<u8>(),
-                                &*mats1_lo.as_ptr(),
-                                rows1.1.as_ptr().add(slot).cast::<u8>(),
-                                &*mats1_hi.as_ptr(),
-                                b_out.as_mut_ptr().add(slot),
-                                planes.as_mut_ptr().cast::<core::arch::x86_64::__m512i>(),
-                            );
-                        }
-                    }
-                }
-                if !b_gfni_on {
-                    let table = &mut scratch[..table_len];
-                    let mut claims_iter = claims.iter().zip(direct_tables.iter());
-                    let (first, first_table) = claims_iter
-                        .next()
-                        .expect("materialize_direct_fold4: claims non-empty");
-                    super::ring_switch::compose_block_table(first_table, first.eq_hi[block], table);
-                    let mut s = 0usize;
-                    while s + 3 < block_len {
-                        #[cfg(target_arch = "x86_64")]
-                        if !pf_base.is_null() && pf_at < pf_span {
-                            unsafe {
-                                core::arch::x86_64::_mm_prefetch(
-                                    pf_base.add(pf_at).cast::<i8>(),
-                                    core::arch::x86_64::_MM_HINT_T1,
-                                );
-                            }
-                            pf_at += 64;
-                        }
-                        b_out[s] = super::ring_switch::fold_one_slot(first.eq_lo[s], table);
-                        b_out[s + 1] = super::ring_switch::fold_one_slot(first.eq_lo[s + 1], table);
-                        b_out[s + 2] = super::ring_switch::fold_one_slot(first.eq_lo[s + 2], table);
-                        b_out[s + 3] = super::ring_switch::fold_one_slot(first.eq_lo[s + 3], table);
-                        s += 4;
-                    }
-                    while s < block_len {
-                        b_out[s] = super::ring_switch::fold_one_slot(first.eq_lo[s], table);
-                        s += 1;
-                    }
-                    for (claim, direct_table) in claims_iter {
-                        super::ring_switch::compose_block_table(
-                            direct_table,
-                            claim.eq_hi[block],
-                            table,
-                        );
-                        let mut s = 0usize;
-                        while s + 3 < block_len {
-                            #[cfg(target_arch = "x86_64")]
-                            if !pf_base.is_null() && pf_at < pf_span {
-                                unsafe {
-                                    core::arch::x86_64::_mm_prefetch(
-                                        pf_base.add(pf_at).cast::<i8>(),
-                                        core::arch::x86_64::_MM_HINT_T1,
-                                    );
-                                }
-                                pf_at += 64;
-                            }
-                            b_out[s] += super::ring_switch::fold_one_slot(claim.eq_lo[s], table);
-                            b_out[s + 1] +=
-                                super::ring_switch::fold_one_slot(claim.eq_lo[s + 1], table);
-                            b_out[s + 2] +=
-                                super::ring_switch::fold_one_slot(claim.eq_lo[s + 2], table);
-                            b_out[s + 3] +=
-                                super::ring_switch::fold_one_slot(claim.eq_lo[s + 3], table);
-                            s += 4;
-                        }
-                        while s < block_len {
-                            b_out[s] += super::ring_switch::fold_one_slot(claim.eq_lo[s], table);
-                            s += 1;
-                        }
-                    }
-                }
-                #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-                {
-                    unsafe { msg_reduce_avx512(f_out, b_out) }
-                }
-                #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
-                {
-                    let mut u0 = F128::ZERO;
-                    let mut u2 = F128::ZERO;
-                    let mut k = 0;
-                    while k + 1 < f_out.len() {
-                        let f0 = f_out[k];
-                        let f1 = f_out[k + 1];
-                        let b0 = b_out[k];
-                        let b1 = b_out[k + 1];
-                        u0 += f0 * b0;
-                        u2 += (f0 + f1) * (b0 + b1);
-                        k += 2;
-                    }
-                    (u0, u2)
-                }
-            },
-        )
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
-        );
-    crate::scratch::give_f128(packed_witness);
-    if has_ordinary {
-        crate::scratch::give_f128(ordinary_basis);
-    }
-    (folded_f, folded_b, SumcheckMessage { u_0, u_2 })
-}
-
-#[allow(clippy::assign_op_pattern)] // Preserve the hand-scheduled indexed stores.
-fn materialize_direct_ab_fold2(
-    packed_witness: Vec<F128>,
-    ordinary_basis: Vec<F128>,
-    claims: &[super::ring_switch::DirectFold2Factors],
-    r0: F128,
-    r1: F128,
-) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
-    use rayon::prelude::*;
-
-    assert!(!claims.is_empty());
-    assert!(ordinary_basis.is_empty() || ordinary_basis.len() == packed_witness.len());
-    let fold_weight = [
-        (F128::ONE + r0) * (F128::ONE + r1),
-        r0 * (F128::ONE + r1),
-        (F128::ONE + r0) * r1,
-        r0 * r1,
-    ];
-    let direct_tables: Vec<Vec<F128>> = claims
-        .par_iter()
-        .map(|claim| {
-            super::ring_switch::build_direct_fold2_table(&claim.low_eq, &fold_weight, &claim.table)
-        })
-        .collect();
-
-    let out_len = packed_witness.len() / 4;
-    let block_len = claims[0].eq_lo.len();
-    assert!(block_len.is_multiple_of(2));
-    assert!(claims.iter().all(|claim| {
-        claim.eq_lo.len() == block_len && out_len == block_len * claim.eq_hi.len()
-    }));
-    let table_len = super::ring_switch::FOLD_TABLE_TOTAL;
-    let mut folded_f = crate::scratch::take_f128(out_len);
-    let mut folded_b = crate::scratch::take_f128(out_len);
-    let (u_0, u_2) = folded_b
-        .par_chunks_mut(block_len)
-        .zip(folded_f.par_chunks_mut(block_len))
-        .enumerate()
-        .map_init(
-            || {
-                crate::scratch::LocalBuf::new(
-                    if claims.len() == 2 {
-                        table_len
-                    } else {
-                        claims.len() * table_len
-                    },
-                    crate::scratch::fold_buf_pool_enabled(),
-                )
-            },
-            |scratch, (block, (b_out, f_out))| {
-                if claims.len() != 2 {
-                    for (claim_index, (claim, direct_table)) in
-                        claims.iter().zip(direct_tables.iter()).enumerate()
-                    {
-                        super::ring_switch::compose_block_table(
-                            direct_table,
-                            claim.eq_hi[block],
-                            &mut scratch[claim_index * table_len..(claim_index + 1) * table_len],
-                        );
-                    }
-                }
-                let start = 4 * block * block_len;
-                let f_in = &packed_witness[start..start + 4 * block_len];
-                let b_in = (!ordinary_basis.is_empty())
-                    .then(|| &ordinary_basis[start..start + 4 * block_len]);
-                crate::field::f128_slice::fold4_nested(f_in, f_out, r0, r1);
-                let fold4 = |input: &[F128], slot: usize| {
-                    let a0 = input[4 * slot];
-                    let a1 = input[4 * slot + 1];
-                    let a2 = input[4 * slot + 2];
-                    let a3 = input[4 * slot + 3];
-                    let low = a0 + r0 * (a0 + a1);
-                    let high = a2 + r0 * (a2 + a3);
-                    low + r1 * (low + high)
-                };
-                if let [only] = claims {
-                    let table = &scratch[..table_len];
-                    for pair in 0..(block_len / 2) {
-                        let slot0 = 2 * pair;
-                        let slot1 = slot0 + 1;
-                        let b0 = super::ring_switch::fold_one_slot(only.eq_lo[slot0], table)
-                            + b_in.map_or(F128::ZERO, |basis| fold4(basis, slot0));
-                        let b1 = super::ring_switch::fold_one_slot(only.eq_lo[slot1], table)
-                            + b_in.map_or(F128::ZERO, |basis| fold4(basis, slot1));
-                        b_out[slot0] = b0;
-                        b_out[slot1] = b1;
-                    }
-                } else if let [first, second] = claims {
-                    debug_assert!(b_in.is_none());
-                    let table = &mut scratch[..table_len];
-                    super::ring_switch::compose_block_table(
-                        &direct_tables[0],
-                        first.eq_hi[block],
-                        table,
-                    );
-                    let n_pairs = block_len / 2;
-                    let mut pair = 0usize;
-                    while pair + 1 < n_pairs {
-                        let s0 = 2 * pair;
-                        let s1 = s0 + 1;
-                        let s2 = s0 + 2;
-                        let s3 = s0 + 3;
-                        b_out[s0] = super::ring_switch::fold_one_slot(first.eq_lo[s0], table);
-                        b_out[s1] = super::ring_switch::fold_one_slot(first.eq_lo[s1], table);
-                        b_out[s2] = super::ring_switch::fold_one_slot(first.eq_lo[s2], table);
-                        b_out[s3] = super::ring_switch::fold_one_slot(first.eq_lo[s3], table);
-                        pair += 2;
-                    }
-                    if pair < n_pairs {
-                        let s0 = 2 * pair;
-                        let s1 = s0 + 1;
-                        b_out[s0] = super::ring_switch::fold_one_slot(first.eq_lo[s0], table);
-                        b_out[s1] = super::ring_switch::fold_one_slot(first.eq_lo[s1], table);
-                    }
-                    super::ring_switch::compose_block_table(
-                        &direct_tables[1],
-                        second.eq_hi[block],
-                        table,
-                    );
-                    pair = 0;
-                    while pair + 1 < n_pairs {
-                        let s0 = 2 * pair;
-                        let s1 = s0 + 1;
-                        let s2 = s0 + 2;
-                        let s3 = s0 + 3;
-                        b_out[s0] =
-                            b_out[s0] + super::ring_switch::fold_one_slot(second.eq_lo[s0], table);
-                        b_out[s1] =
-                            b_out[s1] + super::ring_switch::fold_one_slot(second.eq_lo[s1], table);
-                        b_out[s2] =
-                            b_out[s2] + super::ring_switch::fold_one_slot(second.eq_lo[s2], table);
-                        b_out[s3] =
-                            b_out[s3] + super::ring_switch::fold_one_slot(second.eq_lo[s3], table);
-                        pair += 2;
-                    }
-                    if pair < n_pairs {
-                        let s0 = 2 * pair;
-                        let s1 = s0 + 1;
-                        b_out[s0] =
-                            b_out[s0] + super::ring_switch::fold_one_slot(second.eq_lo[s0], table);
-                        b_out[s1] =
-                            b_out[s1] + super::ring_switch::fold_one_slot(second.eq_lo[s1], table);
-                    }
-                } else {
-                    for pair in 0..(block_len / 2) {
-                        let slot0 = 2 * pair;
-                        let slot1 = slot0 + 1;
-                        let direct_at = |slot: usize| {
-                            claims
-                                .iter()
-                                .enumerate()
-                                .map(|(claim_index, claim)| {
-                                    super::ring_switch::fold_one_slot(
-                                        claim.eq_lo[slot],
-                                        &scratch[claim_index * table_len
-                                            ..(claim_index + 1) * table_len],
-                                    )
-                                })
-                                .fold(F128::ZERO, |sum, value| sum + value)
-                        };
-                        let b0 =
-                            direct_at(slot0) + b_in.map_or(F128::ZERO, |basis| fold4(basis, slot0));
-                        let b1 =
-                            direct_at(slot1) + b_in.map_or(F128::ZERO, |basis| fold4(basis, slot1));
-                        b_out[slot0] = b0;
-                        b_out[slot1] = b1;
-                    }
-                }
-                #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-                {
-                    unsafe { msg_reduce_avx512(f_out, b_out) }
-                }
-                #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
-                {
-                    let mut u0 = F128::ZERO;
-                    let mut u2 = F128::ZERO;
-                    let mut k = 0;
-                    while k + 1 < f_out.len() {
-                        let f0 = f_out[k];
-                        let f1 = f_out[k + 1];
-                        let b0 = b_out[k];
-                        let b1 = b_out[k + 1];
-                        u0 += f0 * b0;
-                        u2 += (f0 + f1) * (b0 + b1);
-                        k += 2;
-                    }
-                    (u0, u2)
-                }
-            },
-        )
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
-        );
-    crate::scratch::give_f128(packed_witness);
-    if !ordinary_basis.is_empty() {
-        crate::scratch::give_f128(ordinary_basis);
-    }
-    (folded_f, folded_b, SumcheckMessage { u_0, u_2 })
-}
-
-#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-#[target_feature(enable = "aes")]
-unsafe fn fold_and_msg_chunk_nt_neon(
-    f: &[F128],
-    b: &[F128],
-    base: usize,
-    fc: &mut [F128],
-    bc: &mut [F128],
-    r: F128,
-) -> (F128, F128) {
-    use crate::field::gf2_128::aarch64::ghash_mul_vec2_neon;
-
-    #[inline(always)]
-    unsafe fn store_nt_pair(dst: *mut F128, v0: F128, v1: F128) {
-        unsafe {
-            let q0: core::arch::aarch64::uint8x16_t = core::mem::transmute(v0);
-            let q1: core::arch::aarch64::uint8x16_t = core::mem::transmute(v1);
-            core::arch::asm!(
-                "stnp {a:q}, {b:q}, [{p}]",
-                a = in(vreg) q0,
-                b = in(vreg) q1,
-                p = in(reg) dst,
-                options(nostack, preserves_flags)
-            );
-        }
-    }
-
-    let len = fc.len();
-    debug_assert_eq!(bc.len(), len);
-    debug_assert!(len.is_multiple_of(2));
-    let mut u0 = F128::ZERO;
-    let mut u2 = F128::ZERO;
-    unsafe {
-        let mut src_f = f.as_ptr().add(2 * base);
-        let mut src_b = b.as_ptr().add(2 * base);
-        let mut dst_f = fc.as_mut_ptr();
-        let mut dst_b = bc.as_mut_ptr();
-        let mut remaining = len / 2;
-        while remaining != 0 {
-            let fe0 = src_f.read();
-            let fo0 = src_f.add(1).read();
-            let fe1 = src_f.add(2).read();
-            let fo1 = src_f.add(3).read();
-            let be0 = src_b.read();
-            let bo0 = src_b.add(1).read();
-            let be1 = src_b.add(2).read();
-            let bo1 = src_b.add(3).read();
-
-            let pf = ghash_mul_vec2_neon(
-                [r, r],
-                [
-                    F128 {
-                        lo: fe0.lo ^ fo0.lo,
-                        hi: fe0.hi ^ fo0.hi,
-                    },
-                    F128 {
-                        lo: fe1.lo ^ fo1.lo,
-                        hi: fe1.hi ^ fo1.hi,
-                    },
-                ],
-            );
-            let pb = ghash_mul_vec2_neon(
-                [r, r],
-                [
-                    F128 {
-                        lo: be0.lo ^ bo0.lo,
-                        hi: be0.hi ^ bo0.hi,
-                    },
-                    F128 {
-                        lo: be1.lo ^ bo1.lo,
-                        hi: be1.hi ^ bo1.hi,
-                    },
-                ],
-            );
-            let f0 = F128 {
-                lo: fe0.lo ^ pf[0].lo,
-                hi: fe0.hi ^ pf[0].hi,
-            };
-            let f1 = F128 {
-                lo: fe1.lo ^ pf[1].lo,
-                hi: fe1.hi ^ pf[1].hi,
-            };
-            let b0 = F128 {
-                lo: be0.lo ^ pb[0].lo,
-                hi: be0.hi ^ pb[0].hi,
-            };
-            let b1 = F128 {
-                lo: be1.lo ^ pb[1].lo,
-                hi: be1.hi ^ pb[1].hi,
-            };
-
-            store_nt_pair(dst_f, f0, f1);
-            store_nt_pair(dst_b, b0, b1);
-
-            let g = ghash_mul_vec2_neon([f0, f0 + f1], [b0, b0 + b1]);
-            u0 += g[0];
-            u2 += g[1];
-
-            src_f = src_f.add(4);
-            src_b = src_b.add(4);
-            dst_f = dst_f.add(2);
-            dst_b = dst_b.add(2);
-            remaining -= 1;
-        }
-    }
-    (u0, u2)
-}
-
-#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-#[target_feature(enable = "aes,sha3")]
-unsafe fn fold_and_msg_chunk_nt_neon_soa<const NT: bool>(
-    f: &[F128],
-    b: &[F128],
-    base: usize,
-    fc: &mut [F128],
-    bc: &mut [F128],
-    r: F128,
-) -> (F128, F128) {
-    use core::arch::aarch64::*;
-
-    #[inline(always)]
-    unsafe fn pmull_lo(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
-        let d: uint64x2_t;
-        unsafe {
-            core::arch::asm!(
-                "pmull {d:v}.1q, {a:v}.1d, {b:v}.1d",
-                d = lateout(vreg) d,
-                a = in(vreg) a,
-                b = in(vreg) b,
-                options(pure, nomem, nostack, preserves_flags)
-            );
-        }
-        d
-    }
-    #[inline(always)]
-    unsafe fn pmull_hi(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
-        let d: uint64x2_t;
-        unsafe {
-            core::arch::asm!(
-                "pmull2 {d:v}.1q, {a:v}.2d, {b:v}.2d",
-                d = lateout(vreg) d,
-                a = in(vreg) a,
-                b = in(vreg) b,
-                options(pure, nomem, nostack, preserves_flags)
-            );
-        }
-        d
-    }
-
-    #[inline(always)]
-    unsafe fn mul2_kara_barrett_aos(
-        d_lo: uint64x2_t,
-        d_hi: uint64x2_t,
-        r_lo: uint64x2_t,
-        r_hi: uint64x2_t,
-        r_sum: uint64x2_t,
-        c87: uint64x2_t,
-    ) -> (uint64x2_t, uint64x2_t) {
-        unsafe {
-            let d_sum = veorq_u64(d_lo, d_hi);
-            let p0_0 = pmull_lo(d_lo, r_lo);
-            let p0_1 = pmull_hi(d_lo, r_lo);
-            let p2_0 = pmull_lo(d_hi, r_hi);
-            let p2_1 = pmull_hi(d_hi, r_hi);
-            let pm_0 = pmull_lo(d_sum, r_sum);
-            let pm_1 = pmull_hi(d_sum, r_sum);
-            let c_0 = veor3q_u64(pm_0, p0_0, p2_0);
-            let c_1 = veor3q_u64(pm_1, p0_1, p2_1);
-
-            let zero = vdupq_n_u64(0);
-            let lo_0 = veorq_u64(p0_0, vextq_u64::<1>(zero, c_0));
-            let hi_0 = veorq_u64(p2_0, vextq_u64::<1>(c_0, zero));
-            let lo_1 = veorq_u64(p0_1, vextq_u64::<1>(zero, c_1));
-            let hi_1 = veorq_u64(p2_1, vextq_u64::<1>(c_1, zero));
-
-            let rl_0 = pmull_lo(hi_0, c87);
-            let rh_0 = pmull_hi(hi_0, c87);
-            let rl_1 = pmull_lo(hi_1, c87);
-            let rh_1 = pmull_hi(hi_1, c87);
-            let cor_0 = pmull_hi(rh_0, c87);
-            let cor_1 = pmull_hi(rh_1, c87);
-
-            let res_0 = veor3q_u64(lo_0, rl_0, vzip1q_u64(cor_0, rh_0));
-            let res_1 = veor3q_u64(lo_1, rl_1, vzip1q_u64(cor_1, rh_1));
-            (res_0, res_1)
-        }
-    }
-
-    #[inline(always)]
-    unsafe fn store_pair_v<const NT: bool>(dst: *mut F128, v0: uint64x2_t, v1: uint64x2_t) {
-        unsafe {
-            if NT {
-                core::arch::asm!(
-                    "stnp {a:q}, {b:q}, [{p}]",
-                    a = in(vreg) v0,
-                    b = in(vreg) v1,
-                    p = in(reg) dst,
-                    options(nostack, preserves_flags)
-                );
-            } else {
-                core::arch::asm!(
-                    "stp {a:q}, {b:q}, [{p}]",
-                    a = in(vreg) v0,
-                    b = in(vreg) v1,
-                    p = in(reg) dst,
-                    options(nostack, preserves_flags)
-                );
-            }
-        }
-    }
-
-    let len = fc.len();
-    debug_assert_eq!(bc.len(), len);
-    debug_assert!(len.is_multiple_of(2));
-    unsafe {
-        let mut src_f = f.as_ptr().add(2 * base) as *const u64;
-        let mut src_b = b.as_ptr().add(2 * base) as *const u64;
-        let mut dst_f = fc.as_mut_ptr();
-        let mut dst_b = bc.as_mut_ptr();
-        let r_lo = vdupq_n_u64(r.lo);
-        let r_hi = vdupq_n_u64(r.hi);
-        let r_sum = vdupq_n_u64(r.lo ^ r.hi);
-        let c87 = vdupq_n_u64(0x87);
-        let mut acc_d0_0 = vdupq_n_u64(0);
-        let mut acc_d0_1 = vdupq_n_u64(0);
-        let mut acc_dm_0 = vdupq_n_u64(0);
-        let mut acc_dm_1 = vdupq_n_u64(0);
-        let mut acc_d2_0 = vdupq_n_u64(0);
-        let mut acc_d2_1 = vdupq_n_u64(0);
-        let mut remaining = len / 2;
-        while remaining != 0 {
-            let fe0 = vld1q_u64(src_f);
-            let fo0 = vld1q_u64(src_f.add(2));
-            let fe1 = vld1q_u64(src_f.add(4));
-            let fo1 = vld1q_u64(src_f.add(6));
-            let be0 = vld1q_u64(src_b);
-            let bo0 = vld1q_u64(src_b.add(2));
-            let be1 = vld1q_u64(src_b.add(4));
-            let bo1 = vld1q_u64(src_b.add(6));
-
-            let fd0 = veorq_u64(fe0, fo0);
-            let fd1 = veorq_u64(fe1, fo1);
-            let (pf0, pf1) = mul2_kara_barrett_aos(
-                vzip1q_u64(fd0, fd1),
-                vzip2q_u64(fd0, fd1),
-                r_lo,
-                r_hi,
-                r_sum,
-                c87,
-            );
-            let bd0 = veorq_u64(be0, bo0);
-            let bd1 = veorq_u64(be1, bo1);
-            let (pb0, pb1) = mul2_kara_barrett_aos(
-                vzip1q_u64(bd0, bd1),
-                vzip2q_u64(bd0, bd1),
-                r_lo,
-                r_hi,
-                r_sum,
-                c87,
-            );
-            let f0 = veorq_u64(fe0, pf0);
-            let f1 = veorq_u64(fe1, pf1);
-            let b0 = veorq_u64(be0, pb0);
-            let b1 = veorq_u64(be1, pb1);
-
-            store_pair_v::<NT>(dst_f, f0, f1);
-            store_pair_v::<NT>(dst_b, b0, b1);
-
-            let fs = veorq_u64(f0, f1);
-            let bs = veorq_u64(b0, b1);
-            let a_lo = vzip1q_u64(f0, fs);
-            let a_hi = vzip2q_u64(f0, fs);
-            let b_lo = vzip1q_u64(b0, bs);
-            let b_hi = vzip2q_u64(b0, bs);
-            let a_sum = veorq_u64(a_lo, a_hi);
-            let b_sum = veorq_u64(b_lo, b_hi);
-            acc_d0_0 = veorq_u64(acc_d0_0, pmull_lo(a_lo, b_lo));
-            acc_d0_1 = veorq_u64(acc_d0_1, pmull_hi(a_lo, b_lo));
-            acc_dm_0 = veorq_u64(acc_dm_0, pmull_lo(a_sum, b_sum));
-            acc_dm_1 = veorq_u64(acc_dm_1, pmull_hi(a_sum, b_sum));
-            acc_d2_0 = veorq_u64(acc_d2_0, pmull_lo(a_hi, b_hi));
-            acc_d2_1 = veorq_u64(acc_d2_1, pmull_hi(a_hi, b_hi));
-
-            src_f = src_f.add(8);
-            src_b = src_b.add(8);
-            dst_f = dst_f.add(2);
-            dst_b = dst_b.add(2);
-            remaining -= 1;
-        }
-
-        #[inline(always)]
-        unsafe fn finish(d0: uint64x2_t, dm: uint64x2_t, d2: uint64x2_t) -> F128 {
-            unsafe {
-                let c = veor3q_u64(dm, d0, d2);
-                crate::field::gf2_128::ghash_reduce(
-                    vgetq_lane_u64::<0>(d0),
-                    vgetq_lane_u64::<1>(d0) ^ vgetq_lane_u64::<0>(c),
-                    vgetq_lane_u64::<0>(d2) ^ vgetq_lane_u64::<1>(c),
-                    vgetq_lane_u64::<1>(d2),
-                )
-            }
-        }
-        (
-            finish(acc_d0_0, acc_dm_0, acc_d2_0),
-            finish(acc_d0_1, acc_dm_1, acc_d2_1),
-        )
-    }
-}
-
-pub struct FoldArena {
-    ptr: std::ptr::NonNull<F128>,
-    cap: usize,
-    offset: usize,
-    parts: Vec<PrefaultPart>,
-    threads: Vec<std::thread::JoinHandle<()>>,
-}
-
-struct PrefaultPart {
-    start: usize,
-    end: usize,
-    done: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-}
-
-unsafe impl Send for FoldArena {}
-
-impl FoldArena {
-    pub fn capacity_for(l: usize, k: usize) -> usize {
-        debug_assert!(l.is_power_of_two());
-        debug_assert!(k >= 1 && k <= l.trailing_zeros() as usize);
-        2 * (l - (l >> k))
-    }
-
-    pub fn new_prefaulted(cap: usize) -> Self {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        assert!(cap > 0);
-        let layout = std::alloc::Layout::array::<F128>(cap).expect("FoldArena layout");
-        let raw = unsafe { std::alloc::alloc(layout) } as *mut F128;
-        let Some(ptr) = std::ptr::NonNull::new(raw) else {
-            std::alloc::handle_alloc_error(layout);
-        };
-        struct SendPtr(*mut u8);
-        unsafe impl Send for SendPtr {}
-
-        const PREFAULT_THREADS: usize = 3;
-        #[cfg(target_os = "macos")]
-        const STRIDE: usize = 16384;
-        #[cfg(not(target_os = "macos"))]
-        const STRIDE: usize = 4096;
-        const STRIDE_ELEMS: usize = STRIDE / core::mem::size_of::<F128>();
-        const CHUNK_ELEMS: usize = (4 << 20) / core::mem::size_of::<F128>();
-
-        let bound = |i: usize| -> usize {
-            let raw = cap * i / PREFAULT_THREADS;
-            (raw / STRIDE_ELEMS) * STRIDE_ELEMS
-        };
-        let mut parts = Vec::with_capacity(PREFAULT_THREADS);
-        let mut threads = Vec::with_capacity(PREFAULT_THREADS);
-        for i in 0..PREFAULT_THREADS {
-            let (start, end) = (
-                bound(i),
-                if i + 1 == PREFAULT_THREADS {
-                    cap
-                } else {
-                    bound(i + 1)
-                },
-            );
-            let done = Arc::new(AtomicUsize::new(start));
-            parts.push(PrefaultPart {
-                start,
-                end,
-                done: done.clone(),
-            });
-            if start >= end {
-                done.store(end, Ordering::Release);
-                continue;
-            }
-            let base = SendPtr(unsafe { raw.add(start) } as *mut u8);
-            let elems = end - start;
-            threads.push(std::thread::spawn(move || {
-                let base = base;
-                let mut e = 0usize;
-                while e < elems {
-                    let chunk_end = (e + CHUNK_ELEMS).min(elems);
-                    while e < chunk_end {
-                        unsafe {
-                            std::ptr::write_volatile(
-                                base.0.add(e * core::mem::size_of::<F128>()),
-                                0u8,
-                            )
-                        };
-                        e += STRIDE_ELEMS;
-                    }
-                    let e = e.min(elems);
-                    done.store(start + e, Ordering::Release);
-                }
-                done.store(end, Ordering::Release);
-            }));
-        }
-        Self {
-            ptr,
-            cap,
-            offset: 0,
-            parts,
-            threads,
-        }
-    }
-
-    fn carve_pair(&mut self, half: usize) -> Option<(FoldBuf, FoldBuf)> {
-        use std::sync::atomic::Ordering;
-        if self.cap - self.offset < 2 * half {
-            return None;
-        }
-        let (lo, hi) = (self.offset, self.offset + 2 * half);
-        let ready = self.parts.iter().all(|p| {
-            hi <= p.start || lo >= p.end || p.done.load(Ordering::Acquire) >= hi.min(p.end)
-        });
-        if !ready {
-            return None;
-        }
-        let a = unsafe { self.ptr.add(self.offset) };
-        let b = unsafe { self.ptr.add(self.offset + half) };
-        self.offset += 2 * half;
-        Some((
-            FoldBuf::Arena { ptr: a, len: half },
-            FoldBuf::Arena { ptr: b, len: half },
-        ))
-    }
-}
-
-impl Drop for FoldArena {
-    fn drop(&mut self) {
-        for h in self.threads.drain(..) {
-            let _ = h.join();
-        }
-        let layout = std::alloc::Layout::array::<F128>(self.cap).expect("FoldArena layout");
-        unsafe { std::alloc::dealloc(self.ptr.as_ptr() as *mut u8, layout) };
-    }
-}
-
-pub(crate) enum FoldBuf {
-    Owned(Vec<F128>),
-    Arena {
-        ptr: std::ptr::NonNull<F128>,
-        len: usize,
-    },
-}
-
-unsafe impl Send for FoldBuf {}
-unsafe impl Sync for FoldBuf {}
-
-impl Default for FoldBuf {
-    fn default() -> Self {
-        FoldBuf::Owned(Vec::new())
-    }
-}
-
-impl std::ops::Deref for FoldBuf {
-    type Target = [F128];
-    #[inline]
-    fn deref(&self) -> &[F128] {
-        match self {
-            FoldBuf::Owned(v) => v,
-            FoldBuf::Arena { ptr, len } => unsafe {
-                std::slice::from_raw_parts(ptr.as_ptr(), *len)
-            },
-        }
-    }
-}
-
-impl std::ops::DerefMut for FoldBuf {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut [F128] {
-        match self {
-            FoldBuf::Owned(v) => v,
-            FoldBuf::Arena { ptr, len } => unsafe {
-                std::slice::from_raw_parts_mut(ptr.as_ptr(), *len)
-            },
-        }
-    }
-}
-
-#[inline]
-fn ranked_l1_lazy_ood_eq_enabled(
-    config: &ProverConfig,
-    log_n: usize,
-    n_1: usize,
-    l1_ood_count: usize,
-    current_len: usize,
-    direct_fold4_mode: bool,
-) -> bool {
-    ranked_l1_lazy_ood_eq_selected(
-        config,
-        log_n,
-        n_1,
-        l1_ood_count,
-        current_len,
-        direct_fold4_mode,
-        cfg!(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq"
-        )),
-        crate::sl2_env_set!("FLOCK_NO_LIG_LAZY_OOD_EQ"),
-    )
-}
-
-#[inline]
-fn ranked_l1_lazy_ood_eq_selected(
-    config: &ProverConfig,
-    log_n: usize,
-    n_1: usize,
-    l1_ood_count: usize,
-    current_len: usize,
-    direct_fold4_mode: bool,
-    platform_supported: bool,
-    disabled: bool,
-) -> bool {
-    platform_supported
-        && !disabled
-        && direct_fold4_mode
-        && log_n == 25
-        && n_1 == 19
-        && current_len == (1usize << 19)
-        && l1_ood_count == 1
-        && config.initial_log_msg_cols == 19
-        && config.initial_log_num_interleaved == 6
-        && config.initial_k == 6
-        && config.log_inv_rates.first() == Some(&1)
-}
-
-#[inline]
-fn ranked_deep_lazy_ood_eq_enabled(
-    config: &ProverConfig,
-    log_n: usize,
-    n_level: usize,
-    level_ood_count: usize,
-    current_len: usize,
-    direct_fold4_mode: bool,
-) -> bool {
-    ranked_deep_lazy_ood_eq_selected(
-        config,
-        log_n,
-        n_level,
-        level_ood_count,
-        current_len,
-        direct_fold4_mode,
-        cfg!(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq"
-        )),
-        crate::sl2_env_set!("FLOCK_NO_LIG_LAZY_OOD_EQ")
-            || crate::sl2_env_set!("FLOCK_NO_LIG_LAZY_OOD_EQ_DEEP"),
-    )
-}
-
-#[inline]
-fn ranked_deep_lazy_ood_eq_selected(
-    config: &ProverConfig,
-    log_n: usize,
-    n_level: usize,
-    level_ood_count: usize,
-    current_len: usize,
-    direct_fold4_mode: bool,
-    platform_supported: bool,
-    disabled: bool,
-) -> bool {
-    platform_supported
-        && !disabled
-        && direct_fold4_mode
-        && log_n == 25
-        && matches!(n_level, 16 | 13 | 10 | 7)
-        && current_len == (1usize << n_level)
-        && level_ood_count == 1
-        && config.initial_log_msg_cols == 19
-        && config.initial_log_num_interleaved == 6
-        && config.initial_k == 6
-        && config.log_inv_rates.first() == Some(&1)
-}
-
-const ENV_NO_LIG_DEFER_INDUCED_GLUE: &str = "FLOCK_NO_LIG_DEFER_INDUCED_GLUE";
-const ENV_NO_OPEN_INDUCE_DUAL: &str = "FLOCK_NO_OPEN_INDUCE_DUAL";
-const ENV_NO_OPEN_INDUCE_DUAL2: &str = "FLOCK_NO_OPEN_INDUCE_DUAL2";
-const ENV_OPEN_INDUCE_DUAL_DEPTH: &str = "FLOCK_OPEN_INDUCE_DUAL_DEPTH";
-const ENV_NO_OPEN_INDUCE_DUAL_DEPTH2: &str = "FLOCK_NO_OPEN_INDUCE_DUAL_DEPTH2";
-const RANKED_SPARSE_DUAL_DEFAULT_DEPTH: usize = 2;
-/// Lane op: with the background materialization on, the ranked L0 dual has
-/// depth 3 = the first recursive level's fold count, so its basis is
-/// complete after that level's last fold and only has to be in the combined
-/// basis by the next level's first fold (see [`op_bg_dual_enabled`]). The
-/// depth only changes when the same basis is materialized (every depth is
-/// exact).
-const OP_BG_SPARSE_DUAL_DEPTH: usize = 3;
-
-/// Lane op (`FLOCK_NO_OP_BGDUAL=1`: incumbent depth 2, materialized inside
-/// the fold join): when the L0 sparse dual reaches its depth at the last
-/// fold of a non-final level, its merge into the combined basis is first read
-/// by the next level's first fold (the next commit, OOD, queries and duals
-/// read only `f`, their own bases and the transcript; the round's message
-/// takes only the dual's round delta, computed in the join as before). The
-/// transposed sparse NTT that materializes the basis then runs as a detached
-/// job on idle hot-pool spinners while the next commit drains, and the next
-/// level's first fold adds it to the combined basis while folding (alpha 1:
-/// `fold(b + basis)`, the same field values as merging first). Same round
-/// messages, same transcript, same bytes. Read once.
-fn op_bg_dual_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OP_BGDUAL").is_none());
-    *ON
-}
-const ENV_NO_DEEP_INDUCE_DUAL: &str = "FLOCK_NO_DEEP_INDUCE_DUAL";
-#[cfg(test)]
-thread_local! {
-    static SPARSE_DUAL_TEST_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static SPARSE_DUAL_DEEP_TEST_DEPTH: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
-}
-
-#[allow(clippy::too_many_arguments)]
-#[inline]
-fn ranked_deferred_induced_glue_selected(
-    config: &ProverConfig,
-    log_n: usize,
-    n_level: usize,
-    current_len: usize,
-    n_queries: usize,
-    log_inv_rate: usize,
-    lazy_ood: bool,
-    direct_fold8_mode: bool,
-    platform_supported: bool,
-    disabled: bool,
-) -> bool {
-    platform_supported
-        && !disabled
-        && lazy_ood
-        && direct_fold8_mode
-        && log_n == 25
-        && current_len == (1usize << n_level)
-        && matches!(
-            (n_level, n_queries, log_inv_rate),
-            (19, 218, 1) | (16, 106, 2) | (13, 71, 3) | (10, 53, 4) | (7, 43, 5)
-        )
-        && config.initial_log_msg_cols == 19
-        && config.initial_log_num_interleaved == 6
-        && config.initial_k == 6
-        && config.recursive_steps == 5
-        && config.recursive_log_msg_cols.as_slice() == [16, 13, 10, 7, 4]
-        && config.recursive_ks.as_slice() == [3, 3, 3, 3, 3]
-        && config.log_inv_rates.as_slice() == [1, 2, 3, 4, 5, 6]
-        && config.queries.as_slice() == [218, 106, 71, 53, 43, 36]
-        && config.grinding_bits.as_slice() == [0, 0, 0, 0, 0, 0]
-        && config.fold_grinding_bits.as_slice() == [19, 14, 11, 8, 6, 4]
-        && config.ood_samples.as_slice() == [0, 1, 1, 1, 1, 1]
-        && config.merkle_hash == HashKind::Blake3
-}
-
-#[allow(clippy::too_many_arguments)]
-#[inline]
-fn ranked_deferred_induced_glue_enabled(
-    config: &ProverConfig,
-    log_n: usize,
-    n_level: usize,
-    current_len: usize,
-    n_queries: usize,
-    log_inv_rate: usize,
-    lazy_ood: bool,
-    direct_fold8_mode: bool,
-) -> bool {
-    ranked_deferred_induced_glue_selected(
-        config,
-        log_n,
-        n_level,
-        current_len,
-        n_queries,
-        log_inv_rate,
-        lazy_ood,
-        direct_fold8_mode,
-        cfg!(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq"
-        )),
-        crate::sl2_env_set!(ENV_NO_LIG_DEFER_INDUCED_GLUE),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-#[inline]
-fn ranked_sparse_dual_l0_depth_selected(
-    config: &ProverConfig,
-    log_n: usize,
-    n_level: usize,
-    current_len: usize,
-    n_queries: usize,
-    log_inv_rate: usize,
-    lazy_ood: bool,
-    direct_fold8_mode: bool,
-    platform_supported: bool,
-    sparse_disabled: bool,
-    defer_disabled: bool,
-    depth: usize,
-) -> Option<usize> {
-    let selected = matches!(n_level, 19 | 16 | 13 | 10 | 7)
-        && ranked_deferred_induced_glue_selected(
-            config,
-            log_n,
-            n_level,
-            current_len,
-            n_queries,
-            log_inv_rate,
-            lazy_ood,
-            direct_fold8_mode,
-            platform_supported,
-            defer_disabled,
-        )
-        && !sparse_disabled;
-    if !selected {
-        return None;
-    }
-    assert!((1..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
-    Some(depth)
-}
-
-#[inline]
-fn ranked_sparse_dual_l0_depth_setting(
-    explicit_depth: Option<&str>,
-    depth2_disabled: bool,
-) -> usize {
-    let depth = explicit_depth
-        .map(|value| {
-            value
-                .parse::<usize>()
-                .expect("FLOCK_OPEN_INDUCE_DUAL_DEPTH must be 1, 2, 3, or 4")
-        })
-        .unwrap_or(if depth2_disabled {
-            SPARSE_DUAL_MAX_DEPTH
-        } else if op_bg_dual_enabled() {
-            OP_BG_SPARSE_DUAL_DEPTH
-        } else {
-            RANKED_SPARSE_DUAL_DEFAULT_DEPTH
-        });
-    assert!((1..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
-    depth
-}
-
-#[allow(clippy::too_many_arguments)]
-#[inline]
-fn ranked_sparse_dual_l0_depth(
-    config: &ProverConfig,
-    log_n: usize,
-    n_level: usize,
-    current_len: usize,
-    n_queries: usize,
-    log_inv_rate: usize,
-    lazy_ood: bool,
-    direct_fold8_mode: bool,
-) -> Option<usize> {
-    #[cfg(test)]
-    {
-        let forced = SPARSE_DUAL_TEST_DEPTH.with(std::cell::Cell::get);
-        if forced != 0 {
-            assert!((1..=SPARSE_DUAL_MAX_DEPTH).contains(&forced));
-            return Some(forced);
-        }
-    }
-    let sparse_disabled = crate::sl2_env_set!(ENV_NO_OPEN_INDUCE_DUAL)
-        || crate::sl2_env_set!(ENV_NO_OPEN_INDUCE_DUAL2);
-    let defer_disabled = crate::sl2_env_set!(ENV_NO_LIG_DEFER_INDUCED_GLUE);
-    let platform_supported = cfg!(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ));
-    if ranked_sparse_dual_l0_depth_selected(
-        config,
-        log_n,
-        n_level,
-        current_len,
-        n_queries,
-        log_inv_rate,
-        lazy_ood,
-        direct_fold8_mode,
-        platform_supported,
-        sparse_disabled,
-        defer_disabled,
-        SPARSE_DUAL_MAX_DEPTH,
-    )
-    .is_none()
-    {
-        return None;
-    }
-    static EXPLICIT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    let explicit_depth = if crate::sl2_env_live() {
-        std::env::var(ENV_OPEN_INDUCE_DUAL_DEPTH).ok()
-    } else {
-        EXPLICIT.get_or_init(|| std::env::var(ENV_OPEN_INDUCE_DUAL_DEPTH).ok()).clone()
-    };
-    let depth = ranked_sparse_dual_l0_depth_setting(
-        explicit_depth.as_deref(),
-        crate::sl2_env_set!(ENV_NO_OPEN_INDUCE_DUAL_DEPTH2),
-    );
-    Some(depth)
-}
-
-#[inline]
-fn ranked_sparse_dual_deep_depth_for_level(n_level: usize) -> Option<usize> {
-    match n_level {
-        16 | 13 | 10 if od_deep_bg_enabled() => Some(3),
-        16 | 13 | 10 => Some(SPARSE_DUAL_MAX_DEPTH),
-        7 => Some(3),
-        _ => None,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-#[inline]
-fn ranked_sparse_dual_deep_depth(
-    config: &ProverConfig,
-    log_n: usize,
-    n_level: usize,
-    current_len: usize,
-    n_queries: usize,
-    log_inv_rate: usize,
-    lazy_ood: bool,
-    direct_fold8_mode: bool,
-    remaining_folds: usize,
-) -> Option<usize> {
-    #[cfg(test)]
-    {
-        let forced = SPARSE_DUAL_DEEP_TEST_DEPTH.with(std::cell::Cell::get);
-        if forced != 0 {
-            assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&forced));
-            let depth = forced.min(remaining_folds);
-            return (depth >= 2).then_some(depth);
-        }
-    }
-    if crate::sl2_env_set!(ENV_NO_DEEP_INDUCE_DUAL) {
-        return None;
-    }
-    let depth = ranked_sparse_dual_deep_depth_for_level(n_level)?;
-    if depth > remaining_folds {
-        return None;
-    }
-    let sparse_disabled = crate::sl2_env_set!(ENV_NO_OPEN_INDUCE_DUAL)
-        || crate::sl2_env_set!(ENV_NO_OPEN_INDUCE_DUAL2);
-    let defer_disabled = crate::sl2_env_set!(ENV_NO_LIG_DEFER_INDUCED_GLUE);
-    let platform_supported = cfg!(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ));
-    ranked_sparse_dual_l0_depth_selected(
-        config,
-        log_n,
-        n_level,
-        current_len,
-        n_queries,
-        log_inv_rate,
-        lazy_ood,
-        direct_fold8_mode,
-        platform_supported,
-        sparse_disabled,
-        defer_disabled,
-        depth,
-    )
-}
-
-enum PendingOodEq {
-    Introduced {
-        eq_lo: Vec<F128>,
-        eq_hi: Vec<F128>,
-        z_0: F128,
-        h_new: F128,
-    },
-    Glued {
-        eq_lo: Vec<F128>,
-        eq_hi: Vec<F128>,
-        z_0: F128,
-        beta: F128,
-    },
-}
-
-#[inline]
-fn fold_one_direct_fold8_claim_and_message(
-    claim: &mut super::ring_switch::DirectFold8Factors,
-    challenge: F128,
-) -> (F128, F128) {
-    assert_eq!(claim.a_state.len(), claim.w_state.len());
-    assert_eq!(claim.a_state.len() % (1usize << super::LOG_PACKING), 0);
-    let banks = claim.a_state.len() >> super::LOG_PACKING;
-    assert!(banks >= 4 && banks.is_power_of_two());
-    crate::field::f128_slice::fold_two_and_msg_in_place(
-        &mut claim.a_state,
-        &mut claim.w_state,
-        challenge,
-    )
-}
-
-/// Lane opus-pcs: `FLOCK_NO_OPUS_F8B_MSG_FUSION=1` restores the two-pass
-/// basis-then-message block form in the GFNI direct-fold8 basis kernel.
-/// Read once.
-#[allow(dead_code)] // Consumed only by the ranked AVX-512 GFNI route.
-fn opus_f8b_msg_fusion_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPUS_F8B_MSG_FUSION").is_none());
-    *ON
-}
-
-/// Lane opus-pcs: `FLOCK_NO_OPUS_F8_CLAIMS_JOIN=1` folds the two ranked
-/// claims' factor states one after the other (incumbent) instead of side by
-/// side. Read once.
-fn opus_f8_claims_join_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPUS_F8_CLAIMS_JOIN").is_none());
-    *ON
-}
-
-fn fold_direct_fold8_factors_and_message(
-    claims: &mut [super::ring_switch::DirectFold8Factors],
-    challenge: F128,
-) -> SumcheckMessage {
-    // Lane opus-pcs: the two claims' in-place factor folds are independent
-    // (each touches only its own states); run them side by side while the
-    // states are large enough to amortize the join. The message is the XOR
-    // of the same two partial sums, so it is identical.
-    if claims.len() == 2 && claims[0].a_state.len() >= 2048 && opus_f8_claims_join_enabled() {
-        let (first, second) = claims.split_at_mut(1);
-        let (p0, p1) = rayon::join(
-            || fold_one_direct_fold8_claim_and_message(&mut first[0], challenge),
-            || fold_one_direct_fold8_claim_and_message(&mut second[0], challenge),
-        );
-        return SumcheckMessage {
-            u_0: F128::ZERO + p0.0 + p1.0,
-            u_2: F128::ZERO + p0.1 + p1.1,
-        };
-    }
-    let (u0, u2) = claims
-        .iter_mut()
-        .fold((F128::ZERO, F128::ZERO), |mut total, claim| {
-            let part = fold_one_direct_fold8_claim_and_message(claim, challenge);
-            total.0 += part.0;
-            total.1 += part.1;
-            total
-        });
-    SumcheckMessage { u_0: u0, u_2: u2 }
-}
-
-fn direct_fold8_final_generators(
-    claim: &super::ring_switch::DirectFold8Factors,
-    challenge: F128,
-) -> Vec<F128> {
-    let mut generators = crate::alloc_uninit_vec(claim.w_state.len() / 2);
-    crate::field::f128_slice::fold_pairs(&claim.w_state, 0, &mut generators, challenge);
-    generators
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-#[inline]
-fn direct_fold8_b_gfni_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_FOLD8_B_GFNI").is_none());
-    *ON
-}
-
-#[derive(Clone, Copy)]
-#[allow(dead_code)] // Fields are consumed only by the ranked AVX-512 route.
-struct DirectFold8L1Precommit {
-    log_msg_cols: usize,
-    log_num_interleaved: usize,
-    log_inv_rate: usize,
-    kind: HashKind,
-}
-
-#[inline]
-#[allow(dead_code)] // Selector is consumed only by the ranked AVX-512 route.
-fn direct_fold8_b_overlap_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_F8B_OVERLAP").is_none());
-    *ON
-}
-
-/// Lane rs: `FLOCK_NO_RS_F8_REBAL=1` (or `FLOCK_NO_RS_SEED6=1`) restores
-/// the fold64 ‖ basis, then commit ‖ message schedule. Read once.
-fn rs_f8_rebal_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_RS_F8_REBAL").is_none()
-            && std::env::var_os("FLOCK_NO_RS_SEED6").is_none()
-    });
-    *ON
-}
-
-fn direct_fold8_l1_precommit_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LIG_L1_PRECOMMIT").is_none());
-    *ON
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-#[inline]
-fn split_eq_lo_halves_avx512(eq_lo: &[F128]) -> (Vec<u64>, Vec<u64>) {
-    use core::arch::x86_64::*;
-    let n = eq_lo.len();
-    let mut lo: Vec<u64> = Vec::with_capacity(n);
-    let mut hi: Vec<u64> = Vec::with_capacity(n);
-    unsafe {
-        let idx_lo = _mm512_set_epi64(14, 12, 10, 8, 6, 4, 2, 0);
-        let idx_hi = _mm512_set_epi64(15, 13, 11, 9, 7, 5, 3, 1);
-        let src_ptr = eq_lo.as_ptr();
-        let lo_ptr = lo.as_mut_ptr();
-        let hi_ptr = hi.as_mut_ptr();
-        let mut i = 0usize;
-        let simd_end = n & !7;
-        while i < simd_end {
-            let v0 = _mm512_loadu_si512(src_ptr.add(i) as *const __m512i);
-            let v1 = _mm512_loadu_si512(src_ptr.add(i + 4) as *const __m512i);
-            let lo_vec = _mm512_permutex2var_epi64(v0, idx_lo, v1);
-            let hi_vec = _mm512_permutex2var_epi64(v0, idx_hi, v1);
-            _mm512_storeu_si512(lo_ptr.add(i) as *mut __m512i, lo_vec);
-            _mm512_storeu_si512(hi_ptr.add(i) as *mut __m512i, hi_vec);
-            i += 8;
-        }
-        while i < n {
-            let x = *src_ptr.add(i);
-            *lo_ptr.add(i) = x.lo;
-            *hi_ptr.add(i) = x.hi;
-            i += 1;
-        }
-        lo.set_len(n);
-        hi.set_len(n);
-    }
-    (lo, hi)
-}
-
-/// Benchmark/oracle hook: the dense direct-fold8 f materialization exactly
-/// as the ranked open runs it (`chunk_len = 512`), bypassing any elided-z
-/// registration.
-#[doc(hidden)]
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-pub fn bench_direct_fold8_f_dense(
-    packed_witness: &[F128],
-    folded_f: &mut [F128],
-    fold16_weight: &[F128; 16],
-    r4: F128,
-    r5: F128,
-) {
-    use rayon::prelude::*;
-    folded_f
-        .par_chunks_mut(512)
-        .enumerate()
-        .for_each(|(block, f_out)| {
-            let start = 64 * block * 512;
-            let f_in = &packed_witness[start..start + 64 * f_out.len()];
-            crate::field::f128_slice::fold64_banked_nested(f_in, f_out, fold16_weight, r4, r5);
-        });
-}
-
-fn od_btail_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OD_BTAIL").is_none());
-    *ON
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-type F8BasisSetup = (
-    [super::ring_switch::GfniDirectFoldMap; 2],
-    [(Vec<u64>, Vec<u64>); 2],
-);
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-struct F8BasisTail<'a> {
-    claims: &'a [super::ring_switch::DirectFold8Factors],
-    challenges: [F128; 6],
-    block_len: usize,
-    n_blocks: usize,
-    b_addr: usize,
-    next: std::sync::atomic::AtomicUsize,
-    done: Vec<std::sync::atomic::AtomicBool>,
-    setup: std::sync::OnceLock<F8BasisSetup>,
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-unsafe impl Sync for F8BasisTail<'_> {}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-impl<'a> F8BasisTail<'a> {
-    fn new(
-        claims: &'a [super::ring_switch::DirectFold8Factors],
-        challenges: [F128; 6],
-        block_len: usize,
-        folded_b: &mut [F128],
-    ) -> Self {
-        let n_blocks = folded_b.len() / block_len;
-        Self {
-            claims,
-            challenges,
-            block_len,
-            n_blocks,
-            b_addr: folded_b.as_mut_ptr() as usize,
-            next: std::sync::atomic::AtomicUsize::new(0),
-            done: (0..n_blocks).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
-            setup: std::sync::OnceLock::new(),
-        }
-    }
-
-    fn setup(&self) -> &F8BasisSetup {
-        self.setup.get_or_init(|| f8_basis_setup(self.claims, self.challenges))
-    }
-
-    fn run_one(&self, gfni_tmp: &mut Option<crate::scratch::LocalBuf>) -> bool {
-        use std::sync::atomic::Ordering;
-        let x = self.next.fetch_add(1, Ordering::Relaxed);
-        if x >= self.n_blocks {
-            return false;
-        }
-        const ALIGN64_MIN_F128: usize = (32 * 1024) / core::mem::size_of::<F128>();
-        let tmp = gfni_tmp.get_or_insert_with(|| {
-            crate::scratch::LocalBuf::new(64usize.max(ALIGN64_MIN_F128), crate::scratch::fold_buf_pool_enabled())
-        });
-        let (mats, rows) = self.setup();
-        crate::rstrace::evd("bt:s", x as u32);
-        unsafe {
-            let b_out = std::slice::from_raw_parts_mut((self.b_addr as *mut F128).add(x * self.block_len), self.block_len);
-            materialize_direct_fold8_b_gfni_block_x86(
-                mats,
-                rows,
-                self.claims[0].eq_hi[x],
-                self.claims[1].eq_hi[x],
-                self.block_len,
-                b_out,
-                None,
-                tmp,
-            );
-        }
-        self.done[x].store(true, Ordering::Release);
-        crate::rstrace::evd("bt:e", x as u32);
-        true
-    }
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-fn f8_basis_setup(claims: &[super::ring_switch::DirectFold8Factors], challenges: [F128; 6]) -> F8BasisSetup {
-    (
-        [
-            super::ring_switch::build_gfni_direct_fold_map_from_generators(
-                &direct_fold8_final_generators(&claims[0], challenges[5]),
-            ),
-            super::ring_switch::build_gfni_direct_fold_map_from_generators(
-                &direct_fold8_final_generators(&claims[1], challenges[5]),
-            ),
-        ],
-        [split_eq_lo_halves_avx512(&claims[0].eq_lo), split_eq_lo_halves_avx512(&claims[1].eq_lo)],
-    )
-}
-
-pub(crate) trait H3Tail: Sync {
-    fn run_one(&self, gfni_tmp: &mut Option<crate::scratch::LocalBuf>) -> bool;
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-impl H3Tail for F8BasisTail<'_> {
-    fn run_one(&self, gfni_tmp: &mut Option<crate::scratch::LocalBuf>) -> bool {
-        F8BasisTail::run_one(self, gfni_tmp)
-    }
-}
-
-/// Lane h3 (`FLOCK_NO_H3_F8_PIPE=1` restores fold64, then the commit).
-fn h3_f8_pipe_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_H3_F8_PIPE").is_none());
-    *ON
-}
-
-/// Lane h3: what [`h3_fold64_seed_pipeline`] did besides folding.
-enum H3Seeded {
-    /// `folded_f` is complete; the commit runs as before.
-    Folded,
-    /// `folded_f` is complete and `mat` holds the commit's seed6 layers.
-    Seeded { mat: Vec<F128>, ntt: AdditiveNttF128 },
-}
-
-/// Lane h3: run the elided witness's fold64 and the L1 commit's seed6 pass
-/// in one parallel region.
-///
-/// fold64 (regenerating z from root tiles) is compute-bound and leaves DRAM
-/// idle; the seed6 pass is bound by its 32 MiB of non-temporal stores. Every
-/// seed task reads only the message rows of its own positions (see
-/// `Seed6Plan::task_positions`), and every row is written by one known
-/// fold64 task group (`Fold64Tasks::row_group`). Workers claim from one
-/// ordered list — all fold64 tasks in order, each seed task placed
-/// `H3_PIPE_LAG` groups after the last group it reads — and a seed task
-/// waits (acquire) until its groups' tasks have all finished (release).
-/// Claims are ordered and every claimed task is running, so the wait always
-/// ends. Each fold64 task and each seed task is the incumbent task body on
-/// the same inputs, so `folded_f` and the seeded codeword are bit-identical;
-/// the deep pass then runs exactly as in `rs_encode_interleaved_on_range_done`.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-fn h3_fold64_seed_pipeline(
-    packed_witness: &[F128],
-    folded_f: &mut [F128],
-    fold16_weight: &[F128; 16],
-    r4: F128,
-    r5: F128,
-    precommit: &DirectFold8L1Precommit,
-    tail: Option<&dyn H3Tail>,
-) -> Option<H3Seeded> {
-    use rayon::prelude::*;
-    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-    const H3_PIPE_LAG: usize = 2;
-    if !h3_f8_pipe_enabled()
-        || !crate::pcs::commit::lig_fused_commit_enabled()
-        || crate::gpu::merkle::available()
-        || !super::elided_z::is_elided(packed_witness)
-    {
-        return None;
-    }
-    let num_ntts = 1usize << precommit.log_num_interleaved;
-    let msg_len = folded_f.len();
-    if msg_len != num_ntts << precommit.log_msg_cols {
-        return None;
-    }
-    let codeword_len = msg_len << precommit.log_inv_rate;
-    let ntt = AdditiveNttF128::standard(precommit.log_msg_cols + precommit.log_inv_rate);
-    let mut mat = crate::scratch::take_f128(codeword_len);
-    let nt = match ntt.seed6_route(msg_len, &mat, num_ntts) {
-        Some((log_inv_rate, nt)) if log_inv_rate == precommit.log_inv_rate => nt,
-        _ => {
-            crate::scratch::give_f128(mat);
-            return None;
-        }
-    };
-    let regen = super::elided_z::take(packed_witness).expect("elided witness has a regenerator");
-    let e4 = [F128::ONE + r4, r4];
-    let e5 = [F128::ONE + r5, r5];
-    let w: [F128; 64] = std::array::from_fn(|i| {
-        let s = i >> 4;
-        fold16_weight[i & 15] * e4[s & 1] * e5[s >> 1]
-    });
-    assert_eq!(folded_f.len() * 64, packed_witness.len());
-    let Some(tasks) = regen.fold64_tasks(&w) else {
-        crate::scratch::give_f128(mat);
-        regen.fold64(folded_f, &w);
-        return Some(H3Seeded::Folded);
-    };
-    let plan = ntt.seed6_plan(msg_len, codeword_len, num_ntts, precommit.log_inv_rate);
-    let (n_prod, groups, n_cons) = (tasks.len(), tasks.groups(), plan.tasks());
-    assert!(groups >= 1 && groups <= 64 && n_prod % groups == 0);
-    // A fold64 output row (8 F128) is one seed position (`num_ntts` F128).
-    assert_eq!(num_ntts, 8);
-    let per_group = n_prod / groups;
-    // Group mask each seed task reads: pure geometry, built once.
-    static DEPS: std::sync::OnceLock<(usize, usize, usize, Vec<u64>)> = std::sync::OnceLock::new();
-    let deps = DEPS.get_or_init(|| {
-        let masks = (0..n_cons)
-            .map(|t| plan.task_positions(t).fold(0u64, |m, p| m | 1u64 << tasks.row_group(p)))
-            .collect();
-        (n_prod, groups, n_cons, masks)
-    });
-    if deps.0 != n_prod || deps.1 != groups || deps.2 != n_cons {
-        crate::scratch::give_f128(mat);
-        // SAFETY: `folded_f` is the full output; every task runs once.
-        let out = folded_f.as_mut_ptr() as usize;
-        (0..n_prod).into_par_iter().for_each(|u| unsafe { tasks.run(u, out as *mut F128) });
-        return Some(H3Seeded::Folded);
-    }
-    let masks = &deps.3;
-    // Claim order: fold64 tasks in order; a seed task right after the
-    // fold64 tasks of group (its last group + LAG).
-    let mut seq: Vec<u32> = Vec::with_capacity(n_prod + n_cons);
-    let mut by_group: Vec<Vec<u32>> = vec![Vec::new(); groups];
-    for (t, &m) in masks.iter().enumerate() {
-        let last = 63 - m.leading_zeros() as usize;
-        by_group[(last + H3_PIPE_LAG).min(groups - 1)].push(t as u32);
-    }
-    const CONS: u32 = 1 << 31;
-    for (g, cons) in by_group.iter().enumerate() {
-        seq.extend((g * per_group..(g + 1) * per_group).map(|u| u as u32));
-        seq.extend(cons.iter().map(|&t| t | CONS));
-    }
-    let done: Vec<AtomicU32> = (0..groups).map(|_| AtomicU32::new(0)).collect();
-    let next = AtomicUsize::new(0);
-    let fin = AtomicUsize::new(0);
-    let out = folded_f.as_mut_ptr() as usize;
-    let cw = mat.as_mut_ptr() as usize;
-    let (tasks, plan, seq, done, next, fin) = (&*tasks, &plan, &seq, &done, &next, &fin);
-    (0..rayon::current_num_threads()).into_par_iter().for_each(|_| {
-        let mut buf: Option<Vec<F128>> = None;
-        let mut gfni_tmp: Option<crate::scratch::LocalBuf> = None;
-        loop {
-            let s = next.fetch_add(1, Ordering::Relaxed);
-            if s >= seq.len() {
-                if let Some(t) = tail {
-                    while fin.load(Ordering::Acquire) < seq.len() && t.run_one(&mut gfni_tmp) {}
-                }
-                break;
-            }
-            let item = seq[s];
-            if item & CONS == 0 {
-                let u = item as usize;
-                // SAFETY: `out` is the full fold64 output; `u` is claimed once.
-                unsafe { tasks.run(u, out as *mut F128) };
-                done[u / per_group].fetch_add(1, Ordering::Release);
-            } else {
-                let t = (item & !CONS) as usize;
-                let mut m = masks[t];
-                while m != 0 {
-                    let g = m.trailing_zeros() as usize;
-                    while done[g].load(Ordering::Acquire) < per_group as u32 {
-                        core::hint::spin_loop();
-                    }
-                    m &= m - 1;
-                }
-                let b = buf.get_or_insert_with(|| plan.staging());
-                // SAFETY: every message row task `t` reads is final (its
-                // groups are done); `t` is claimed once and writes only its
-                // own codeword rows; NT stores are fenced right after.
-                unsafe {
-                    if nt {
-                        plan.run::<true>(out as *const F128, cw as *mut F128, t, b);
-                        core::arch::x86_64::_mm_sfence();
-                    } else {
-                        plan.run::<false>(out as *const F128, cw as *mut F128, t, b);
-                    }
-                }
-            }
-            fin.fetch_add(1, Ordering::Release);
-        }
-    });
-    for d in done.iter() {
-        assert_eq!(d.load(Ordering::Acquire), per_group as u32, "fold64 task group incomplete");
-    }
-    Some(H3Seeded::Seeded { mat, ntt })
-}
-
-#[cfg(not(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-)))]
-fn h3_fold64_seed_pipeline(
-    _packed_witness: &[F128],
-    _folded_f: &mut [F128],
-    _fold16_weight: &[F128; 16],
-    _r4: F128,
-    _r5: F128,
-    _precommit: &DirectFold8L1Precommit,
-    _tail: Option<&dyn H3Tail>,
-) -> Option<H3Seeded> {
-    None
-}
-
-/// Lane h3: [`ligero_commit`]'s fused route for a codeword whose seed6
-/// layers [`h3_fold64_seed_pipeline`] already applied.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-fn ligero_commit_after_seed6(
-    poly: &[F128],
-    mut mat: Vec<F128>,
-    log_msg_cols: usize,
-    log_num_interleaved: usize,
-    log_inv_rate: usize,
-    ntt: &AdditiveNttF128,
-    kind: HashKind,
-) -> LigeroWitness {
-    let msg_cols = 1usize << log_msg_cols;
-    let num_interleaved = 1usize << log_num_interleaved;
-    let block_len = msg_cols << log_inv_rate;
-    let log_block_len = log_msg_cols + log_inv_rate;
-    assert_eq!(poly.len(), num_interleaved * msg_cols);
-    assert_eq!(mat.len(), block_len * num_interleaved);
-    let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
-    crate::rstrace::ev("lc:start", log_block_len as u32);
-    let mut tree = crate::pcs::commit::take_tree(2 * block_len - 1);
-    let folded = crate::pcs::commit::fused_leaves_subtree_after_seed6(
-        ntt,
-        log_inv_rate,
-        &mut mat,
-        num_interleaved,
-        &mut tree,
-        block_len,
-        leaf_size_bytes,
-        kind,
-    );
-    crate::rstrace::ev("lc:fused", log_block_len as u32);
-    crate::pcs::commit::build_upper_levels(&mut tree, block_len, block_len >> folded, kind);
-    crate::rstrace::ev("lc:end", log_block_len as u32);
-    LigeroWitness {
-        mat,
-        tree,
-        block_len,
-        num_interleaved,
-    }
-}
-
-#[cfg(not(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-)))]
-fn ligero_commit_after_seed6(
-    _poly: &[F128],
-    _mat: Vec<F128>,
-    _log_msg_cols: usize,
-    _log_num_interleaved: usize,
-    _log_inv_rate: usize,
-    _ntt: &AdditiveNttF128,
-    _kind: HashKind,
-) -> LigeroWitness {
-    unreachable!("the h3 seed pipeline is x86 AVX-512 only")
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-fn materialize_direct_fold8_f_for_precommit(
-    packed_witness: &[F128],
-    folded_f: &mut [F128],
-    block_len: usize,
-    fold16_weight: &[F128; 16],
-    r4: F128,
-    r5: F128,
-) {
-    use rayon::prelude::*;
-
-    // Elided witness: fold straight from the exact regenerator. The weight
-    // of source slot 16s+b is the product of the same factors the nested
-    // fold applies (fold16 weight, then r4 on s bit 0, r5 on s bit 1); the
-    // field is exact, so every output is bit-identical.
-    if let Some(regen) = super::elided_z::take(packed_witness) {
-        let t = std::time::Instant::now();
-        let e4 = [F128::ONE + r4, r4];
-        let e5 = [F128::ONE + r5, r5];
-        let w: [F128; 64] = std::array::from_fn(|i| {
-            let s = i >> 4;
-            fold16_weight[i & 15] * e4[s & 1] * e5[s >> 1]
-        });
-        assert_eq!(folded_f.len() * 64, packed_witness.len());
-        regen.fold64(folded_f, &w);
-        drop(regen);
-        if open_timing() || std::env::var_os("FLOCK_ZR_TRACE").is_some() {
-            eprintln!("[zr] regen fold64 {:.3} ms", t.elapsed().as_secs_f64() * 1e3);
-        }
-        return;
-    }
-
-    let chunk_len = block_len.min(512);
-    folded_f
-        .par_chunks_mut(chunk_len)
-        .enumerate()
-        .for_each(|(block, f_out)| {
-            let start = 64 * block * chunk_len;
-            let f_in = &packed_witness[start..start + 64 * f_out.len()];
-            crate::field::f128_slice::fold64_banked_nested(f_in, f_out, fold16_weight, r4, r5);
-        });
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-#[inline(never)]
-#[cfg_attr(
-    target_feature = "avx512bw",
-    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
-)]
-#[cfg_attr(
-    not(target_feature = "avx512bw"),
-    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
-)]
-unsafe fn materialize_direct_fold8_b_gfni_block_x86(
-    direct_gfni_mats: &[super::ring_switch::GfniDirectFoldMap; 2],
-    direct_gfni_rows: &[(Vec<u64>, Vec<u64>); 2],
-    e_hi0: F128,
-    e_hi1: F128,
-    block_len: usize,
-    b_out: &mut [F128],
-    f_out: Option<&[F128]>,
-    gfni_tmp: &mut [F128],
-) -> (F128, F128) {
-    use crate::pcs::ring_switch::compose_block_mats_gfni_into;
-    use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_four_maps_staged;
-
-    let mut mats0_lo = core::mem::MaybeUninit::<[u64; 128]>::uninit();
-    let mut mats0_hi = core::mem::MaybeUninit::<[u64; 128]>::uninit();
-    let mut mats1_lo = core::mem::MaybeUninit::<[u64; 128]>::uninit();
-    let mut mats1_hi = core::mem::MaybeUninit::<[u64; 128]>::uninit();
-    unsafe {
-        compose_block_mats_gfni_into(
-            &direct_gfni_mats[0],
-            e_hi0,
-            &mut *mats0_lo.as_mut_ptr(),
-            &mut *mats0_hi.as_mut_ptr(),
-        );
-        compose_block_mats_gfni_into(
-            &direct_gfni_mats[1],
-            e_hi1,
-            &mut *mats1_lo.as_mut_ptr(),
-            &mut *mats1_hi.as_mut_ptr(),
-        );
-        let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
-        // Lane opus-pcs: accumulate the round message strip by strip right
-        // after each 64-slot strip of b is written (still in L1), instead of
-        // a second pass over the whole block. The strips run in slot order,
-        // so the raw Karatsuba accumulators see exactly the sequence
-        // `msg_reduce_avx512(f_out, b_out)` would; one fold/reduce per block
-        // as before. `FLOCK_NO_OPUS_F8B_MSG_FUSION=1` restores the two-pass form.
-        let fuse = f_out.filter(|_| opus_f8b_msg_fusion_enabled());
-        let mut u0_acc = crate::field::gf2_128::x86_64::WideGhashX4::zero();
-        let mut u2_acc = crate::field::gf2_128::x86_64::WideGhashX4::zero();
-        for slot in (0..block_len).step_by(64) {
-            gfni_fold64_four_maps_staged(
-                rows0.0.as_ptr().add(slot).cast::<u8>(),
-                &*mats0_lo.as_ptr(),
-                rows0.1.as_ptr().add(slot).cast::<u8>(),
-                &*mats0_hi.as_ptr(),
-                rows1.0.as_ptr().add(slot).cast::<u8>(),
-                &*mats1_lo.as_ptr(),
-                rows1.1.as_ptr().add(slot).cast::<u8>(),
-                &*mats1_hi.as_ptr(),
-                b_out.as_mut_ptr().add(slot),
-                gfni_tmp.as_mut_ptr().cast(),
-            );
-            if let Some(f_out) = fuse {
-                msg_accumulate_avx512(
-                    &f_out[slot..slot + 64],
-                    &b_out[slot..slot + 64],
-                    &mut u0_acc,
-                    &mut u2_acc,
-                );
-            }
-        }
-        if fuse.is_some() {
-            return (u0_acc.fold().reduce(), u2_acc.fold().reduce());
-        }
-        match f_out {
-            Some(f_out) => msg_reduce_avx512(f_out, b_out),
-            None => (F128::ZERO, F128::ZERO),
-        }
-    }
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-fn materialize_direct_fold8_b_gfni_for_precommit(
-    folded_f: &[F128],
-    folded_b: Vec<F128>,
-    claims: &[super::ring_switch::DirectFold8Factors],
-    challenges: [F128; 6],
-    block_len: usize,
-) -> (Vec<F128>, SumcheckMessage) {
-    materialize_direct_fold8_b_gfni_impl(Some(folded_f), folded_b, claims, challenges, block_len, None)
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-fn materialize_direct_fold8_b_gfni_impl(
-    folded_f: Option<&[F128]>,
-    mut folded_b: Vec<F128>,
-    claims: &[super::ring_switch::DirectFold8Factors],
-    challenges: [F128; 6],
-    block_len: usize,
-    tail: Option<&F8BasisTail<'_>>,
-) -> (Vec<F128>, SumcheckMessage) {
-    use rayon::prelude::*;
-
-    assert_eq!(claims.len(), 2);
-    assert!(block_len.is_multiple_of(64));
-    if let Some(folded_f) = folded_f {
-        assert_eq!(folded_b.len(), folded_f.len());
-    }
-    assert!(claims.iter().all(|claim| {
-        claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == folded_b.len()
-    }));
-
-    let local_setup;
-    let (direct_gfni_mats, direct_gfni_rows) = match tail {
-        Some(t) => {
-            let (m, r) = t.setup();
-            (m, r)
-        }
-        None => {
-            local_setup = f8_basis_setup(claims, challenges);
-            (&local_setup.0, &local_setup.1)
-        }
-    };
-
-    const ALIGN64_MIN_F128: usize = (32 * 1024) / core::mem::size_of::<F128>();
-    let stats = folded_b
-        .par_chunks_mut(block_len)
-        .enumerate()
-        .map_init(
-            || {
-                crate::scratch::LocalBuf::new(
-                    64usize.max(ALIGN64_MIN_F128),
-                    crate::scratch::fold_buf_pool_enabled(),
-                )
-            },
-            |gfni_tmp, (block, b_out)| unsafe {
-                let f_out = folded_f.map(|f| &f[block * block_len..(block + 1) * block_len]);
-                if tail.is_some_and(|t| t.done[block].load(std::sync::atomic::Ordering::Acquire)) {
-                    return match f_out {
-                        Some(f_out) => msg_reduce_avx512(f_out, b_out),
-                        None => (F128::ZERO, F128::ZERO),
-                    };
-                }
-                materialize_direct_fold8_b_gfni_block_x86(
-                    direct_gfni_mats,
-                    direct_gfni_rows,
-                    claims[0].eq_hi[block],
-                    claims[1].eq_hi[block],
-                    block_len,
-                    b_out,
-                    f_out,
-                    gfni_tmp,
-                )
-            },
-        )
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
-        );
-
-    (
-        folded_b,
-        SumcheckMessage {
-            u_0: stats.0,
-            u_2: stats.1,
-        },
-    )
-}
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-fn direct_fold8_msg_par(folded_f: &[F128], folded_b: &[F128], block_len: usize) -> SumcheckMessage {
-    use rayon::prelude::*;
-    assert_eq!(folded_f.len(), folded_b.len());
-    let stats = folded_f
-        .par_chunks(block_len)
-        .zip(folded_b.par_chunks(block_len))
-        .map(|(f, b)| {
-            crate::rstrace::evd("msg:s", 0);
-            let r = unsafe { msg_reduce_avx512(f, b) };
-            crate::rstrace::evd("msg:e", 0);
-            r
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
-        );
-    SumcheckMessage {
-        u_0: stats.0,
-        u_2: stats.1,
-    }
-}
-
-fn materialize_direct_fold8(
-    mut packed_witness: Vec<F128>,
-    ordinary_basis: Vec<F128>,
-    claims: &[super::ring_switch::DirectFold8Factors],
-    challenges: [F128; 6],
-    l1_precommit: Option<DirectFold8L1Precommit>,
-) -> (Vec<F128>, Vec<F128>, SumcheckMessage, Option<LigeroWitness>) {
-    use rayon::prelude::*;
-
-    assert!(!claims.is_empty());
-    let has_ordinary = !ordinary_basis.is_empty();
-    assert!(!has_ordinary || ordinary_basis.len() == packed_witness.len());
-    assert!(packed_witness.len().is_multiple_of(64));
-    let [r0, r1, r2, r3, r4, r5] = challenges;
-    let fold16_weight: [F128; 16] = std::array::from_fn(|bank| {
-        let mut weight = F128::ONE;
-        for (bit, &challenge) in challenges[..4].iter().enumerate() {
-            weight *= if (bank >> bit) & 1 == 0 {
-                F128::ONE + challenge
-            } else {
-                challenge
-            };
-        }
-        weight
-    });
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))]
-    let b_gfni_candidate = direct_fold8_b_gfni_enabled() && claims.len() == 2 && !has_ordinary;
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    )))]
-    let b_gfni_candidate = false;
-
-    let out_len = packed_witness.len() / 64;
-    let block_len = claims[0].eq_lo.len();
-    assert!(block_len.is_multiple_of(4));
-    let b_gfni_on = b_gfni_candidate && block_len.is_multiple_of(64);
-    assert_eq!(out_len, block_len * claims[0].eq_hi.len());
-    assert!(claims.iter().all(|claim| {
-        claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == out_len
-    }));
-
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))]
-    if b_gfni_on && direct_fold8_l1_precommit_enabled() {
-        if let Some(precommit) = l1_precommit {
-            assert_eq!(
-                out_len,
-                (1usize << precommit.log_msg_cols) * (1usize << precommit.log_num_interleaved)
-            );
-            // Lane rs: with the seed6 L1 commit (CLMUL + NT publish, then
-            // hash) the GFNI basis fold (+ its fused message) overlaps the
-            // commit better than it overlaps fold64 (both p0/p5-heavy), so
-            // the sequential-fold schedule below wins; see rs RESULT.md.
-            if direct_fold8_b_overlap_enabled() && !rs_f8_rebal_enabled() {
-                let t_f8 = std::time::Instant::now();
-                crate::rstrace::ev("f8:start", 0);
-                let mut folded_f = crate::scratch::take_f128(out_len);
-                let folded_b = crate::scratch::take_f128(out_len);
-                let ((), (folded_b, _)) = rayon::join(
-                    || {
-                        materialize_direct_fold8_f_for_precommit(
-                            &packed_witness,
-                            &mut folded_f,
-                            block_len,
-                            &fold16_weight,
-                            r4,
-                            r5,
-                        );
-                        crate::rstrace::ev("f8:fold64:end", 0);
-                    },
-                    || {
-                        let r = materialize_direct_fold8_b_gfni_impl(
-                            None, folded_b, claims, challenges, block_len, None,
-                        );
-                        crate::rstrace::ev("f8:basis:end", 0);
-                        r
-                    },
-                );
-                crate::rstrace::ev("f8:join1", 0);
-                let t_f8a = t_f8.elapsed();
-                crate::scratch::give_f128(packed_witness);
-                crate::scratch::give_f128(ordinary_basis);
-                let (precommitted, msg) = rayon::join(
-                    || {
-                        let ntt = AdditiveNttF128::standard(
-                            precommit.log_msg_cols + precommit.log_inv_rate,
-                        );
-                        ligero_commit(
-                            &folded_f,
-                            precommit.log_msg_cols,
-                            precommit.log_num_interleaved,
-                            precommit.log_inv_rate,
-                            &ntt,
-                            precommit.kind,
-                        )
-                    },
-                    || {
-                        let m = direct_fold8_msg_par(&folded_f, &folded_b, block_len);
-                        crate::rstrace::ev("f8:msg:end", 0);
-                        m
-                    },
-                );
-                crate::rstrace::ev("f8:join2", 0);
-                if open_timing() {
-                    eprintln!(
-                        "[f8] overlap: f-fold+basis {:.3} ms, commit+msg {:.3} ms",
-                        t_f8a.as_secs_f64() * 1e3,
-                        (t_f8.elapsed() - t_f8a).as_secs_f64() * 1e3
-                    );
-                }
-                return (folded_f, folded_b, msg, Some(precommitted));
-            }
-            let t_f8 = std::time::Instant::now();
-            crate::rstrace::ev("f8s:start", 0);
-            let mut folded_f = crate::scratch::take_f128(out_len);
-            let t_f8a = t_f8.elapsed();
-            let mut folded_b = crate::scratch::take_f128(out_len);
-            let btail = od_btail_enabled().then(|| F8BasisTail::new(claims, challenges, block_len, &mut folded_b));
-            // Lane h3: fold64 and the L1 commit's seed pass in one region
-            // (see `h3_fold64_seed_pipeline`); `None` folded nothing.
-            let h3_seeded = h3_fold64_seed_pipeline(
-                &packed_witness,
-                &mut folded_f,
-                &fold16_weight,
-                r4,
-                r5,
-                &precommit,
-                btail.as_ref().map(|t| t as &dyn H3Tail),
-            );
-            if h3_seeded.is_none() {
-                materialize_direct_fold8_f_for_precommit(
-                    &packed_witness,
-                    &mut folded_f,
-                    block_len,
-                    &fold16_weight,
-                    r4,
-                    r5,
-                );
-            }
-            if open_timing() {
-                eprintln!("[f8] take {:.3} ms, f-fold {:.3} ms over {} MiB in",
-                    t_f8a.as_secs_f64()*1e3, (t_f8.elapsed()-t_f8a).as_secs_f64()*1e3, packed_witness.len()*16>>20);
-            }
-            crate::rstrace::ev("f8s:fold64", 0);
-            let t_f8 = std::time::Instant::now();
-            crate::scratch::give_f128(packed_witness);
-            crate::scratch::give_f128(ordinary_basis);
-
-            let (precommitted, (folded_b, msg)) = rayon::join(
-                || match h3_seeded {
-                    Some(H3Seeded::Seeded { mat, ntt }) => ligero_commit_after_seed6(
-                        &folded_f,
-                        mat,
-                        precommit.log_msg_cols,
-                        precommit.log_num_interleaved,
-                        precommit.log_inv_rate,
-                        &ntt,
-                        precommit.kind,
-                    ),
-                    Some(H3Seeded::Folded) | None => {
-                        let ntt = AdditiveNttF128::standard(
-                            precommit.log_msg_cols + precommit.log_inv_rate,
-                        );
-                        ligero_commit(
-                            &folded_f,
-                            precommit.log_msg_cols,
-                            precommit.log_num_interleaved,
-                            precommit.log_inv_rate,
-                            &ntt,
-                            precommit.kind,
-                        )
-                    }
-                },
-                || {
-                    let r = materialize_direct_fold8_b_gfni_impl(
-                        Some(&folded_f), folded_b, claims, challenges, block_len, btail.as_ref(),
-                    );
-                    crate::rstrace::ev("f8s:basis", 0);
-                    r
-                },
-            );
-            crate::rstrace::ev("f8s:join", 0);
-            if open_timing() {
-                eprintln!("[f8] give+join {:.3} ms", t_f8.elapsed().as_secs_f64()*1e3);
-            }
-            return (folded_f, folded_b, msg, Some(precommitted));
-        }
-    }
-
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    )))]
-    let _ = l1_precommit;
-    // Every route below reads the witness directly.
-    super::elided_z::ensure_dense(&mut packed_witness, "fold8 non-precommit");
-
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))]
-    let direct_tables: Vec<Vec<F128>> = if b_gfni_on {
-        Vec::new()
-    } else {
-        claims
-            .par_iter()
-            .map(|claim| {
-                let generators = direct_fold8_final_generators(claim, challenges[5]);
-                super::ring_switch::build_direct_fold8_table_from_generators(&generators)
-            })
-            .collect()
-    };
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    )))]
-    let direct_tables: Vec<Vec<F128>> = claims
-        .par_iter()
-        .map(|claim| {
-            let generators = direct_fold8_final_generators(claim, challenges[5]);
-            super::ring_switch::build_direct_fold8_table_from_generators(&generators)
-        })
-        .collect();
-
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))]
-    let direct_gfni_rows: Vec<(Vec<u64>, Vec<u64>)> = if b_gfni_on {
-        claims
-            .iter()
-            .map(|claim| split_eq_lo_halves_avx512(&claim.eq_lo))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))]
-    let direct_gfni_mats: Vec<super::ring_switch::GfniDirectFoldMap> = if b_gfni_on {
-        claims
-            .iter()
-            .map(|claim| {
-                let generators = direct_fold8_final_generators(claim, challenges[5]);
-                super::ring_switch::build_gfni_direct_fold_map_from_generators(&generators)
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    let mut folded_f = crate::scratch::take_f128(out_len);
-    let mut folded_b = crate::scratch::take_f128(out_len);
-    const SUB: usize = 256;
-    const ALIGN64_MIN_F128: usize = (32 * 1024) / core::mem::size_of::<F128>();
-    let stats = folded_b
-        .par_chunks_mut(block_len)
-        .zip(folded_f.par_chunks_mut(block_len))
-        .enumerate()
-        .map_init(
-            || {
-                let pooled = crate::scratch::fold_buf_pool_enabled();
-                (
-                    crate::scratch::LocalBuf::new(
-                        if b_gfni_on {
-                            0
-                        } else {
-                            super::ring_switch::FOLD_TABLE_TOTAL
-                        },
-                        pooled,
-                    ),
-                    crate::scratch::LocalBuf::new(if has_ordinary { 16 * SUB } else { 0 }, pooled),
-                    crate::scratch::LocalBuf::new(
-                        if has_ordinary {
-                            (4 * SUB).max(ALIGN64_MIN_F128)
-                        } else {
-                            0
-                        },
-                        pooled,
-                    ),
-                    crate::scratch::LocalBuf::new(
-                        if b_gfni_on {
-                            (64usize).max(ALIGN64_MIN_F128)
-                        } else {
-                            0
-                        },
-                        pooled,
-                    ),
-                )
-            },
-            |(scratch, mid16, mid4, gfni_tmp), (block, (b_out, f_out))| {
-                let _ = &gfni_tmp;
-                let start = 64 * block * block_len;
-                let f_in = &packed_witness[start..start + 64 * block_len];
-                let b_in: &[F128] = if has_ordinary {
-                    &ordinary_basis[start..start + 64 * block_len]
-                } else {
-                    &[]
-                };
-                crate::field::f128_slice::fold64_banked_nested(
-                    f_in,
-                    f_out,
-                    &fold16_weight,
-                    r4,
-                    r5,
-                );
-                if has_ordinary {
-                    let mut slot = 0usize;
-                    while slot < block_len {
-                        let n = SUB.min(block_len - slot);
-                        let m16 = &mut mid16[..16 * n];
-                        let m4 = &mut mid4[..4 * n];
-                        crate::field::f128_slice::fold4_nested(
-                            &b_in[64 * slot..64 * (slot + n)],
-                            m16,
-                            r0,
-                            r1,
-                        );
-                        crate::field::f128_slice::fold4_nested(m16, m4, r2, r3);
-                        crate::field::f128_slice::fold4_nested(
-                            m4,
-                            &mut b_out[slot..slot + n],
-                            r4,
-                            r5,
-                        );
-                        slot += n;
-                    }
-                }
-
-                #[cfg(all(
-                    target_arch = "x86_64",
-                    target_feature = "avx512f",
-                    target_feature = "avx512vbmi",
-                    target_feature = "vpclmulqdq",
-                    target_feature = "gfni"
-                ))]
-                if b_gfni_on {
-                    use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_four_maps_staged;
-                    use crate::pcs::ring_switch::compose_block_mats_gfni_into;
-                    let (claim0, claim1) = (&claims[0], &claims[1]);
-                    let mut mats0_lo = core::mem::MaybeUninit::<[u64; 128]>::uninit();
-                    let mut mats0_hi = core::mem::MaybeUninit::<[u64; 128]>::uninit();
-                    let mut mats1_lo = core::mem::MaybeUninit::<[u64; 128]>::uninit();
-                    let mut mats1_hi = core::mem::MaybeUninit::<[u64; 128]>::uninit();
-                    unsafe {
-                        compose_block_mats_gfni_into(
-                            &direct_gfni_mats[0],
-                            claim0.eq_hi[block],
-                            &mut *mats0_lo.as_mut_ptr(),
-                            &mut *mats0_hi.as_mut_ptr(),
-                        );
-                        compose_block_mats_gfni_into(
-                            &direct_gfni_mats[1],
-                            claim1.eq_hi[block],
-                            &mut *mats1_lo.as_mut_ptr(),
-                            &mut *mats1_hi.as_mut_ptr(),
-                        );
-                    }
-                    let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
-                    for slot in (0..block_len).step_by(64) {
-                        unsafe {
-                            gfni_fold64_four_maps_staged(
-                                rows0.0.as_ptr().add(slot).cast::<u8>(),
-                                &*mats0_lo.as_ptr(),
-                                rows0.1.as_ptr().add(slot).cast::<u8>(),
-                                &*mats0_hi.as_ptr(),
-                                rows1.0.as_ptr().add(slot).cast::<u8>(),
-                                &*mats1_lo.as_ptr(),
-                                rows1.1.as_ptr().add(slot).cast::<u8>(),
-                                &*mats1_hi.as_ptr(),
-                                b_out.as_mut_ptr().add(slot),
-                                gfni_tmp.as_mut_ptr().cast(),
-                            );
-                        }
-                    }
-                }
-                if !b_gfni_on {
-                    let (first_claim, rest_claims) = claims.split_first().unwrap();
-                    let (first_table, _) = direct_tables.split_first().unwrap();
-                    super::ring_switch::compose_block_table(
-                        first_table,
-                        first_claim.eq_hi[block],
-                        scratch,
-                    );
-                    for slot in 0..block_len {
-                        let direct =
-                            super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
-                        b_out[slot] = if has_ordinary {
-                            direct + b_out[slot]
-                        } else {
-                            direct
-                        };
-                    }
-                    for (claim, table) in rest_claims.iter().zip(direct_tables.iter().skip(1)) {
-                        super::ring_switch::compose_block_table(table, claim.eq_hi[block], scratch);
-                        for (slot, out) in b_out.iter_mut().enumerate() {
-                            *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
-                        }
-                    }
-                }
-                #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-                {
-                    unsafe { msg_reduce_avx512(f_out, b_out) }
-                }
-                #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
-                {
-                    super::round0_scalar(f_out, b_out)
-                }
-            },
-        )
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
-        );
-
-    crate::scratch::give_f128(packed_witness);
-    crate::scratch::give_f128(ordinary_basis);
-    (
-        folded_f,
-        folded_b,
-        SumcheckMessage {
-            u_0: stats.0,
-            u_2: stats.1,
-        },
-        None,
-    )
-}
-
 pub struct SumcheckProver {
-    f: FoldBuf,
-    combined_basis: FoldBuf,
-    fold_arena: Option<FoldArena>,
+    f: Vec<F128>,
+    /// Single combined basis poly. After every `glue(β)`, the introduced
+    /// `b_new` is folded into here as `combined_basis += β · b_new`. This
+    /// keeps fold cost O(1 + 1) = (f + combined_basis) regardless of how
+    /// many recursive intro/glue pairs have happened.
+    combined_basis: Vec<F128>,
     t_r: F128,
     transcript: Vec<SumcheckMessage>,
     pending_glue: Option<(Vec<F128>, F128)>,
-    pending_fold_basis: Option<(Vec<F128>, F128)>,
-    pending_ood_eq: Option<PendingOodEq>,
 }
 
 impl SumcheckProver {
     pub fn new(f: Vec<F128>, b1: Vec<F128>, h1: F128) -> (Self, SumcheckMessage) {
         assert_eq!(f.len(), b1.len());
         let mut inst = Self {
-            f: FoldBuf::Owned(f),
-            combined_basis: FoldBuf::Owned(b1),
-            fold_arena: None,
+            f,
+            combined_basis: b1,
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
-            pending_fold_basis: None,
-            pending_ood_eq: None,
         };
         let msg = round_msg_lsb(&inst.f, &inst.combined_basis);
         inst.transcript.push(msg);
         (inst, msg)
     }
 
-    pub fn set_fold_arena(&mut self, arena: FoldArena) {
-        self.fold_arena = Some(arena);
-    }
-
-    pub(crate) fn f_is_arena(&self) -> bool {
-        matches!(self.f, FoldBuf::Arena { .. })
-    }
-
+    /// Like [`Self::new`] but skips the initial `round_msg_lsb` pass over
+    /// `(f, b1)` because the caller already computed `(u_0, u_2)` while
+    /// building `b1` (saves a 256 MB read pass at m=30 BLAKE3). Used by
+    /// `recursive_prover_with_basis` to consume the round0 prime that
+    /// `compute_combined_basis_and_target` produces for free.
     pub fn new_with_first_msg(
         f: Vec<F128>,
         b1: Vec<F128>,
@@ -8936,130 +2706,30 @@ impl SumcheckProver {
     ) -> (Self, SumcheckMessage) {
         assert_eq!(f.len(), b1.len());
         let mut inst = Self {
-            f: FoldBuf::Owned(f),
-            combined_basis: FoldBuf::Owned(b1),
-            fold_arena: None,
+            f,
+            combined_basis: b1,
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
-            pending_fold_basis: None,
-            pending_ood_eq: None,
         };
         inst.transcript.push(first_msg);
         (inst, first_msg)
     }
 
-    fn new_after_direct_fold4(
-        f: Vec<F128>,
-        basis: Vec<F128>,
-        target: F128,
-        transcript: [SumcheckMessage; 5],
-        fold_arena: Option<FoldArena>,
-    ) -> Self {
-        assert_eq!(f.len(), basis.len());
-        Self {
-            f: FoldBuf::Owned(f),
-            combined_basis: FoldBuf::Owned(basis),
-            fold_arena,
-            t_r: target,
-            transcript: transcript.to_vec(),
-            pending_glue: None,
-            pending_fold_basis: None,
-            pending_ood_eq: None,
-        }
-    }
-
-    fn new_after_direct_fold2(
-        f: Vec<F128>,
-        basis: Vec<F128>,
-        target: F128,
-        transcript: [SumcheckMessage; 3],
-        fold_arena: Option<FoldArena>,
-    ) -> Self {
-        assert_eq!(f.len(), basis.len());
-        Self {
-            f: FoldBuf::Owned(f),
-            combined_basis: FoldBuf::Owned(basis),
-            fold_arena,
-            t_r: target,
-            transcript: transcript.to_vec(),
-            pending_glue: None,
-            pending_fold_basis: None,
-            pending_ood_eq: None,
-        }
-    }
-
-    fn new_after_direct_fold8(
-        f: Vec<F128>,
-        basis: Vec<F128>,
-        target: F128,
-        transcript: [SumcheckMessage; 7],
-        fold_arena: Option<FoldArena>,
-    ) -> Self {
-        assert_eq!(f.len(), basis.len());
-        Self {
-            f: FoldBuf::Owned(f),
-            combined_basis: FoldBuf::Owned(basis),
-            fold_arena,
-            t_r: target,
-            transcript: transcript.to_vec(),
-            pending_glue: None,
-            pending_fold_basis: None,
-            pending_ood_eq: None,
-        }
-    }
-
     pub fn fold(&mut self, r: F128) -> SumcheckMessage {
-        assert!(self.pending_glue.is_none(), "fold before ordinary glue");
-        let pending_ood = self.pending_ood_eq.take();
-        let pending_basis = self.pending_fold_basis.take();
-        let (nf, nb, msg) = match (pending_ood, pending_basis) {
-            (
-                Some(PendingOodEq::Glued {
-                    eq_lo,
-                    eq_hi,
-                    z_0,
-                    beta,
-                }),
-                deferred_basis,
-            ) => {
-                let gamma = beta * (F128::ONE + z_0 + r);
-                let out = fold_and_msg_lsb_inner(
-                    &self.f,
-                    &self.combined_basis,
-                    r,
-                    self.fold_arena.as_mut(),
-                    Some((&eq_lo, &eq_hi, gamma)),
-                    deferred_basis
-                        .as_ref()
-                        .map(|(basis, alpha)| (basis.as_slice(), *alpha)),
-                );
-                c4_eq_spare_put(eq_lo);
-                out
-            }
-            (Some(PendingOodEq::Introduced { .. }), _) => {
-                panic!("fold before factorized OOD glue")
-            }
-            (None, Some(deferred_basis)) => fold_and_msg_lsb_inner(
-                &self.f,
-                &self.combined_basis,
-                r,
-                self.fold_arena.as_mut(),
-                None,
-                Some((&deferred_basis.0, deferred_basis.1)),
-            ),
-            (None, None) => {
-                fold_and_msg_lsb(&self.f, &self.combined_basis, r, self.fold_arena.as_mut())
-            }
-        };
+        // Fused: fold f and combined_basis at r AND build the next-round
+        // message in one parallel pass (was three passes). See
+        // [`fold_and_msg_lsb`].
+        let (nf, nb, msg) = fold_and_msg_lsb(&self.f, &self.combined_basis, r);
+        // On x86_64, recycle the just-consumed buffers into the scratch pool
+        // (same ownership as the Drop impl) so the next round's
+        // `fold_and_msg_lsb` takes resident pages. aarch64 measured slower with
+        // this pooling, so there we just move the new buffers in and drop the
+        // old ones.
         #[cfg(target_arch = "x86_64")]
         {
-            if let FoldBuf::Owned(v) = std::mem::replace(&mut self.f, nf) {
-                crate::scratch::give_f128(v);
-            }
-            if let FoldBuf::Owned(v) = std::mem::replace(&mut self.combined_basis, nb) {
-                crate::scratch::give_f128(v);
-            }
+            crate::scratch::give_f128(std::mem::replace(&mut self.f, nf));
+            crate::scratch::give_f128(std::mem::replace(&mut self.combined_basis, nb));
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -9070,11 +2740,9 @@ impl SumcheckProver {
         msg
     }
 
+    /// Introduce a fresh basis poly with claimed sum `h_new`. Sends the
+    /// (u_0, u_2) for `Σ_x f(x) · b_new(x)` at the current dim.
     pub fn introduce_new(&mut self, b_new: Vec<F128>, h_new: F128) -> SumcheckMessage {
-        assert!(
-            self.pending_fold_basis.is_none(),
-            "ordinary introduction across deferred basis"
-        );
         assert_eq!(b_new.len(), self.f.len());
         let msg = round_msg_lsb(&self.f, &b_new);
         self.transcript.push(msg);
@@ -9082,70 +2750,13 @@ impl SumcheckProver {
         msg
     }
 
-    fn introduce_sparse_dual(&mut self, msg: SumcheckMessage) {
-        assert!(self.pending_glue.is_none());
-        assert!(self.pending_fold_basis.is_none());
-        self.transcript.push(msg);
-    }
-
-    fn glue_sparse_dual(&mut self, alpha: F128, h_new: F128) {
-        assert!(self.pending_glue.is_none());
-        assert!(self.pending_fold_basis.is_none());
-        assert!(!matches!(
-            self.pending_ood_eq,
-            Some(PendingOodEq::Introduced { .. })
-        ));
-        self.t_r += alpha * h_new;
-    }
-
-    fn add_to_last_message(&mut self, delta: SumcheckMessage) -> SumcheckMessage {
-        let msg = self.transcript.last_mut().expect("fold message missing");
-        msg.u_0 += delta.u_0;
-        msg.u_2 += delta.u_2;
-        *msg
-    }
-
-    fn defer_folded_sparse_dual(&mut self, basis: Vec<F128>, alpha: F128) {
-        assert!(self.pending_glue.is_none());
-        assert!(self.pending_ood_eq.is_none());
-        assert!(self.pending_fold_basis.is_none());
-        assert_eq!(basis.len(), self.f.len());
-        self.pending_fold_basis = Some((basis, alpha));
-    }
-
-    /// Lane op: add a materialized sparse-dual basis (alpha 1) to the
-    /// combined basis inside the next fold, after this level's OOD and dual
-    /// introductions (which read only `f` and their own bases). The fold
-    /// computes `fold(b + basis)`, the same field values as merging first.
-    fn attach_folded_sparse_dual(&mut self, basis: Vec<F128>) {
-        assert!(self.pending_glue.is_none());
-        assert!(!matches!(self.pending_ood_eq, Some(PendingOodEq::Introduced { .. })));
-        assert!(self.pending_fold_basis.is_none());
-        assert_eq!(basis.len(), self.combined_basis.len());
-        self.pending_fold_basis = Some((basis, F128::ONE));
-    }
-
-    fn merge_folded_sparse_dual(&mut self, basis: Vec<F128>) {
-        use rayon::prelude::*;
-        assert!(self.pending_glue.is_none());
-        assert!(self.pending_ood_eq.is_none());
-        assert!(self.pending_fold_basis.is_none());
-        assert_eq!(basis.len(), self.combined_basis.len());
-        if self.combined_basis.len() <= 8192 {
-            transpose_top_only(&mut self.combined_basis, &basis);
-        } else {
-            self.combined_basis
-                .par_chunks_mut(4096)
-                .zip(basis.par_chunks(4096))
-                .for_each(|(dst, src)| transpose_top_only(dst, src));
-        }
-    }
-
+    /// Like [`Self::introduce_new`] but also returns the claimed sum
+    /// `h_new = Σ_x f(x)·b_new(x)`, computed in the same pass as the round
+    /// message. For OOD binding `b_new = eq_table(z)`, so `h_new` is the MLE
+    /// eval `f̂(z)` — fusing it here removes the separate `mle_eval_inline`
+    /// fold over `f`. Transcript-identical: the caller observes the returned
+    /// `h_new` then `(u_0, u_2)`, exactly as the unfused path does.
     pub fn introduce_new_with_eval(&mut self, b_new: Vec<F128>) -> (SumcheckMessage, F128) {
-        assert!(
-            self.pending_fold_basis.is_none(),
-            "OOD introduction across deferred basis"
-        );
         assert_eq!(b_new.len(), self.f.len());
         let (msg, h_new) = round_msg_and_eval_lsb(&self.f, &b_new);
         self.transcript.push(msg);
@@ -9153,95 +2764,17 @@ impl SumcheckProver {
         (msg, h_new)
     }
 
-    fn introduce_new_ood_factorized(&mut self, z: &[F128]) -> Option<(SumcheckMessage, F128)> {
-        let expected_len = 1usize.checked_shl(z.len().try_into().ok()?);
-        if z.is_empty()
-            || expected_len != Some(self.f.len())
-            || self.pending_glue.is_some()
-            || self.pending_fold_basis.is_some()
-            || self.pending_ood_eq.is_some()
-        {
-            return None;
-        }
-        let tail = &z[1..];
-        let split = tail.len().min(LAZY_OOD_EQ_SPLIT_LOW_LOG);
-        let eq_lo = c4_build_eq_table(&tail[..split]);
-        let eq_hi = build_eq_table(&tail[split..]);
-        let z_0 = z[0];
-        let (msg, h_new) = round_msg_and_eval_lsb_factorized_eq(&self.f, &eq_lo, &eq_hi, z_0);
-        self.transcript.push(msg);
-        self.pending_ood_eq = Some(PendingOodEq::Introduced {
-            eq_lo,
-            eq_hi,
-            z_0,
-            h_new,
-        });
-        Some((msg, h_new))
-    }
-
-    fn glue_factorized_ood(&mut self, beta: F128) {
-        assert!(
-            self.pending_glue.is_none(),
-            "factorized OOD glue across ordinary pending glue"
-        );
-        assert!(
-            self.pending_fold_basis.is_none(),
-            "factorized OOD glue across deferred ordinary basis"
-        );
-        let pending = self
-            .pending_ood_eq
-            .take()
-            .expect("factorized OOD glue without introduction");
-        let PendingOodEq::Introduced {
-            eq_lo,
-            eq_hi,
-            z_0,
-            h_new,
-        } = pending
-        else {
-            panic!("factorized OOD equality glued twice");
-        };
-        self.t_r += beta * h_new;
-        self.pending_ood_eq = Some(PendingOodEq::Glued {
-            eq_lo,
-            eq_hi,
-            z_0,
-            beta,
-        });
-    }
-
+    /// Combine the introduced basis into `combined_basis` with separation α.
+    /// `combined_basis[j] += α · b_new[j]` (pointwise), `T_r += α · h_new`.
     pub fn glue(&mut self, alpha: F128) {
         use rayon::prelude::*;
-        assert!(
-            self.pending_fold_basis.is_none(),
-            "ordinary glue across deferred ordinary basis"
-        );
         let (b_new, h_new) = self
             .pending_glue
             .take()
             .expect("glue without introduce_new");
         assert_eq!(b_new.len(), self.combined_basis.len());
         const PAR_THRESHOLD: usize = 4096;
-        #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-        let x4 = open_ood_x4_enabled();
-        #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
-        let x4 = false;
-        if x4 {
-            #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-            {
-                const CHUNK: usize = 2048;
-                let acc: &mut [F128] = &mut self.combined_basis;
-                if acc.len() < PAR_THRESHOLD {
-                    unsafe { glue_block_x4(acc, &b_new, alpha) };
-                } else {
-                    acc.par_chunks_mut(CHUNK)
-                        .zip(b_new.par_chunks(CHUNK))
-                        .for_each(|(a, v)| {
-                            unsafe { glue_block_x4(a, v, alpha) }
-                        });
-                }
-            }
-        } else if self.combined_basis.len() < PAR_THRESHOLD {
+        if self.combined_basis.len() < PAR_THRESHOLD {
             for (acc, &v) in self.combined_basis.iter_mut().zip(b_new.iter()) {
                 *acc += alpha * v;
             }
@@ -9255,24 +2788,6 @@ impl SumcheckProver {
         self.t_r += alpha * h_new;
     }
 
-    fn glue_deferred_into_factorized_ood_fold(&mut self, alpha: F128) {
-        assert!(
-            matches!(self.pending_ood_eq, Some(PendingOodEq::Glued { .. })),
-            "deferred ordinary glue requires a glued factorized OOD term"
-        );
-        assert!(
-            self.pending_fold_basis.is_none(),
-            "more than one ordinary basis deferred"
-        );
-        let (basis, h_new) = self
-            .pending_glue
-            .take()
-            .expect("deferred glue without ordinary introduction");
-        assert_eq!(basis.len(), self.combined_basis.len());
-        self.t_r += alpha * h_new;
-        self.pending_fold_basis = Some((basis, alpha));
-    }
-
     pub fn f(&self) -> &[F128] {
         &self.f
     }
@@ -9282,386 +2797,13 @@ impl SumcheckProver {
     }
 }
 
+// ===================================================================
+// Prover / Verifier — stubs
+// ===================================================================
 
-fn od_deep_bg_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OD_DEEPBG").is_none());
-    *ON
-}
-
-/// Lane op (`FLOCK_NO_OP_OODTEAM=1`: rayon route): run a factorized OOD pass
-/// of `chunks` chunks on the hot-pool team when the caller owns a live team.
-fn op_ood_team(chunks: usize) -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OP_OODTEAM").is_none());
-    *ON && (2..=64).contains(&chunks)
-        && crate::flat_par::team_enabled()
-        && crate::flat_par::team_ready()
-}
-
-/// Lane opus-pcs: `FLOCK_NO_OPUS_DUAL_JOIN=1` runs the sparse duals' fold
-/// step after `sc_prover.fold` (incumbent order) instead of beside it.
-/// Read once.
-fn opus_dual_join_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPUS_DUAL_JOIN").is_none());
-    *ON
-}
-
-/// Lane opus-pcs: what the sparse duals contribute to one recursive fold —
-/// message deltas (to be XOR-added into the fold's message, in order) and at
-/// most one materialized basis (to be deferred or merged by the caller).
-struct SparseDualFoldWork {
-    l0_delta: Option<SumcheckMessage>,
-    l0_basis: Option<Vec<F128>>,
-    /// Lane op: the L0 dual reached its depth but its materialization was
-    /// left to the caller (`defer_l0`).
-    l0_left: bool,
-    /// Sum of the deep duals' round deltas (F128 addition is XOR, so the
-    /// sum equals adding them one by one; no per-round Vec).
-    deep_delta: Option<SumcheckMessage>,
-    deep_basis: Option<Vec<F128>>,
-    deep_left: Option<usize>,
-}
-
-/// Lane opus-pcs: whether the next fold step materializes any sparse dual
-/// (its challenge count reaches the dual's depth with this round).
-fn sparse_duals_materialize_next(
-    l0: &Option<(SparseDualL0, Vec<F128>)>,
-    deep: &[(SparseDualL0, Vec<F128>)],
-) -> bool {
-    l0.as_ref().is_some_and(|(dual, fc)| fc.len() + 1 == dual.depth)
-        || deep.iter().any(|(dual, fc)| fc.len() + 1 == dual.depth)
-}
-
-/// Lane opus-pcs: the duals' half of one recursive fold, exactly the
-/// incumbent per-dual sequence (push challenge, round step while within
-/// depth, materialize at depth) minus every `SumcheckProver` mutation, which
-/// the caller applies afterwards in the incumbent order. Touches only the
-/// duals, so it may run concurrently with `SumcheckProver::fold`.
-fn sparse_duals_fold_step(
-    l0: &mut Option<(SparseDualL0, Vec<F128>)>,
-    deep: &mut [(SparseDualL0, Vec<F128>)],
-    ri: F128,
-    defer_l0: bool,
-    defer_deep: bool,
-) -> SparseDualFoldWork {
-    let mut work = SparseDualFoldWork {
-        l0_delta: None,
-        l0_basis: None,
-        l0_left: false,
-        deep_delta: None,
-        deep_basis: None,
-        deep_left: None,
-    };
-    if let Some((dual, fold_challenges)) = l0.as_mut() {
-        fold_challenges.push(ri);
-        if fold_challenges.len() <= dual.depth {
-            work.l0_delta = Some(dual.round_msg_step(fold_challenges));
-        }
-        if fold_challenges.len() == dual.depth {
-            if defer_l0 {
-                work.l0_left = true;
-            } else {
-                work.l0_basis = Some(dual.materialize_after_folds(fold_challenges));
-            }
-        }
-    }
-    let l0_materialized_here = work.l0_basis.is_some() || work.l0_left;
-    for (k, (dual, fold_challenges)) in deep.iter_mut().enumerate() {
-        fold_challenges.push(ri);
-        if fold_challenges.len() <= dual.depth {
-            let d = dual.round_msg_step(fold_challenges);
-            work.deep_delta = Some(match work.deep_delta {
-                Some(acc) => SumcheckMessage {
-                    u_0: acc.u_0 + d.u_0,
-                    u_2: acc.u_2 + d.u_2,
-                },
-                None => d,
-            });
-        }
-        if fold_challenges.len() == dual.depth {
-            assert!(
-                !l0_materialized_here && work.deep_basis.is_none() && work.deep_left.is_none(),
-                "two sparse duals materialize into one fold"
-            );
-            if defer_deep {
-                work.deep_left = Some(k);
-            } else {
-                work.deep_basis = Some(dual.materialize_after_folds(fold_challenges));
-            }
-        }
-    }
-    work
-}
-
-fn serial_par_enabled() -> bool {
-    crate::serial_par_enabled()
-}
-
-const ROW_GATHER_PAR_MIN_ELEMS: usize = 512;
-
-/// Lane lf1: `FLOCK_LF1_QS_HASHSET=1` restores the SipHash set in
-/// `sample_distinct_queries` (default: bitmap). Read once.
-fn lf1_qs_bitmap() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_LF1_QS_HASHSET").is_none());
-    *ON
-}
-
-/// Lane lf1: the recursive levels' opened rows and multiproof siblings
-/// (~100 rows of 128 B, ~1K hashes) are gathered serially on the joined
-/// thread; `FLOCK_NO_LF1_OPEN_SERIAL=1` restores the rayon gathers. Read once.
-fn lf1_open_par() -> bool {
-    static PAR: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LF1_OPEN_SERIAL").is_some());
-    serial_par_enabled() && *PAR
-}
-
-/// Lane lf1: the sparse dual's query split takes at least 8 queries per
-/// rayon task (`FLOCK_LF1_DUAL_MINLEN=k` overrides, 1 = rayon adaptive as
-/// before). Read once.
-fn lf1_dual_minlen() -> usize {
-    static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        std::env::var("FLOCK_LF1_DUAL_MINLEN").ok().and_then(|s| s.parse().ok()).filter(|&v| v >= 1).unwrap_or(8)
-    });
-    *V
-}
-
-fn gather_opened_rows<'a, F>(queries: &[usize], row: F, par: bool) -> Vec<Vec<F128>>
-where
-    F: Fn(usize) -> &'a [F128] + Sync,
-{
-    use rayon::prelude::*;
-    let row_len = queries.first().map_or(0, |&q| row(q).len());
-    if par && queries.len() * row_len >= ROW_GATHER_PAR_MIN_ELEMS {
-        queries.par_iter().map(|&q| row(q).to_vec()).collect()
-    } else {
-        queries.iter().map(|&q| row(q).to_vec()).collect()
-    }
-}
-
-const MULTIPROOF_PAR_MIN_SIBLINGS: usize = 512;
-
-const MULTIPROOF_PAR_CHUNK: usize = 64;
-
-/// Lane gl2: `FLOCK_NO_GL2_DEFER=1` keeps the opened-row + multiproof gathers
-/// of L1 and the recursive levels inside the `rayon::join` with the sparse
-/// dual (incumbent). Default: they run as detached jobs off the open's
-/// critical path -- neither enters the transcript, so they only have to be
-/// complete when the proof is assembled. Read once per open.
-fn gl2_defer_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL2_DEFER").is_none());
-    *ON
-}
-
-type Gl2Opened = (Vec<Vec<F128>>, Vec<Hash>);
-
-/// Lane gl2: `FLOCK_NO_GL2_SIDE=1` dispatches the deferred gathers and the
-/// streamed-dual helpers with `rayon::spawn` (onto the owner's deque, where
-/// the owner's own join waits can pop them) instead of the hot-pool side
-/// list. Read once.
-fn gl2_side_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL2_SIDE").is_none());
-    *ON
-}
-
-/// Lane gl2: streamed-dual tuning, read once: helper count (default
-/// threads - 2) and the pause count between a waiting helper's polls of the
-/// owner's publication counter (default 16).
-fn gl2_stream_knobs() -> (usize, usize) {
-    static K: std::sync::LazyLock<(usize, usize)> = std::sync::LazyLock::new(|| {
-        let h = std::env::var("FLOCK_GL2_STREAM_HELPERS").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
-        let p = std::env::var("FLOCK_GL2_STREAM_POLL").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
-        (h, p)
-    });
-    *K
-}
-
-#[repr(align(128))]
-struct Gl2Pad(std::sync::atomic::AtomicUsize);
-
-#[repr(align(64))]
-#[derive(Clone, Copy)]
-struct Gl2Line([usize; 8]);
-
-/// A detached open-arm job (an opened-rows gather, or lane op's background
-/// sparse-dual materialization). Claimed exactly once (by the rayon job or by
-/// the waiter, whichever comes first), so a waiter never blocks on a job that
-/// no worker has started.
-#[repr(align(128))]
-struct Gl2Deferred<T = Gl2Opened> {
-    state: std::sync::atomic::AtomicU8,
-    job: std::cell::UnsafeCell<Option<Box<dyn FnOnce() -> T + Send>>>,
-    out: std::cell::UnsafeCell<Option<T>>,
-    side: std::sync::Mutex<Option<crate::hot_pool::side::Task>>,
-}
-
-// SAFETY: `job` is taken only by the thread that wins the 0 -> 1 claim, `out`
-// is written by that thread before the release store of 2 and read only after
-// an acquire load of 2.
-unsafe impl<T: Send> Sync for Gl2Deferred<T> {}
-unsafe impl<T: Send> Send for Gl2Deferred<T> {}
-
-impl<T: Send + 'static> Gl2Deferred<T> {
-    fn spawn(job: Box<dyn FnOnce() -> T + Send>) -> std::sync::Arc<Self> {
-        Self::spawn_inner(job, false, None)
-    }
-
-    /// [`Self::spawn`] for compute-heavy jobs: the open owner's SMT sibling
-    /// never claims it (the owner's serial steps, e.g. the query draws, are
-    /// latency-bound BLAKE3 chains on that core), and with a `gate` no
-    /// spinner claims it before the gate opens (the waiter always may).
-    fn spawn_off_sibling(
-        job: Box<dyn FnOnce() -> T + Send>,
-        gate: Option<Box<dyn Fn() -> bool + Send + Sync>>,
-    ) -> std::sync::Arc<Self> {
-        Self::spawn_inner(job, true, gate)
-    }
-
-    fn spawn_inner(
-        job: Box<dyn FnOnce() -> T + Send>,
-        skip_sib: bool,
-        gate: Option<Box<dyn Fn() -> bool + Send + Sync>>,
-    ) -> std::sync::Arc<Self> {
-        let d = std::sync::Arc::new(Self {
-            state: std::sync::atomic::AtomicU8::new(0),
-            job: std::cell::UnsafeCell::new(Some(job)),
-            out: std::cell::UnsafeCell::new(None),
-            side: std::sync::Mutex::new(None),
-        });
-        if gl2_side_enabled() {
-            // Run by an idle hot-pool spinner; never popped by the owner's
-            // own join waits (a `rayon::spawn` lands on the owner's deque).
-            let d2 = d.clone();
-            let t: crate::hot_pool::side::Task = std::sync::Arc::new(move |sib: bool| {
-                if !(skip_sib && sib)
-                    && d2.state.load(std::sync::atomic::Ordering::Relaxed) == 0
-                    && gate.as_ref().is_none_or(|g| g())
-                {
-                    d2.run();
-                }
-            });
-            *d.side.lock().unwrap_or_else(|e| e.into_inner()) = Some(t.clone());
-            crate::hot_pool::side::register(t);
-        } else {
-            let d2 = d.clone();
-            rayon::spawn(move || d2.run());
-        }
-        d
-    }
-
-    fn run(&self) {
-        use std::sync::atomic::Ordering;
-        if self.state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
-            return;
-        }
-        // SAFETY: claim won above; see the `Sync` impl.
-        let job = unsafe { (*self.job.get()).take() }.expect("deferred job claimed twice");
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).ok();
-        unsafe { *self.out.get() = r };
-        self.state.store(2, Ordering::Release);
-    }
-
-    fn take_side(&self) -> Option<crate::hot_pool::side::Task> {
-        self.side.lock().unwrap_or_else(|e| e.into_inner()).take()
-    }
-
-    fn wait(&self) -> Option<T> {
-        use std::sync::atomic::Ordering;
-        self.run();
-        while self.state.load(Ordering::Acquire) != 2 {
-            std::hint::spin_loop();
-        }
-        // SAFETY: state 2 observed with acquire; only the single waiter takes.
-        unsafe { (*self.out.get()).take() }
-    }
-}
-
-/// Waits for every pending deferred gather when dropped (also on unwind), so
-/// no job can outlive the witnesses / L0 buffers its raw pointers refer to.
-/// Declare it AFTER the storage those jobs read.
-struct Gl2DeferSet(Vec<std::sync::Arc<Gl2Deferred>>);
-
-impl Drop for Gl2DeferSet {
-    fn drop(&mut self) {
-        for d in &self.0 {
-            let _ = d.wait();
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct Gl2Ptr<T>(*const T, usize);
-// SAFETY: only ever dereferenced as a shared slice while the owner is kept
-// alive by `Gl2DeferSet`'s ordering contract.
-unsafe impl<T> Send for Gl2Ptr<T> {}
-impl<T> Gl2Ptr<T> {
-    fn of(s: &[T]) -> Self {
-        Self(s.as_ptr(), s.len())
-    }
-    /// # Safety
-    /// The slice this was made from must still be alive and unmodified.
-    unsafe fn get<'a>(self) -> &'a [T] {
-        unsafe { std::slice::from_raw_parts(self.0, self.1) }
-    }
-}
-
-/// Lane gl2: the dedupe set of query sampling. A 4 KiB open-addressing table
-/// (thread-local, cache-resident, reset after use) instead of a block_len-bit
-/// bitmap: the L1 bitmap is 128 KiB, a fresh calloc is an mmap + page faults
-/// + munmap, and a reused one is cache-cold at every probe.
-struct Gl2QSet {
-    slots: [u32; 1024],
-}
-
-impl Gl2QSet {
-    const EMPTY: u32 = u32::MAX;
-
-    /// Insert `q`; true when it was not present. Needs `q < u32::MAX` and
-    /// fewer than 1024 members.
-    #[inline]
-    fn insert(&mut self, q: usize) -> bool {
-        let key = q as u32;
-        let mut i = (key.wrapping_mul(0x9E37_79B1) >> 22) as usize;
-        loop {
-            let s = self.slots[i];
-            if s == key {
-                return false;
-            }
-            if s == Self::EMPTY {
-                self.slots[i] = key;
-                return true;
-            }
-            i = (i + 1) & 1023;
-        }
-    }
-
-    fn with<R>(f: impl FnOnce(&mut Self) -> R) -> R {
-        thread_local! {
-            static SET: std::cell::RefCell<Box<Gl2QSet>> =
-                std::cell::RefCell::new(Box::new(Gl2QSet { slots: [Gl2QSet::EMPTY; 1024] }));
-        }
-        SET.with(|c| {
-            let mut set = c.borrow_mut();
-            let r = f(&mut set);
-            set.slots.fill(Self::EMPTY);
-            r
-        })
-    }
-}
-
-/// Lane gl2: `FLOCK_NO_GL2_QS_REUSE=1` restores lf1's per-call calloc'd
-/// query bitmap (default: [`Gl2QSet`] when `count <= 256` and
-/// `block_len < 2^32`). Read once.
-fn gl2_qs_reuse() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL2_QS_REUSE").is_none());
-    *ON
-}
-
+/// Sample `count` distinct positions in `[0, block_len)` via the challenger.
+/// Asserts `count <= block_len` — otherwise no number of samples could satisfy
+/// the distinctness requirement (would infinite-loop).
 fn sample_distinct_queries<Ch: Challenger>(
     challenger: &mut Ch,
     block_len: usize,
@@ -9671,42 +2813,8 @@ fn sample_distinct_queries<Ch: Challenger>(
         count <= block_len,
         "sample_distinct_queries: count ({count}) > block_len ({block_len}) — config is too thin for this query count"
     );
-    let mut out = Vec::with_capacity(count);
-    if gl2_qs_reuse() && count <= 256 && block_len < u32::MAX as usize {
-        // Lane gl2: same draws, same first-occurrence dedupe, small hash set.
-        Gl2QSet::with(|seen| {
-            crate::rstrace::evd("qs:begin", count as u32);
-            while out.len() < count {
-                let v = challenger.sample_f128();
-                let q = (v.lo as usize) % block_len;
-                if seen.insert(q) {
-                    out.push(q);
-                }
-            }
-            crate::rstrace::evd("qs:drawn", count as u32);
-        });
-        out.sort_unstable();
-        return out;
-    }
-    if lf1_qs_bitmap() {
-        // Lane lf1: same draws, same first-occurrence dedupe, bitmap
-        // membership instead of a SipHash set.
-        let mut seen = vec![0u64; block_len.div_ceil(64)];
-        crate::rstrace::evd("qs:begin", count as u32);
-        while out.len() < count {
-            let v = challenger.sample_f128();
-            let q = (v.lo as usize) % block_len;
-            let (w, b) = (q >> 6, 1u64 << (q & 63));
-            if seen[w] & b == 0 {
-                seen[w] |= b;
-                out.push(q);
-            }
-        }
-        crate::rstrace::evd("qs:drawn", count as u32);
-        out.sort_unstable();
-        return out;
-    }
     let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(count);
     while out.len() < count {
         let v = challenger.sample_f128();
         let q = (v.lo as usize) % block_len;
@@ -9718,143 +2826,23 @@ fn sample_distinct_queries<Ch: Challenger>(
     out
 }
 
+/// Build a single octopus multi-proof for all `queries` against `tree`.
 fn merkle_multi_proof_for(tree: &[Hash], block_len: usize, queries: &[usize]) -> Vec<Hash> {
-    multi_proof_gather(tree, block_len, queries, serial_par_enabled())
-}
-
-#[inline]
-fn ranked_l0_auth_batch_enabled(
-    tree_len: usize,
-    block_len: usize,
-    num_interleaved: usize,
-    n_queries: usize,
-    kind: HashKind,
-) -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_L0_AUTH_BATCH").is_none());
-    cfg!(all(target_arch = "x86_64", target_feature = "avx512f"))
-        && *ON
-        && tree_len == block_len - 1
-        && block_len == (1 << 20)
-        && num_interleaved == 64
-        && n_queries == 218
-        && kind == HashKind::Blake3
-}
-
-fn merkle_multi_proof_for_l0(
-    tree: &[Hash],
-    codeword: &[F128],
-    block_len: usize,
-    num_interleaved: usize,
-    queries: &[usize],
-    kind: HashKind,
-) -> Vec<Hash> {
-    if tree.len() == 2 * block_len - 1 {
-        return merkle_multi_proof_for(tree, block_len, queries);
-    }
-    assert_eq!(tree.len(), block_len - 1, "unsupported compact L0 tree");
-    assert_eq!(codeword.len(), block_len * num_interleaved);
-
-    use rayon::prelude::*;
-    let indices = merkle::merkle_multi_proof_sibling_indices(block_len, queries);
-    let leaf_size = num_interleaved * core::mem::size_of::<F128>();
-    // Leaf `i` is codeword row `l0_layout.row(i)` (page-blocked ranked codeword).
-    let l0_layout = crate::ntt::additive_ntt_f128::L0Rows::of(codeword);
-    let bytes = unsafe {
-        core::slice::from_raw_parts(
-            codeword.as_ptr().cast::<u8>(),
-            codeword.len() * core::mem::size_of::<F128>(),
-        )
-    };
-
-    if ranked_l0_auth_batch_enabled(
-        tree.len(),
-        block_len,
-        num_interleaved,
-        queries.len(),
-        kind,
-    ) {
-        let leaf_siblings = indices.partition_point(|&i| i < block_len);
-        debug_assert!(indices[leaf_siblings..].iter().all(|&i| i >= block_len));
-        let mut proof: Vec<Hash> = crate::alloc_uninit_vec(indices.len());
-        debug_assert_eq!(leaf_size, 1024);
-        let (leaf_out, stored_out) = proof.split_at_mut(leaf_siblings);
-        let leaf_indices = &indices[..leaf_siblings];
-        let stored_indices = &indices[leaf_siblings..];
-        let leaf_rows: Vec<usize>;
-        let leaf_indices = if l0_layout.is_blocked() {
-            leaf_rows = leaf_indices.iter().map(|&i| l0_layout.row(i)).collect();
-            &leaf_rows[..]
-        } else {
-            leaf_indices
-        };
-        rayon::join(
-            || merkle::hash_indexed_blake3_1k(bytes, leaf_indices, leaf_out),
-            || {
-                if serial_par_enabled()
-                    && stored_indices.len() >= MULTIPROOF_PAR_MIN_SIBLINGS
-                {
-                    stored_out
-                        .par_iter_mut()
-                        .zip(stored_indices.par_iter())
-                        .with_min_len(MULTIPROOF_PAR_CHUNK)
-                        .for_each(|(out, &i)| *out = tree[i - block_len]);
-                } else {
-                    for (out, &i) in stored_out.iter_mut().zip(stored_indices) {
-                        *out = tree[i - block_len];
-                    }
-                }
-            },
-        );
-        return proof;
-    }
-
-    let gather = |&i: &usize| {
-        if i < block_len {
-            let start = l0_layout.row(i) * leaf_size;
-            merkle::hash_leaf(&bytes[start..start + leaf_size], kind)
-        } else {
-            tree[i - block_len]
-        }
-    };
-
-    if serial_par_enabled() && indices.len() >= MULTIPROOF_PAR_MIN_SIBLINGS {
-        indices
-            .par_iter()
-            .with_min_len(MULTIPROOF_PAR_CHUNK)
-            .map(gather)
-            .collect()
-    } else {
-        indices.iter().map(gather).collect()
-    }
-}
-
-fn multi_proof_gather(tree: &[Hash], block_len: usize, queries: &[usize], par: bool) -> Vec<Hash> {
-    use rayon::prelude::*;
-    if par {
-        let indices = merkle::merkle_multi_proof_sibling_indices(block_len, queries);
-        if indices.len() >= MULTIPROOF_PAR_MIN_SIBLINGS {
-            return indices
-                .par_iter()
-                .with_min_len(MULTIPROOF_PAR_CHUNK)
-                .map(|&i| tree[i])
-                .collect();
-        }
-        // The plan is already complete (patternrecognition9-del 01a4b83a, runner
-        // in-run read -0.31%): gather from it instead of re-walking the frontier.
-        // FLOCK_NO_MERKLE_PLAN_REUSE=1 restores the rebuild.
-        // Ported from Mahmoud514 5b2ced50 (gated form).
-        static REUSE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var_os("FLOCK_NO_MERKLE_PLAN_REUSE").is_none()
-        });
-        if *REUSE {
-            assert_eq!(tree.len(), 2 * block_len - 1);
-            return indices.into_iter().map(|i| tree[i]).collect();
-        }
-    }
     merkle::merkle_multi_proof(tree, block_len, queries)
 }
 
+/// Drive the recursive Ligerito prover to prove `poly(eval_point) = claimed_value`.
+///
+/// Protocol structure (unique-decoding regime, no OOD samples yet):
+/// 1. Commit f⁰ = `poly`.
+/// 2. Partial-eval at `eval_point[0..initial_k]` (LSB-first), commit f¹.
+/// 3. Open f⁰ at random query positions, induce a basis poly from the openings.
+/// 4. Start sumcheck on `Σ_x f¹(x) · eq(eval_point[initial_k..], x) = claimed_value`,
+///    introduce the induced basis (α-batched), glue with a separation challenge.
+/// 5. For each recursive level: do k_i sumcheck folds; if last, send the residual
+///    yr in clear and open the previous commitment; else commit the folded f,
+///    open the previous commitment, induce a fresh basis from these opens,
+///    introduce + glue.
 pub fn recursive_prover<Ch: Challenger>(
     config: &ProverConfig,
     poly: &[F128],
@@ -9862,7 +2850,7 @@ pub fn recursive_prover<Ch: Challenger>(
     claimed_value: F128,
     challenger: &mut Ch,
 ) -> LigeritoProof {
-    let trace = crate::sl2_env_set!("LIGERITO_TRACE");
+    let trace = std::env::var("LIGERITO_TRACE").is_ok();
     macro_rules! tlog {
         ($($arg:tt)*) => { if trace { eprintln!($($arg)*); } }
     }
@@ -9889,6 +2877,7 @@ pub fn recursive_prover<Ch: Challenger>(
     challenger.observe_f128(claimed_value);
     challenger.observe_f128_slice(eval_point);
 
+    // ---- Initial commit (wtns_0) ----
     let log_inv_rate_0 = config.log_inv_rates[0];
     let log_msg_cols_0 = log_n - initial_k;
     let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + log_inv_rate_0);
@@ -9920,6 +2909,15 @@ pub fn recursive_prover<Ch: Challenger>(
     )
 }
 
+/// Variant of [`recursive_prover`] that reuses an **externally-built L0 commit**
+/// (the codeword + merkle tree). This is what Flock's `pcs::open_batch` will
+/// call after `pcs::commit` has already built the same shape. Skips the
+/// L0 commit cost (~17 ms at m=29 MT).
+///
+/// Caller responsibility: the external L0 data must match what `ligero_commit`
+/// would produce at the same `(log_msg_cols_0 = log_n - initial_k, initial_k,
+/// log_inv_rates[0])`. In practice this means using `PcsParams` with
+/// `log_batch_size = config.initial_k` and `log_inv_rate = config.log_inv_rates[0]`.
 pub fn recursive_prover_with_l0<Ch: Challenger>(
     config: &ProverConfig,
     poly: &[F128],
@@ -9929,7 +2927,7 @@ pub fn recursive_prover_with_l0<Ch: Challenger>(
     claimed_value: F128,
     challenger: &mut Ch,
 ) -> LigeritoProof {
-    let trace = crate::sl2_env_set!("LIGERITO_TRACE");
+    let trace = std::env::var("LIGERITO_TRACE").is_ok();
     macro_rules! tlog {
         ($($arg:tt)*) => { if trace { eprintln!($($arg)*); } }
     }
@@ -9993,6 +2991,16 @@ pub fn recursive_prover_with_l0<Ch: Challenger>(
     )
 }
 
+/// Drop-in replacement for the legacy `basefold::prove`: takes a generic basis poly +
+/// target (typically the combined `Σ γ_k · eq(z_k, ·)` and target produced by
+/// `ring_switch::prove_batched` for batched claims), plus an externally-built
+/// L0 commitment (the existing `pcs::commit` output).
+///
+/// Differs from [`recursive_prover`] in the initial step: instead of partial-
+/// evaluating at `z[0..initial_k]` (which doesn't make sense for a combined
+/// basis with no single `z`), runs `initial_k` real sumcheck rounds folding
+/// both `f` and `b` together with FS challenges. The folded f becomes wtns_1
+/// and the rest of the protocol proceeds identically.
 pub fn recursive_prover_with_basis<Ch: Challenger>(
     config: &ProverConfig,
     packed_witness: Vec<F128>,
@@ -10010,19 +3018,15 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         l0_codeword,
         l0_tree,
         None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
         challenger,
     )
 }
 
+/// Variant of [`recursive_prover_with_basis`] that accepts the round-0 sumcheck
+/// `(u_0, u_2)` pre-computed by the caller. Useful from
+/// `pcs::compute_combined_basis_and_target` which produces these values as a
+/// side effect while building `b_initial` — passing them in here lets
+/// `SumcheckProver::new` skip the redundant 256 MB read pass over (f, b1).
 #[allow(clippy::too_many_arguments)]
 pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
     config: &ProverConfig,
@@ -10032,7 +3036,6 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
     l0_codeword: &[F128],
     l0_tree: &[Hash],
     round0_uv: (F128, F128),
-    fold_arena: Option<FoldArena>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
     recursive_prover_with_basis_impl(
@@ -10046,137 +3049,6 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
             u_0: round0_uv.0,
             u_2: round0_uv.1,
         }),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        fold_arena,
-        challenger,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn recursive_prover_with_basis_direct_ab_fold2<Ch: Challenger>(
-    config: &ProverConfig,
-    packed_witness: Vec<F128>,
-    ordinary_basis: Vec<F128>,
-    direct: Vec<super::ring_switch::DirectFold2Factors>,
-    target: F128,
-    l0_codeword: &[F128],
-    l0_tree: &[Hash],
-    round0_uv: (F128, F128),
-    round1_lookahead: [F128; 6],
-    fold_arena: Option<FoldArena>,
-    challenger: &mut Ch,
-) -> LigeritoProof {
-    recursive_prover_with_basis_impl(
-        config,
-        packed_witness,
-        ordinary_basis,
-        target,
-        l0_codeword,
-        l0_tree,
-        Some(SumcheckMessage {
-            u_0: round0_uv.0,
-            u_2: round0_uv.1,
-        }),
-        Some(round1_lookahead),
-        None,
-        None,
-        None,
-        None,
-        Some(direct),
-        None,
-        None,
-        fold_arena,
-        challenger,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn recursive_prover_with_basis_direct_fold4<Ch: Challenger>(
-    config: &ProverConfig,
-    packed_witness: Vec<F128>,
-    ordinary_basis: Vec<F128>,
-    direct: Vec<super::ring_switch::DirectFold4Factors>,
-    target: F128,
-    l0_codeword: &[F128],
-    l0_tree: &[Hash],
-    round0_uv: (F128, F128),
-    round1_lookahead: [F128; 6],
-    round2_lookahead: super::Fold4Lookahead2,
-    round3_lookahead: super::Fold4Lookahead3,
-    fold_arena: Option<FoldArena>,
-    challenger: &mut Ch,
-) -> LigeritoProof {
-    assert!(
-        config.initial_k >= 4,
-        "direct-fold4 scaffold requires initial_k >= 4"
-    );
-    recursive_prover_with_basis_impl(
-        config,
-        packed_witness,
-        ordinary_basis,
-        target,
-        l0_codeword,
-        l0_tree,
-        Some(SumcheckMessage {
-            u_0: round0_uv.0,
-            u_2: round0_uv.1,
-        }),
-        Some(round1_lookahead),
-        Some(round2_lookahead),
-        Some(round3_lookahead),
-        None,
-        None,
-        None,
-        Some(direct),
-        None,
-        fold_arena,
-        challenger,
-    )
-}
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn recursive_prover_with_basis_direct_fold8<Ch: Challenger>(
-    config: &ProverConfig,
-    packed_witness: Vec<F128>,
-    ordinary_basis: Vec<F128>,
-    direct: Vec<super::ring_switch::DirectFold8Factors>,
-    target: F128,
-    l0_codeword: &[F128],
-    l0_tree: &[Hash],
-    round0_uv: (F128, F128),
-    fold_arena: Option<FoldArena>,
-    challenger: &mut Ch,
-) -> LigeritoProof {
-    assert_eq!(
-        config.initial_k, 6,
-        "direct-fold8 scaffold requires initial_k=6"
-    );
-    recursive_prover_with_basis_impl(
-        config,
-        packed_witness,
-        ordinary_basis,
-        target,
-        l0_codeword,
-        l0_tree,
-        Some(SumcheckMessage {
-            u_0: round0_uv.0,
-            u_2: round0_uv.1,
-        }),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(direct),
-        fold_arena,
         challenger,
     )
 }
@@ -10190,15 +3062,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     l0_codeword: &[F128],
     l0_tree: &[Hash],
     first_msg: Option<SumcheckMessage>,
-    round1_lookahead: Option<[F128; 6]>,
-    round2_lookahead: Option<super::Fold4Lookahead2>,
-    round3_lookahead: Option<super::Fold4Lookahead3>,
-    _round4_lookahead: Option<super::Fold8Lookahead4>,
-    _round5_lookahead: Option<super::Fold8Lookahead5>,
-    direct_fold2: Option<Vec<super::ring_switch::DirectFold2Factors>>,
-    direct_fold4: Option<Vec<super::ring_switch::DirectFold4Factors>>,
-    direct_fold8: Option<Vec<super::ring_switch::DirectFold8Factors>>,
-    fold_arena: Option<FoldArena>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
     let log_n = packed_witness.len().trailing_zeros() as usize;
@@ -10206,22 +3069,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let initial_k = config.initial_k;
 
     assert_eq!(packed_witness.len(), 1usize << log_n);
-    assert!(
-        direct_fold2.is_none() || (direct_fold4.is_none() && direct_fold8.is_none()),
-        "direct-fold2 and direct-fold4/fold8 modes are mutually exclusive"
-    );
-    assert!(
-        direct_fold4.is_none() || direct_fold8.is_none(),
-        "direct-fold4 and direct-fold8 modes are mutually exclusive"
-    );
-    if direct_fold2.is_some() || direct_fold4.is_some() || direct_fold8.is_some() {
-        assert!(b_initial.is_empty() || b_initial.len() == 1usize << log_n);
-    } else {
-        assert_eq!(b_initial.len(), 1usize << log_n);
-    }
-    if direct_fold8.is_some() {
-        assert_eq!(initial_k, 6, "direct-fold8 scaffold requires initial_k=6");
-    }
+    assert_eq!(b_initial.len(), 1usize << log_n);
     assert_eq!(config.recursive_ks.len(), r);
     assert_eq!(config.log_inv_rates.len(), r + 1);
     assert!(r >= 1);
@@ -10231,12 +3079,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let block_len_0 = 1usize << (log_msg_cols_0 + log_inv_rate_0);
     let num_interleaved_0 = 1usize << initial_k;
     assert_eq!(l0_codeword.len(), block_len_0 * num_interleaved_0);
-    assert!(
-        l0_tree.len() == 2 * block_len_0 - 1 || l0_tree.len() == block_len_0 - 1,
-        "external L0 tree has unsupported layout"
-    );
+    assert_eq!(l0_tree.len(), 2 * block_len_0 - 1);
 
-    let trace = crate::sl2_env_set!("LIG_PROVE_TRACE") || open_timing();
+    let trace = std::env::var("LIG_PROVE_TRACE").is_ok();
     let mut t_init_sumcheck = std::time::Duration::ZERO;
     let mut t_commits = std::time::Duration::ZERO;
     let mut t_opens = std::time::Duration::ZERO;
@@ -10246,23 +3091,25 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let mut t_ood = std::time::Duration::ZERO;
 
     let t_total = std::time::Instant::now();
-    crate::rstrace::ev("lig:start", 0);
 
     challenger.observe_label(b"flock-ligerito-basis-v0");
     challenger.observe_f128(target);
 
+    // L0 codeword + tree are borrowed (reused from upstream `pcs::commit`).
+    // wtns_0 access reduces to: root (last tree node), row(q), block_len.
     let initial_root: Hash = l0_tree[l0_tree.len() - 1];
     let l0_block_len = block_len_0;
     let l0_num_interleaved = num_interleaved_0;
-    // Opened row `q` is codeword row `l0_layout.row(q)` (page-blocked
-    // ranked codeword; the identity otherwise).
-    let l0_layout = crate::ntt::additive_ntt_f128::L0Rows::of(l0_codeword);
     let l0_row = |q: usize| -> &[F128] {
-        let start = l0_layout.row(q) * l0_num_interleaved;
+        let start = q * l0_num_interleaved;
         &l0_codeword[start..start + l0_num_interleaved]
     };
     challenger.observe_bytes(&initial_root);
 
+    // L0 takes no explicit OOD samples: it is bound by the opening's own
+    // evaluation claim (`target` at the post-commit random point behind
+    // `b_initial`), which plays the OOD role with a union over the list
+    // instead of over pairs. See `paper_ood_bits`.
     assert_eq!(
         config.ood_samples.first().copied().unwrap_or(0),
         0,
@@ -10275,650 +3122,159 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let ood_count = |lvl: usize| -> usize { config.ood_samples.get(lvl).copied().unwrap_or(0) };
 
     let _t = std::time::Instant::now();
-    assert!(
-        direct_fold2.is_none() || (direct_fold4.is_none() && direct_fold8.is_none()),
-        "direct-fold2 and direct-fold4/fold8 modes are mutually exclusive"
-    );
-    assert!(direct_fold4.is_none() || direct_fold8.is_none());
-    let direct_fold4_mode = direct_fold4.is_some();
-    let direct_fold8_mode = direct_fold8.is_some();
-    let direct_mode = direct_fold2.is_some() || direct_fold4_mode || direct_fold8_mode;
-    if direct_fold8_mode {
-        assert_eq!(initial_k, 6, "direct fold8 needs six initial rounds");
-    } else if direct_fold4_mode {
-        assert!(initial_k >= 4, "direct fold4 needs four initial rounds");
-    } else if direct_mode {
-        assert!(initial_k >= 2, "direct AB fold2 needs two initial rounds");
-    }
-    let mut packed_witness = Some(packed_witness);
-    let mut b_initial = Some(b_initial);
-    let mut direct_fold2 = direct_fold2;
-    let mut direct_fold4 = direct_fold4;
-    let mut direct_fold8 = direct_fold8;
-    let n1 = log_n - initial_k;
-    let log_num_interleaved_1 = config.recursive_ks[0];
-    assert!(n1 >= log_num_interleaved_1);
-    let log_msg_cols_1 = n1 - log_num_interleaved_1;
-    let log_inv_rate_1 = config.log_inv_rates[1];
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))]
-    let l1_precommit_candidate = direct_fold8_mode
-        && log_n == 25
-        && initial_k == 6
-        && log_msg_cols_1 == 16
-        && log_num_interleaved_1 == 3
-        && log_inv_rate_1 == 2
-        && config.merkle_hash == HashKind::Blake3
-        && direct_fold8_l1_precommit_enabled()
-        && direct_fold8_b_gfni_enabled()
-        && b_initial.as_ref().is_some_and(|basis| basis.is_empty())
-        && direct_fold8
-            .as_ref()
-            .is_some_and(|claims| claims.len() == 2 && claims[0].eq_lo.len().is_multiple_of(64));
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    )))]
-    let l1_precommit_candidate = false;
-    // Only the direct-fold8 L1-precommit route can fold an elided witness
-    // from its regenerator; every other route reads it directly.
-    if !l1_precommit_candidate {
-        if let Some(w) = packed_witness.as_mut() {
-            super::elided_z::ensure_dense(w, "ligerito non-fold8");
-        }
-    }
-    let mut early_wtns_1: Option<LigeroWitness> = None;
-    let mut fold4_challenges: Vec<F128> = Vec::with_capacity(6);
-    let mut fold4_msgs: Vec<SumcheckMessage> = Vec::with_capacity(6);
-    let mut fold_arena = fold_arena;
-    let (mut sc_prover, start_msg) = if direct_mode {
-        (
-            None,
-            first_msg.expect("direct mode requires a precomputed round-zero message"),
-        )
-    } else {
-        let (mut prover, msg) = match first_msg {
-            Some(msg) => SumcheckProver::new_with_first_msg(
-                packed_witness.take().unwrap(),
-                b_initial.take().unwrap(),
-                target,
-                msg,
-            ),
-            None => SumcheckProver::new(
-                packed_witness.take().unwrap(),
-                b_initial.take().unwrap(),
-                target,
-            ),
-        };
-        if let Some(arena) = fold_arena.take() {
-            prover.set_fold_arena(arena);
-        }
-        (Some(prover), msg)
+    let (mut sc_prover, start_msg) = match first_msg {
+        Some(msg) => SumcheckProver::new_with_first_msg(packed_witness, b_initial, target, msg),
+        None => SumcheckProver::new(packed_witness, b_initial, target),
     };
     challenger.observe_f128(start_msg.u_0);
     challenger.observe_f128(start_msg.u_2);
 
     let mut r_lane_fold = Vec::with_capacity(initial_k);
-    let mut direct_r0 = None;
-    let mut direct_msg1 = None;
-    let mut round_diag: Vec<(f64, f64, bool)> = Vec::new();
-    let mut induce_diag: Vec<(usize, usize, usize, f64, bool)> = Vec::new();
     for j in 0..initial_k {
-        let _tg = std::time::Instant::now();
+        // Fold-challenge grinding: the L0 proximity-gap bad event lives on
+        // each of these lane-fold challenges, so each one is individually
+        // PoW-guarded (a cheating prover re-rolls a fold challenge by
+        // varying the preceding sumcheck message; the grind prices every
+        // such attempt). Tapered per round: round j folds a 2^{ℓ-j}-row word
+        // whose MCA error carries the factor 2^{ℓ-1-j} (App. C.3 Lemma
+        // `mca-commutes`), so it needs (fold_bits − j) bits — one fewer per
+        // round than the worst (j=0) round `fold_grinding_bits` is sized for.
+        // Derived from fold_grinding_bits + round index; not stored.
         let bits = fold_bits(0).saturating_sub(j as u32);
         if bits > 0 {
-            fold_grinding_nonces.push(challenger.grind_pow_any_valid(bits));
+            fold_grinding_nonces.push(challenger.grind_pow(bits));
         }
-        let grind_ms = _tg.elapsed().as_secs_f64() * 1e3;
-        crate::rstrace::ev("r:grind", j as u32);
         let r = challenger.sample_f128();
-        let _tf = std::time::Instant::now();
-        let msg = if direct_fold8_mode && j < 6 {
-            let msg = if j < 5 {
-                fold_direct_fold8_factors_and_message(
-                    direct_fold8
-                        .as_mut()
-                        .expect("direct-fold8 factors remain live through round five"),
-                    r,
-                )
-            } else {
-                let direct = direct_fold8
-                    .take()
-                    .expect("direct-fold8 factors consumed once");
-                let l1_precommit = l1_precommit_candidate.then_some(DirectFold8L1Precommit {
-                    log_msg_cols: log_msg_cols_1,
-                    log_num_interleaved: log_num_interleaved_1,
-                    log_inv_rate: log_inv_rate_1,
-                    kind: config.merkle_hash,
-                });
-                let (f8, b8, msg, precommitted) = materialize_direct_fold8(
-                    packed_witness.take().unwrap(),
-                    b_initial.take().unwrap(),
-                    &direct,
-                    [
-                        fold4_challenges[0],
-                        fold4_challenges[1],
-                        fold4_challenges[2],
-                        fold4_challenges[3],
-                        fold4_challenges[4],
-                        r,
-                    ],
-                    l1_precommit,
-                );
-                early_wtns_1 = precommitted;
-                debug_assert_eq!(l1_precommit_candidate, early_wtns_1.is_some());
-                sc_prover = Some(SumcheckProver::new_after_direct_fold8(
-                    f8,
-                    b8,
-                    target,
-                    [
-                        start_msg,
-                        fold4_msgs[0],
-                        fold4_msgs[1],
-                        fold4_msgs[2],
-                        fold4_msgs[3],
-                        fold4_msgs[4],
-                        msg,
-                    ],
-                    fold_arena.take(),
-                ));
-                msg
-            };
-            fold4_challenges.push(r);
-            fold4_msgs.push(msg);
-            msg
-        } else if direct_fold4_mode && j < 4 {
-            let msg = match j {
-                0 => eval_lookahead(
-                    round1_lookahead
-                        .as_ref()
-                        .expect("direct-fold4 requires round-one lookahead"),
-                    r,
-                ),
-                1 => eval_fold4_lookahead2(
-                    round2_lookahead
-                        .as_ref()
-                        .expect("direct-fold4 requires round-two lookahead"),
-                    fold4_challenges[0],
-                    r,
-                ),
-                2 => eval_fold4_lookahead3(
-                    round3_lookahead
-                        .as_ref()
-                        .expect("direct-fold4 requires round-three lookahead"),
-                    fold4_challenges[0],
-                    fold4_challenges[1],
-                    r,
-                ),
-                _ => {
-                    let direct = direct_fold4
-                        .take()
-                        .expect("direct-fold4 factors consumed once");
-                    let (f4, b4, msg) = materialize_direct_fold4(
-                        packed_witness.take().unwrap(),
-                        b_initial.take().unwrap(),
-                        &direct,
-                        [
-                            fold4_challenges[0],
-                            fold4_challenges[1],
-                            fold4_challenges[2],
-                            r,
-                        ],
-                    );
-                    sc_prover = Some(SumcheckProver::new_after_direct_fold4(
-                        f4,
-                        b4,
-                        target,
-                        [start_msg, fold4_msgs[0], fold4_msgs[1], fold4_msgs[2], msg],
-                        fold_arena.take(),
-                    ));
-                    msg
-                }
-            };
-            fold4_challenges.push(r);
-            fold4_msgs.push(msg);
-            msg
-        } else if direct_mode && j == 0 {
-            let msg = eval_lookahead(
-                round1_lookahead
-                    .as_ref()
-                    .expect("direct AB fold2 requires round-one lookahead"),
-                r,
-            );
-            direct_r0 = Some(r);
-            direct_msg1 = Some(msg);
-            msg
-        } else if direct_mode && j == 1 {
-            let direct = direct_fold2
-                .take()
-                .expect("direct AB factors consumed once");
-            let (f2, b2, msg) = materialize_direct_ab_fold2(
-                packed_witness.take().unwrap(),
-                b_initial.take().unwrap(),
-                &direct,
-                direct_r0.take().unwrap(),
-                r,
-            );
-            sc_prover = Some(SumcheckProver::new_after_direct_fold2(
-                f2,
-                b2,
-                target,
-                [start_msg, direct_msg1.take().unwrap(), msg],
-                fold_arena.take(),
-            ));
-            msg
-        } else {
-            sc_prover.as_mut().unwrap().fold(r)
-        };
-        if trace {
-            round_diag.push((
-                grind_ms,
-                _tf.elapsed().as_secs_f64() * 1e3,
-                sc_prover.as_ref().is_some_and(SumcheckProver::f_is_arena),
-            ));
-        }
+        let msg = sc_prover.fold(r);
         challenger.observe_f128(msg.u_0);
         challenger.observe_f128(msg.u_2);
-        crate::rstrace::ev("r:fold", j as u32);
         r_lane_fold.push(r);
     }
     if trace {
         t_init_sumcheck += _t.elapsed();
     }
-    let mut sc_prover = sc_prover.expect("direct state must materialize during the initial rounds");
 
-    let wtns_1 = match early_wtns_1.take() {
-        Some(witness) => witness,
-        None => {
-            let _t = std::time::Instant::now();
-            let ntt_1 = AdditiveNttF128::standard(log_msg_cols_1 + log_inv_rate_1);
-            let witness = ligero_commit(
-                sc_prover.f(),
-                log_msg_cols_1,
-                log_num_interleaved_1,
-                log_inv_rate_1,
-                &ntt_1,
-                config.merkle_hash,
-            );
-            if trace {
-                t_commits += _t.elapsed();
-            }
-            witness
-        }
-    };
-    challenger.observe_bytes(&wtns_1.root());
-    crate::rstrace::ev("L1:root", 0);
-
-    let lazy_l1_ood = ranked_l1_lazy_ood_eq_enabled(
-        config,
-        log_n,
-        n1,
-        ood_count(1),
-        sc_prover.f().len(),
-        direct_fold4_mode || direct_fold8_mode,
+    // Commit f^1 = folded packed witness as wtns_1.
+    let n1 = log_n - initial_k;
+    let log_num_interleaved_1 = config.recursive_ks[0];
+    assert!(n1 >= log_num_interleaved_1);
+    let log_msg_cols_1 = n1 - log_num_interleaved_1;
+    let log_inv_rate_1 = config.log_inv_rates[1];
+    let _t = std::time::Instant::now();
+    let ntt_1 = AdditiveNttF128::standard(log_msg_cols_1 + log_inv_rate_1);
+    let f1 = sc_prover.f().to_vec();
+    let wtns_1 = ligero_commit(
+        &f1,
+        log_msg_cols_1,
+        log_num_interleaved_1,
+        log_inv_rate_1,
+        &ntt_1,
+        config.merkle_hash,
     );
+    if trace {
+        t_commits += _t.elapsed();
+    }
+    challenger.observe_bytes(&wtns_1.root());
 
+    // OOD binding for the L1 commit: each sample evaluates f1's multilinear
+    // extension at a random transcript point z ∈ F^{n1}, sends the claimed
+    // value, and folds the claim `Σ_x f1(x)·eq(z,x) = y` into the running
+    // sumcheck (introduce + glue). Binds the prover to a single codeword of
+    // the interleaved list before any of L0's queries are drawn.
     {
         let _t = std::time::Instant::now();
         for _ in 0..ood_count(1) {
             let z = challenger.sample_f128_vec(n1);
-            let (intro, y) = if lazy_l1_ood {
-                sc_prover
-                    .introduce_new_ood_factorized(&z)
-                    .expect("ranked factorized OOD introduction shape changed")
-            } else {
-                let eq_z = build_eq_table_split(&z);
-                sc_prover.introduce_new_with_eval(eq_z)
-            };
+            // Build eq(z, ·) once and fuse the MLE eval `y = f̂1(z)` into the
+            // introduce round message (single pass over f1 + eq_z), instead of
+            // a separate `mle_eval_inline` fold.
+            let eq_z = build_eq_table(&z);
+            let (intro, y) = sc_prover.introduce_new_with_eval(eq_z);
             challenger.observe_f128(y);
             ood_values.push(y);
             challenger.observe_f128(intro.u_0);
             challenger.observe_f128(intro.u_2);
             let beta = challenger.sample_f128();
-            if lazy_l1_ood {
-                sc_prover.glue_factorized_ood(beta);
-            } else {
-                sc_prover.glue(beta);
-            }
+            sc_prover.glue(beta);
         }
         if trace {
             t_ood += _t.elapsed();
         }
     }
 
-    crate::rstrace::ev("L1:ood", 0);
-    // Lane gl2: retired level witnesses stay alive until every deferred
-    // gather has been waited for (`gl2_jobs` is dropped first).
-    let gl2_defer = gl2_defer_enabled();
-    let mut gl2_retired: Vec<LigeroWitness> = Vec::new();
-    let mut gl2_jobs = Gl2DeferSet(Vec::new());
-    let mut gl2_l1_job: Option<std::sync::Arc<Gl2Deferred>> = None;
-    let mut gl2_level_jobs: Vec<(usize, std::sync::Arc<Gl2Deferred>)> = Vec::new();
-    let mut gl2_side_done: Vec<crate::hot_pool::side::Task> = Vec::new();
-    let pow_nonce_0 = challenger.grind_pow_any_valid(config.grinding_bits[0] as u32);
-    crate::rstrace::ev("L1:qgrind", 0);
+    // Query-phase PoW grinding for L0: each ground bit substitutes for
+    // ~1/log₂(1/(1−γ)) queries at this level (the Slim profile grinds 16
+    // bits here). Verifier mirror checks the nonce; both then proceed to
+    // sample query positions. (The proximity-gap shortfall is covered
+    // separately by the fold-challenge grinds above.)
+    let pow_nonce_0 = challenger.grind_pow(config.grinding_bits[0] as u32);
     let mut grinding_nonces: Vec<u64> = vec![pow_nonce_0];
 
+    // Open L0; lane-fold weights = r_lane_fold.
     let num_queries_0 = config.queries[0];
-    let sparse_dual_depth = ranked_sparse_dual_l0_depth(
-        config,
-        log_n,
-        n1,
-        sc_prover.f().len(),
-        num_queries_0,
-        log_inv_rate_0,
-        lazy_l1_ood,
-        direct_fold8_mode,
-    );
-    let gl2_s0 = match sparse_dual_depth {
-        Some(depth) if gl2_defer && gl2_stream_enabled() && lig_sparse_dual_snapshot_enabled() => {
-            Some(Gl2DualStream::start(
-                depth,
-                n1 + log_inv_rate_0,
-                l0_codeword,
-                l0_num_interleaved,
-                &r_lane_fold,
-                num_queries_0,
-            ))
-        }
-        _ => None,
-    };
-    let (queries_0, gl2_perm0) = match &gl2_s0 {
-        Some(st) => sample_distinct_queries_streamed(challenger, l0_block_len, num_queries_0, st),
-        None => (sample_distinct_queries(challenger, l0_block_len, num_queries_0), Vec::new()),
-    };
+    let queries_0 = sample_distinct_queries(challenger, l0_block_len, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
-    crate::rstrace::evd("L1:qs", queries_0.len() as u32);
-    let open_l0 = || {
-        let opened_rows = gather_opened_rows(&queries_0, l0_row, serial_par_enabled());
-        crate::rstrace::evd("L1:rows", 0);
-        let merkle_proof = merkle_multi_proof_for_l0(
-            l0_tree,
-            l0_codeword,
-            l0_block_len,
-            l0_num_interleaved,
-            &queries_0,
-            config.merkle_hash,
-        );
-        crate::rstrace::evd("L1:mp", 0);
-        (opened_rows, merkle_proof)
-    };
-
-    let sks_vks_n1 = if induce_lazy_sks_enabled() {
-        None
-    } else {
-        Some(eval_sk_at_vks(n1))
-    };
     let _t = std::time::Instant::now();
-    let ((opened_rows_0, merkle_proof_0), (basis_0_induced, sparse_dual_0, enforced_sum_0)) =
-        if let (Some(depth), true) = (sparse_dual_depth, gl2_defer) {
-            let (tree_p, cw_p) = (Gl2Ptr::of(l0_tree), Gl2Ptr::of(l0_codeword));
-            let (bl, ni, kind) = (l0_block_len, l0_num_interleaved, config.merkle_hash);
-            let qs = queries_0.clone();
-            let job = Gl2Deferred::spawn(Box::new(move || {
-                // SAFETY: the L0 tree / codeword are borrowed for the whole
-                // open; `gl2_jobs` waits for this job before it returns.
-                let (tree, cw) = unsafe { (tree_p.get(), cw_p.get()) };
-                let lay = crate::ntt::additive_ntt_f128::L0Rows::of(cw);
-                let rows = gather_opened_rows(&qs, |q| { let q = lay.row(q); &cw[q * ni..(q + 1) * ni] }, serial_par_enabled());
-                let mp = merkle_multi_proof_for_l0(tree, cw, bl, ni, &qs, kind);
-                crate::rstrace::evd("L1:deferred", 0);
-                (rows, mp)
-            }));
-            gl2_jobs.0.push(job.clone());
-            gl2_l1_job = Some(job);
-            crate::rstrace::evd("L1:dual0", 0);
-            // Lane sl1: warm holders for L1's three fold grinds (~0.05 ms ahead).
-            crate::challenger::sl1_grind_prewarm(sl1_hold_us(120));
-            let (dual, enforced_sum) = if let Some(st) = gl2_s0.as_deref() {
-                let r = SparseDualL0::from_stream(st, log_inv_rate_0, queries_0.clone(), &gl2_perm0, &alpha_0);
-                gl2_side_done.extend(st.take_side());
-                r
-            } else {
-                SparseDualL0::new(
-                    depth,
-                    n1 + log_inv_rate_0,
-                    log_inv_rate_0,
-                    l0_codeword,
-                    l0_num_interleaved,
-                    &r_lane_fold,
-                    &queries_0,
-                    &alpha_0,
-                )
-            };
-            crate::rstrace::evd("L1:dual1", 0);
-            ((Vec::new(), Vec::new()), (None, Some(dual), enforced_sum))
-        } else if let Some(depth) = sparse_dual_depth {
-            let ((dual, enforced_sum), opened) = rayon::join(
-                || {
-                    crate::rstrace::evd("L1:dual0", 0);
-                    let r = SparseDualL0::new(
-                        depth,
-                        n1 + log_inv_rate_0,
-                        log_inv_rate_0,
-                        l0_codeword,
-                        l0_num_interleaved,
-                        &r_lane_fold,
-                        &queries_0,
-                        &alpha_0,
-                    );
-                    crate::rstrace::evd("L1:dual1", 0);
-                    r
-                },
-                open_l0,
-            );
-            (opened, (None, Some(dual), enforced_sum))
-        } else {
-            let opened = open_l0();
-            if trace {
-                t_opens += _t.elapsed();
-            }
-            let (basis, enforced_sum) = induce_sumcheck_poly_auto(
-                n1,
-                log_inv_rate_0,
-                sks_vks_n1.as_deref(),
-                &opened.0,
-                &r_lane_fold,
-                &queries_0,
-                &alpha_0,
-            );
-            (opened, (Some(basis), None, enforced_sum))
-        };
+    let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| l0_row(q).to_vec()).collect();
+    let merkle_proof_0 = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
     if trace {
-        let d = _t.elapsed();
-        t_induce += d;
-        let lb = n1 + log_inv_rate_0;
-        induce_diag.push((
-            0,
-            n1,
-            queries_0.len(),
-            d.as_secs_f64() * 1e3,
-            n1 >= 12 && queries_0.len() > 4 * (1usize << log_inv_rate_0) * lb.max(1),
-        ));
+        t_opens += _t.elapsed();
     }
-
-    crate::rstrace::ev("L1:open+induce", 0);
     let initial_proof = RecursiveProof {
-        opened_rows: opened_rows_0,
+        opened_rows: opened_rows_0.clone(),
         merkle_proof: merkle_proof_0,
     };
 
+    // Induce basis_0 from wtns_0 opens. L0 dominates the induce phase, where the
+    // sparse-prefix Fᵀ-NTT path wins; the dispatcher auto-selects it (deeper
+    // levels stay dense).
+    let sks_vks_n1 = eval_sk_at_vks(n1);
     let _t = std::time::Instant::now();
-    let intro_msg_0 = if let Some(dual) = sparse_dual_0.as_ref() {
-        let msg = dual.round_msg(&[]);
-        sc_prover.introduce_sparse_dual(msg);
-        msg
-    } else {
-        sc_prover.introduce_new(
-            basis_0_induced.expect("ordinary L0 induce basis missing"),
-            enforced_sum_0,
-        )
-    };
+    let (basis_0_induced, enforced_sum_0) = induce_sumcheck_poly_auto(
+        n1,
+        log_inv_rate_0,
+        &sks_vks_n1,
+        &opened_rows_0,
+        &r_lane_fold,
+        &queries_0,
+        &alpha_0,
+    );
+    if trace {
+        t_induce += _t.elapsed();
+    }
+
+    // Introduce + glue basis_0.
+    let _t = std::time::Instant::now();
+    let intro_msg_0 = sc_prover.introduce_new(basis_0_induced, enforced_sum_0);
     challenger.observe_f128(intro_msg_0.u_0);
     challenger.observe_f128(intro_msg_0.u_2);
     let beta_0 = challenger.sample_f128();
-    let mut active_sparse_dual_0 = if let Some(mut dual) = sparse_dual_0 {
-        sc_prover.glue_sparse_dual(beta_0, enforced_sum_0);
-        dual.scale(beta_0);
-        let depth = dual.depth;
-        Some((dual, Vec::<F128>::with_capacity(depth)))
-    } else if ranked_deferred_induced_glue_enabled(
-        config,
-        log_n,
-        n1,
-        sc_prover.f().len(),
-        num_queries_0,
-        log_inv_rate_0,
-        lazy_l1_ood,
-        direct_fold8_mode,
-    ) {
-        sc_prover.glue_deferred_into_factorized_ood_fold(beta_0);
-        None
-    } else {
-        sc_prover.glue(beta_0);
-        None
-    };
+    sc_prover.glue(beta_0);
     if trace {
         t_intro_glue += _t.elapsed();
     }
 
-    crate::rstrace::ev("L1:intro+glue", 0);
+    // Recursive levels — same as recursive_prover_inner from here.
     let mut wtns_prev = wtns_1;
     let mut recursive_roots: Vec<Hash> = vec![wtns_prev.root()];
     let mut recursive_proofs: Vec<RecursiveProof> = Vec::new();
-    let mut active_deep_duals: Vec<(SparseDualL0, Vec<F128>)> = Vec::with_capacity(2);
 
-    let mut gl2_tail: Option<crate::hot_pool::side::Task> = None;
-    // Lane op: a sparse dual's basis materializing off the critical path
-    // (`op_bg_dual_enabled`), consumed by the next level's first fold.
-    let mut op_bg_job: Option<std::sync::Arc<Gl2Deferred<Vec<F128>>>> = None;
     for i in 0..r {
-        if i + 2 == r || r == 1 {
-            // Lane gl2: the publisher's tail hook, run by an idle spinner
-            // during the last two (small) levels so it is done well before
-            // the publish (see `GL2_TAIL_HOOK`).
-            gl2_tail = crate::GL2_TAIL_HOOK.get().copied().map(|h| {
-                let once = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let t: crate::hot_pool::side::Task = std::sync::Arc::new(move |_sib: bool| {
-                    if !once.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                        h();
-                        crate::rstrace::evd("fin:hook", 0);
-                    }
-                });
-                crate::hot_pool::side::register(t.clone());
-                t
-            });
-        }
         let k_i = config.recursive_ks[i];
         let mut level_rs = Vec::with_capacity(k_i);
         let _t = std::time::Instant::now();
         for j in 0..k_i {
+            // These folds fold level i+1's commitment — fold-challenge
+            // grinding guards its proximity-gap term. Tapered per round:
+            // round j needs (fold_bits − j) bits (see L0 loop).
             let bits = fold_bits(i + 1).saturating_sub(j as u32);
             if bits > 0 {
-                fold_grinding_nonces.push(challenger.grind_pow_any_valid(bits));
+                fold_grinding_nonces.push(challenger.grind_pow(bits));
             }
-            crate::rstrace::ev("lv:fgrind", (i * 16 + j) as u32);
             let ri = challenger.sample_f128();
-            // Lane opus-pcs: the sparse duals' round steps and materialization
-            // read only their own state and the fold challenges, never the
-            // sumcheck prover, so they run beside `sc_prover.fold(ri)` (a
-            // bandwidth-bound pass) instead of after it. Their deltas and
-            // bases are then applied in the incumbent order: identical
-            // messages (XOR-adds into the same last message), identical
-            // defer/merge sequence, identical transcript.
-            let has_dual_work = active_sparse_dual_0.is_some() || !active_deep_duals.is_empty();
-            // Join only where it can pay: the fold is a parallel pass (input
-            // >= 8192, i.e. half >= the fold's PAR_THRESHOLD) or a dual
-            // materializes this round. A tiny serial fold beside a few
-            // query-sized round steps is cheaper inline than a join.
-            let join_pays = sc_prover.f().len() >= (1 << 13)
-                || sparse_duals_materialize_next(&active_sparse_dual_0, &active_deep_duals);
-            // Lane op: the L0 dual reaching its depth at this level's last fold
-            // materializes in the background (the next level's first fold adds
-            // it to the combined basis).
-            let defer_l0 = op_bg_dual_enabled() && j + 1 == k_i && i + 1 < r;
-            let defer_deep = od_deep_bg_enabled() && j + 1 == k_i && i + 1 < r;
-            // Lane op: a background basis joins this level's first fold.
-            if j == 0 {
-                if let Some(job) = op_bg_job.take() {
-                    gl2_side_done.extend(job.take_side());
-                    let basis = job.wait().expect("background sparse-dual materialization panicked");
-                    sc_prover.attach_folded_sparse_dual(basis);
-                }
-            }
-            let (mut msg, dual_work) = if has_dual_work && join_pays && opus_dual_join_enabled() {
-                let (l0, deep, scp) =
-                    (&mut active_sparse_dual_0, &mut active_deep_duals, &mut sc_prover);
-                if c4_join_swap_enabled() && c4_fold_wants_team(scp.f().len()) {
-                    rayon::join(|| scp.fold(ri), || sparse_duals_fold_step(l0, deep, ri, defer_l0, defer_deep))
-                } else {
-                    let (work, msg) = rayon::join(
-                        || sparse_duals_fold_step(l0, deep, ri, defer_l0, defer_deep),
-                        || scp.fold(ri),
-                    );
-                    (msg, work)
-                }
-            } else {
-                let msg = sc_prover.fold(ri);
-                (msg, sparse_duals_fold_step(&mut active_sparse_dual_0, &mut active_deep_duals, ri, defer_l0, defer_deep))
-            };
-            if let Some(delta) = dual_work.l0_delta {
-                msg = sc_prover.add_to_last_message(delta);
-            }
-            // Lane op: the L0 dual whose materialization was left to us (its
-            // round delta was applied above, as before).
-            let mut left = if dual_work.l0_left { active_sparse_dual_0.take() } else { None };
-            if let Some(basis) = dual_work.l0_basis {
-                if j + 1 < k_i {
-                    sc_prover.defer_folded_sparse_dual(basis, F128::ONE);
-                } else {
-                    sc_prover.merge_folded_sparse_dual(basis);
-                }
-                active_sparse_dual_0 = None;
-            }
-            if !active_deep_duals.is_empty() {
-                if let Some(delta) = dual_work.deep_delta {
-                    msg = sc_prover.add_to_last_message(delta);
-                }
-                if let Some(basis) = dual_work.deep_basis {
-                    if j + 1 < k_i {
-                        sc_prover.defer_folded_sparse_dual(basis, F128::ONE);
-                    } else {
-                        sc_prover.merge_folded_sparse_dual(basis);
-                    }
-                }
-                if let Some(k) = dual_work.deep_left {
-                    assert!(left.is_none(), "one background basis per fold");
-                    left = Some(active_deep_duals.remove(k));
-                }
-                active_deep_duals
-                    .retain(|(dual, fold_challenges)| fold_challenges.len() < dual.depth);
-            }
-            if let Some((dual, fold_challenges)) = left {
-                assert!(op_bg_job.is_none(), "one background basis per level");
-                // Claimable by spinners once a sub-group of the next level's
-                // commit has finished (no fused commit runs before it), so
-                // every sub-group already has a worker; the next level's
-                // first fold waits for it (and runs it if still unclaimed).
-                let base = crate::pcs::commit::subs_done();
-                let gate: Box<dyn Fn() -> bool + Send + Sync> =
-                    Box::new(move || crate::pcs::commit::subs_done() != base);
-                op_bg_job = Some(Gl2Deferred::spawn_off_sibling(
-                    Box::new(move || dual.materialize_after_folds(&fold_challenges)),
-                    Some(gate),
-                ));
-            }
+            let msg = sc_prover.fold(ri);
             challenger.observe_f128(msg.u_0);
             challenger.observe_f128(msg.u_2);
-            crate::rstrace::ev("lv:fold", (i * 16 + j) as u32);
             level_rs.push(ri);
         }
         if trace {
@@ -10930,47 +3286,19 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             for v in &yr {
                 challenger.observe_f128(*v);
             }
-            crate::rstrace::ev("fin:yr", 0);
-            let nonce_last = challenger.grind_pow_any_valid(config.grinding_bits[i + 1] as u32);
-            crate::rstrace::ev("fin:qgrind", 0);
+            // PoW grinding for the last level before sampling its queries.
+            let nonce_last = challenger.grind_pow(config.grinding_bits[i + 1] as u32);
             grinding_nonces.push(nonce_last);
             let num_queries_last = config.queries[i + 1];
             let queries_last =
                 sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_last);
             let _t = std::time::Instant::now();
-            crate::rstrace::evd("fin:qs", 0);
-            // Lane gl2: rows and multiproof of the final level side by side
-            // (`FLOCK_NO_GL2_FIN_JOIN=1`: one after the other, incumbent).
-            static FIN_JOIN: std::sync::LazyLock<bool> =
-                std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL2_FIN_JOIN").is_none());
-            let (opened_rows_last, merkle_proof_last): (Vec<Vec<F128>>, Vec<Hash>) = if *FIN_JOIN {
-                rayon::join(
-                    || gather_opened_rows(&queries_last, |q| wtns_prev.row(q), false),
-                    || multi_proof_gather(&wtns_prev.tree, wtns_prev.block_len, &queries_last, false),
-                )
-            } else {
-                let rows = gather_opened_rows(&queries_last, |q| wtns_prev.row(q), lf1_open_par());
-                crate::rstrace::evd("fin:rows", 0);
-                let mp = multi_proof_gather(&wtns_prev.tree, wtns_prev.block_len, &queries_last, lf1_open_par());
-                (rows, mp)
-            };
-            crate::rstrace::ev("fin:open", 0);
-            let mut initial_proof = initial_proof;
-            if let Some(job) = gl2_l1_job.take() {
-                gl2_side_done.extend(job.take_side());
-                let (rows, mp) = job.wait().expect("deferred L1 open gather panicked");
-                initial_proof.opened_rows = rows;
-                initial_proof.merkle_proof = mp;
-            }
-            for (k, job) in gl2_level_jobs.drain(..) {
-                gl2_side_done.extend(job.take_side());
-                let (rows, mp) = job.wait().expect("deferred level open gather panicked");
-                recursive_proofs[k].opened_rows = rows;
-                recursive_proofs[k].merkle_proof = mp;
-            }
-            gl2_side_done.extend(gl2_tail.take());
-            crate::hot_pool::side::unregister_many(&gl2_side_done);
-            crate::rstrace::ev("fin:joined", 0);
+            let opened_rows_last: Vec<Vec<F128>> = queries_last
+                .iter()
+                .map(|&q| wtns_prev.row(q).to_vec())
+                .collect();
+            let merkle_proof_last =
+                merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
             if trace {
                 t_opens += _t.elapsed();
             }
@@ -10981,9 +3309,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     "  initial sumcheck (initial_k folds + SC build): {:.2} ms",
                     t_init_sumcheck.as_secs_f64() * 1e3
                 );
-                for (j, (g, f, a)) in round_diag.iter().enumerate() {
-                    eprintln!("    round {j}: grind {g:.2} ms, fold {f:.2} ms, arena={a}",);
-                }
                 eprintln!(
                     "  recursive commits (NTT + merkle):              {:.2} ms",
                     t_commits.as_secs_f64() * 1e3
@@ -10996,11 +3321,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     "  induce_sumcheck_poly:                          {:.2} ms",
                     t_induce.as_secs_f64() * 1e3
                 );
-                for (lvl, lmc, nq, ms, ntt) in induce_diag.iter() {
-                    eprintln!(
-                        "    induce L{lvl}: log_msg_cols={lmc} queries={nq} ntt={ntt} {ms:.2} ms",
-                    );
-                }
                 eprintln!(
                     "  sumcheck recursive folds:                      {:.2} ms",
                     t_sumcheck_folds.as_secs_f64() * 1e3
@@ -11017,7 +3337,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     );
                 }
             }
-            let proof = LigeritoProof {
+            return LigeritoProof {
                 initial_root,
                 initial_proof,
                 recursive_roots,
@@ -11027,20 +3347,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     opened_rows: opened_rows_last,
                     merkle_proof: merkle_proof_last,
                 },
-                sumcheck_transcript: std::mem::take(&mut sc_prover.transcript),
+                sumcheck_transcript: sc_prover.transcript().to_vec(),
                 grinding_nonces,
                 ood_values,
                 fold_grinding_nonces,
             };
-            // Lane sl2 (`FLOCK_NO_SL2_LEAK`): the timed prove's process exits
-            // right after publishing; skip freeing (munmap + TLB shootdowns)
-            // the retired level witnesses and the last fold state here.
-            if crate::sl2_leak_tail() {
-                std::mem::forget(std::mem::take(&mut gl2_retired));
-                std::mem::forget(wtns_prev);
-                std::mem::forget(sc_prover);
-            }
-            return proof;
         }
 
         let n_next = sc_prover.f().len().trailing_zeros() as usize;
@@ -11050,8 +3361,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let log_inv_rate_next = config.log_inv_rates[i + 2];
         let _t = std::time::Instant::now();
         let ntt_next = AdditiveNttF128::standard(log_msg_cols_next + log_inv_rate_next);
+        let f_evals = sc_prover.f().to_vec();
         let wtns_next = ligero_commit(
-            sc_prover.f(),
+            &f_evals,
             log_msg_cols_next,
             log_num_interleaved_next,
             log_inv_rate_next,
@@ -11063,260 +3375,87 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         }
         let root_next = wtns_next.root();
         challenger.observe_bytes(&root_next);
-        crate::rstrace::ev("lv:root", i as u32);
         recursive_roots.push(root_next);
 
-        let lazy_deep_ood = ranked_deep_lazy_ood_eq_enabled(
-            config,
-            log_n,
-            n_next,
-            ood_count(i + 2),
-            sc_prover.f().len(),
-            direct_fold4_mode || direct_fold8_mode,
-        );
-
+        // OOD binding for the L_{i+2} commit (same as the L1 block above).
         {
             let _t = std::time::Instant::now();
             for _ in 0..ood_count(i + 2) {
                 let z = challenger.sample_f128_vec(n_next);
-                crate::rstrace::evd("lv:oodz", i as u32);
-                let (intro, y) = if lazy_deep_ood {
-                    sc_prover
-                        .introduce_new_ood_factorized(&z)
-                        .expect("ranked factorized deep OOD introduction shape changed")
-                } else {
-                    let eq_z = build_eq_table_split(&z);
-                    sc_prover.introduce_new_with_eval(eq_z)
-                };
-                crate::rstrace::evd("lv:oodi", i as u32);
+                let eq_z = build_eq_table(&z);
+                let (intro, y) = sc_prover.introduce_new_with_eval(eq_z);
                 challenger.observe_f128(y);
                 ood_values.push(y);
                 challenger.observe_f128(intro.u_0);
                 challenger.observe_f128(intro.u_2);
                 let beta = challenger.sample_f128();
-                if lazy_deep_ood {
-                    sc_prover.glue_factorized_ood(beta);
-                } else {
-                    sc_prover.glue(beta);
-                }
+                sc_prover.glue(beta);
             }
             if trace {
                 t_ood += _t.elapsed();
             }
         }
 
-        crate::rstrace::ev("lv:ood", i as u32);
-        let nonce_i = challenger.grind_pow_any_valid(config.grinding_bits[i + 1] as u32);
-        crate::rstrace::ev("lv:qgrind", i as u32);
+        // PoW grinding for this iteration's query phase.
+        let nonce_i = challenger.grind_pow(config.grinding_bits[i + 1] as u32);
         grinding_nonces.push(nonce_i);
         let num_queries_i = config.queries[i + 1];
-        let remaining_folds: usize = config.recursive_ks[i + 1..].iter().sum();
-        let deep_dual_depth = ranked_sparse_dual_deep_depth(
-            config,
-            log_n,
-            n_next,
-            sc_prover.f().len(),
-            num_queries_i,
-            config.log_inv_rates[i + 1],
-            lazy_deep_ood,
-            direct_fold8_mode,
-            remaining_folds,
-        );
-        let gl2_si = match deep_dual_depth {
-            Some(depth) if gl2_defer && gl2_stream_enabled() && lig_sparse_dual_snapshot_enabled() => {
-                Some(Gl2DualStream::start(
-                    depth,
-                    n_next + config.log_inv_rates[i + 1],
-                    &wtns_prev.mat,
-                    wtns_prev.num_interleaved,
-                    &level_rs,
-                    num_queries_i,
-                ))
-            }
-            _ => None,
-        };
-        let (queries_i, gl2_permi) = match &gl2_si {
-            Some(st) => sample_distinct_queries_streamed(challenger, wtns_prev.block_len, num_queries_i, st),
-            None => (sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i), Vec::new()),
-        };
+        let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
-        crate::rstrace::evd("lv:qs", i as u32);
-        let open_i = || {
-            let opened_rows =
-                gather_opened_rows(&queries_i, |q| wtns_prev.row(q), lf1_open_par());
-            crate::rstrace::evd("lv:rows", i as u32);
-            let merkle_proof =
-                multi_proof_gather(&wtns_prev.tree, wtns_prev.block_len, &queries_i, lf1_open_par());
-            crate::rstrace::evd("lv:mp", i as u32);
-            (opened_rows, merkle_proof)
-        };
-
-        let sks_vks_i = if induce_sched_enabled() && induce_lazy_sks_enabled() {
-            None
-        } else {
-            Some(eval_sk_at_vks(n_next))
-        };
         let _t = std::time::Instant::now();
-        let ((opened_rows_i, merkle_proof_i), (basis_i_induced, deep_dual_i, enforced_sum_i)) =
-            if let (Some(depth), true) = (deep_dual_depth, gl2_defer) {
-                let (mat_p, tree_p) = (Gl2Ptr::of(&wtns_prev.mat), Gl2Ptr::of(&wtns_prev.tree));
-                let (bl, ni) = (wtns_prev.block_len, wtns_prev.num_interleaved);
-                let qs = queries_i.clone();
-                let lvl = i as u32;
-                let job = Gl2Deferred::spawn(Box::new(move || {
-                    // SAFETY: this level's witness moves into `gl2_retired`
-                    // (heap buffers unchanged) and outlives `gl2_jobs`.
-                    let (mat, tree) = unsafe { (mat_p.get(), tree_p.get()) };
-                    let rows = gather_opened_rows(&qs, |q| &mat[q * ni..(q + 1) * ni], false);
-                    crate::rstrace::evd("lv:rows", lvl);
-                    let mp = multi_proof_gather(tree, bl, &qs, false);
-                    crate::rstrace::evd("lv:mp", lvl);
-                    (rows, mp)
-                }));
-                gl2_jobs.0.push(job.clone());
-                gl2_level_jobs.push((recursive_proofs.len(), job));
-                crate::rstrace::evd("lv:dual0", i as u32);
-                let (dual, enforced_sum) = if let Some(st) = gl2_si.as_deref() {
-                    let r = SparseDualL0::from_stream(
-                        st,
-                        config.log_inv_rates[i + 1],
-                        queries_i.clone(),
-                        &gl2_permi,
-                        &alpha_i,
-                    );
-                    gl2_side_done.extend(st.take_side());
-                    r
-                } else {
-                    SparseDualL0::new(
-                        depth,
-                        n_next + config.log_inv_rates[i + 1],
-                        config.log_inv_rates[i + 1],
-                        &wtns_prev.mat,
-                        wtns_prev.num_interleaved,
-                        &level_rs,
-                        &queries_i,
-                        &alpha_i,
-                    )
-                };
-                crate::rstrace::evd("lv:dual1", i as u32);
-                ((Vec::new(), Vec::new()), (None, Some(dual), enforced_sum))
-            } else if let Some(depth) = deep_dual_depth {
-                let ((dual, enforced_sum), opened) = rayon::join(
-                    || {
-                        crate::rstrace::evd("lv:dual0", i as u32);
-                        let r = SparseDualL0::new(
-                            depth,
-                            n_next + config.log_inv_rates[i + 1],
-                            config.log_inv_rates[i + 1],
-                            &wtns_prev.mat,
-                            wtns_prev.num_interleaved,
-                            &level_rs,
-                            &queries_i,
-                            &alpha_i,
-                        );
-                        crate::rstrace::evd("lv:dual1", i as u32);
-                        r
-                    },
-                    open_i,
-                );
-                (opened, (None, Some(dual), enforced_sum))
-            } else if induce_sched_enabled() {
-                let opened = open_i();
-                let (basis, enforced_sum) = induce_sumcheck_poly_auto(
-                    n_next,
-                    config.log_inv_rates[i + 1],
-                    sks_vks_i.as_deref(),
-                    &opened.0,
-                    &level_rs,
-                    &queries_i,
-                    &alpha_i,
-                );
-                (opened, (Some(basis), None, enforced_sum))
-            } else {
-                let opened = open_i();
-                let (basis, enforced_sum) = induce_sumcheck_poly(
-                    n_next,
-                    sks_vks_i
-                        .as_deref()
-                        .expect("sched-disabled induce always precomputes sks_vks"),
-                    &opened.0,
-                    &level_rs,
-                    &queries_i,
-                    &alpha_i,
-                );
-                (opened, (Some(basis), None, enforced_sum))
-            };
+        let opened_rows_i: Vec<Vec<F128>> = queries_i
+            .iter()
+            .map(|&q| wtns_prev.row(q).to_vec())
+            .collect();
+        let merkle_proof_i =
+            merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
         if trace {
-            let d = _t.elapsed();
-            t_induce += d;
-            let rate = config.log_inv_rates[i + 1];
-            induce_diag.push((
-                i + 1,
-                n_next,
-                queries_i.len(),
-                d.as_secs_f64() * 1e3,
-                induce_sched_enabled()
-                    && n_next >= 12
-                    && queries_i.len()
-                        > induce_ntt_crossover_c() * (1usize << rate) * (n_next + rate).max(1),
-            ));
+            t_opens += _t.elapsed();
         }
-
-        crate::rstrace::ev("lv:open+induce", i as u32);
         recursive_proofs.push(RecursiveProof {
-            opened_rows: opened_rows_i,
+            opened_rows: opened_rows_i.clone(),
             merkle_proof: merkle_proof_i,
         });
 
+        let sks_vks_i = eval_sk_at_vks(n_next);
         let _t = std::time::Instant::now();
-        let intro_msg_i = if let Some(dual) = deep_dual_i.as_ref() {
-            let msg = dual.round_msg(&[]);
-            sc_prover.introduce_sparse_dual(msg);
-            msg
-        } else {
-            sc_prover.introduce_new(
-                basis_i_induced.expect("ordinary deep induce basis missing"),
-                enforced_sum_i,
-            )
-        };
+        let (basis_i_induced, enforced_sum_i) = induce_sumcheck_poly(
+            n_next,
+            &sks_vks_i,
+            &opened_rows_i,
+            &level_rs,
+            &queries_i,
+            &alpha_i,
+        );
+        if trace {
+            t_induce += _t.elapsed();
+        }
+
+        let _t = std::time::Instant::now();
+        let intro_msg_i = sc_prover.introduce_new(basis_i_induced, enforced_sum_i);
         challenger.observe_f128(intro_msg_i.u_0);
         challenger.observe_f128(intro_msg_i.u_2);
         let beta_i = challenger.sample_f128();
-        if let Some(mut dual) = deep_dual_i {
-            sc_prover.glue_sparse_dual(beta_i, enforced_sum_i);
-            dual.scale(beta_i);
-            let depth = dual.depth;
-            active_deep_duals.push((dual, Vec::<F128>::with_capacity(depth)));
-        } else if ranked_deferred_induced_glue_enabled(
-            config,
-            log_n,
-            n_next,
-            sc_prover.f().len(),
-            num_queries_i,
-            config.log_inv_rates[i + 1],
-            lazy_deep_ood,
-            direct_fold8_mode,
-        ) {
-            sc_prover.glue_deferred_into_factorized_ood_fold(beta_i);
-        } else {
-            sc_prover.glue(beta_i);
-        }
+        sc_prover.glue(beta_i);
         if trace {
             t_intro_glue += _t.elapsed();
         }
 
-        crate::rstrace::ev("lv:intro+glue", i as u32);
-        let retired = std::mem::replace(&mut wtns_prev, wtns_next);
-        if gl2_defer {
-            gl2_retired.push(retired);
-        } else {
-            drop(retired);
-        }
+        wtns_prev = wtns_next;
     }
 
     unreachable!()
 }
 
+/// Succinct verifier for [`recursive_prover_with_basis`]: instead of accepting
+/// a dense `b_initial: &[F128]` (which would be ~16 MB at m=29), accepts a
+/// **closure** `eval_b` that evaluates `b_initial(point)` at any multilinear
+/// point. The verifier calls `eval_b` only `yr.len()` times (at the residual)
+/// — typically a few dozen times, not 2^L. Use this from
+/// `pcs::verify_opening_batch_ligerito_mixed` where the closure is built from
+/// `ring_switch::verify_succinct` outputs + PD claim points.
+///
+/// `log_n` is the original packed-witness log size (= b_initial's logical dim).
 #[allow(clippy::too_many_arguments)]
 pub fn recursive_verifier_with_basis_succinct<Ch, F>(
     config: &VerifierConfig,
@@ -11329,6 +3468,10 @@ pub fn recursive_verifier_with_basis_succinct<Ch, F>(
 ) -> bool
 where
     Ch: Challenger,
+    // Called ONCE at the residual check with the full ris and yr_log_n.
+    // Returns 2^yr_log_n values: eval_b(ris ++ y_bits) for y ∈ [0, 2^yr_log_n).
+    // This API allows callers to amortize prefix work across yr positions
+    // (e.g. ring_switch::eval_rs_eq_prefix + finish_from_prefix).
     F: Fn(&[F128], usize) -> Vec<F128>,
 {
     let trace = std::env::var("LIG_VERIFY_TRACE").is_ok();
@@ -11376,6 +3519,8 @@ where
     }
     let mut fold_nonce_idx = 0usize;
     let mut ood_idx = 0usize;
+    // OOD claims glued into the running sumcheck: each contributes
+    // `beta · Π_b eq(z_b, r_b) · eq(z_tail, ·)` at the residual.
     struct OodCtx {
         z: Vec<F128>,
         ris_start: usize,
@@ -11385,6 +3530,8 @@ where
 
     let mut r_lane_fold = Vec::with_capacity(initial_k);
     for j in 0..initial_k {
+        // Fold-challenge PoW mirror (L0's lane folds), tapered per round to
+        // (fold_bits − j) — see the prover's L0 loop.
         let bits = fold_bits(0).saturating_sub(j as u32);
         if bits > 0 {
             if fold_nonce_idx >= proof.fold_grinding_nonces.len() {
@@ -11414,6 +3561,9 @@ where
     let root_1 = proof.recursive_roots[0];
     challenger.observe_bytes(&root_1);
 
+    // OOD binding mirror for the L1 commit: sample z, read the claimed
+    // evaluation from the proof, and glue the claim into the running
+    // sumcheck exactly like the prover.
     for _ in 0..ood_count(1) {
         let z = challenger.sample_f128_vec(log_n - initial_k);
         if ood_idx >= proof.ood_values.len() {
@@ -11440,6 +3590,9 @@ where
         });
     }
 
+    // PoW grinding check for L0's query phase. With grinding_bits[0]=0 this
+    // is a no-op (still absorbs the 0 nonce so the FS state matches the
+    // prover side).
     let mut nonce_idx = 0usize;
     if nonce_idx >= proof.grinding_nonces.len() {
         return false;
@@ -11475,6 +3628,9 @@ where
         t_merkle += _t.elapsed();
     }
 
+    // Compute enforced_sum cheaply at intro time. The induced basis poly's
+    // residual evaluations are deferred to the final check (succinct path —
+    // see `induce_sumcheck_evaluate_at_residual`).
     let n1 = log_n - initial_k;
     let _t = std::time::Instant::now();
     let enforced_sum_0 = induce_sumcheck_enforced_sum(
@@ -11499,6 +3655,7 @@ where
     running_quad = RoundQuad::fold(&running_quad, &intro_quad_0, beta_0);
     t_r += beta_0 * enforced_sum_0;
 
+    // Per-level induced-basis evaluation context — small (no dense vec).
     struct LevelCtx {
         log_msg_cols: usize,
         queries: Vec<usize>,
@@ -11530,6 +3687,8 @@ where
         }
         let mut level_rs = Vec::with_capacity(k_i);
         for j in 0..k_i {
+            // Fold-challenge PoW mirror (level i+1's folds), tapered per round
+            // to (fold_bits − j) — see the prover's L0 loop.
             let bits = fold_bits(i + 1).saturating_sub(j as u32);
             if bits > 0 {
                 if fold_nonce_idx >= proof.fold_grinding_nonces.len() {
@@ -11571,6 +3730,7 @@ where
             for v in yr {
                 challenger.observe_f128(*v);
             }
+            // PoW grinding check for last level's query phase.
             if nonce_idx >= proof.grinding_nonces.len() {
                 return false;
             }
@@ -11580,6 +3740,7 @@ where
             ) {
                 return false;
             }
+            // (last nonce — nonce_idx is not advanced past it)
 
             let prev_block_len = 1usize << (prev_log_msg_cols + prev_log_inv_rate);
             let prev_num_interleaved = 1usize << prev_log_num_interleaved;
@@ -11587,6 +3748,10 @@ where
             let _t = std::time::Instant::now();
             let queries_last =
                 sample_distinct_queries(challenger, prev_block_len, num_queries_last);
+            // Basis-induction challenge for the LAST commitment. Sampled here —
+            // after `yr` was observed (top of this branch) and the queries are
+            // fixed — so a forged `yr` cannot be adapted to it. Mirrors `alpha_i`
+            // at every non-final level (see ~line 3377).
             let alpha_last = challenger.sample_f128_vec(ceil_log2(num_queries_last));
             if trace {
                 t_sample_q += _t.elapsed();
@@ -11607,6 +3772,19 @@ where
                 t_merkle += _t.elapsed();
             }
 
+            // Bind the LAST commitment to `yr`. Every non-final level folds its
+            // opened rows into the running sumcheck via induce_sumcheck; the
+            // final level used to only Merkle-check its opened rows, leaving `yr`
+            // (the claimed final message) constrained by a single scalar equation
+            // — so a malicious prover could solve for a `yr` that opens the
+            // commitment to an arbitrary value. We add the same proximity tie as
+            // the other levels: `enforced_sum_last` is the α-weighted lane-fold
+            // of the (Merkle-bound) opened rows, batched into `t_r` with a fresh
+            // `beta_last`; its induced basis is already at the residual dimension
+            // (zero further folds), so it joins `combined` below via this
+            // LevelCtx. With `alpha_last` drawn after `yr`, the batched check now
+            // forces `yr` to agree with the committed codeword at every queried
+            // column (multilinear Schwartz–Zippel), restoring binding.
             let enforced_sum_last = induce_sumcheck_enforced_sum(
                 &proof.final_proof.opened_rows,
                 &level_rs,
@@ -11623,6 +3801,8 @@ where
                 beta: beta_last,
             });
 
+            // Succinct residual check: per-level induced basis evaluations
+            // via closed-form (no dense materialization).
             let yr_len = yr.len();
             let yr_log_n = n_current;
 
@@ -11652,6 +3832,10 @@ where
                 }
             }
 
+            // OOD bases: closed-form residual. An eq(z, ·) basis introduced
+            // at dim |z| and folded by the subsequent challenges contributes
+            // `beta · Π_b eq(z_b, r_b)` times the eq table on z's unfolded
+            // tail (char-2 eq factor: 1 + a + b).
             let mut ood_residuals: Vec<Vec<F128>> = Vec::with_capacity(ood_ctxs.len());
             for ctx in &ood_ctxs {
                 if ctx.z.len() < yr_log_n || ctx.ris_start + (ctx.z.len() - yr_log_n) > ris.len() {
@@ -11669,6 +3853,8 @@ where
                 ood_residuals.push(tail);
             }
 
+            // Batch-evaluate b at all yr positions in one call so the
+            // caller can amortize prefix work (e.g. ring_switch tensor prefix).
             let _te = std::time::Instant::now();
             let evb_vec = eval_b_residual(&ris, yr_log_n);
             if trace {
@@ -11726,6 +3912,7 @@ where
         next_root_idx += 1;
         challenger.observe_bytes(&root_next);
 
+        // OOD binding mirror for the L_{i+2} commit.
         for _ in 0..ood_count(i + 2) {
             let z = challenger.sample_f128_vec(n_current);
             if ood_idx >= proof.ood_values.len() {
@@ -11752,6 +3939,7 @@ where
             });
         }
 
+        // PoW grinding check for this iteration's query phase.
         if nonce_idx >= proof.grinding_nonces.len() {
             return false;
         }
@@ -11832,6 +4020,9 @@ where
     unreachable!()
 }
 
+/// Verifier for [`recursive_prover_with_basis`]. Caller supplies the basis
+/// `b_initial` recomputed locally (typically from the combined claims) and
+/// `target`. Also supplies the L0 root (from the upstream `Commitment`).
 #[allow(clippy::too_many_arguments)]
 pub fn recursive_verifier_with_basis<Ch: Challenger>(
     config: &VerifierConfig,
@@ -11864,6 +4055,7 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
     let block_len_0 = 1usize << (log_msg_cols_0 + log_inv_rate_0);
     let num_interleaved_0 = 1usize << initial_k;
 
+    // Replay sumcheck: start msg → initial_k folds.
     let mut t_r = target;
     let mut tx_idx = 0usize;
     if tx_idx >= proof.sumcheck_transcript.len() {
@@ -11883,10 +4075,14 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
     }
     let mut fold_nonce_idx = 0usize;
     let mut ood_idx = 0usize;
+    // OOD eq bases glued into the running sumcheck, accumulated as
+    // (dense eq table, ris_start, beta) and added at the residual check.
     let mut ood_bases: Vec<(Vec<F128>, usize, F128)> = Vec::new();
 
     let mut r_lane_fold = Vec::with_capacity(initial_k);
     for j in 0..initial_k {
+        // Fold-challenge PoW mirror (L0's lane folds), tapered per round to
+        // (fold_bits − j) — see the prover's L0 loop.
         let bits = fold_bits(0).saturating_sub(j as u32);
         if bits > 0 {
             if fold_nonce_idx >= proof.fold_grinding_nonces.len() {
@@ -11910,12 +4106,14 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
         running_quad = RoundQuad::from_msg(msg, t_r);
     }
 
+    // Observe wtns_1 root + open wtns_0.
     if proof.recursive_roots.is_empty() {
         return false;
     }
     let root_1 = proof.recursive_roots[0];
     challenger.observe_bytes(&root_1);
 
+    // OOD binding mirror for the L1 commit.
     for _ in 0..ood_count(1) {
         let z = challenger.sample_f128_vec(log_n - initial_k);
         if ood_idx >= proof.ood_values.len() {
@@ -11938,6 +4136,8 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
         ood_bases.push((build_eq_table(&z), initial_k, beta));
     }
 
+    // PoW grinding check (dense verifier mirror) — keeps the FS state in
+    // lockstep with the prover even at grinding_bits = 0.
     let mut nonce_idx = 0usize;
     if nonce_idx >= proof.grinding_nonces.len() {
         return false;
@@ -11970,13 +4170,14 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
     let (basis_0_induced, enforced_sum_0) = induce_sumcheck_poly_auto(
         n1,
         log_inv_rate_0,
-        Some(&sks_vks_n1),
+        &sks_vks_n1,
         &proof.initial_proof.opened_rows,
         &r_lane_fold,
         &queries_0,
         &alpha_0,
     );
 
+    // Intro + glue.
     if tx_idx >= proof.sumcheck_transcript.len() {
         return false;
     }
@@ -11989,6 +4190,9 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
     running_quad = RoundQuad::fold(&running_quad, &intro_quad_0, beta_0);
     t_r += beta_0 * enforced_sum_0;
 
+    // Basis poly tracking for residual check.
+    // b_initial is the "level-0 basis" — it gets partial-eval'd at all ris.
+    // basis_0_induced is introduced at start (before any ris from level 0+) — partial-eval at the level-0+ ris.
     let mut basis_polys: Vec<Vec<F128>> = vec![b_initial.to_vec(), basis_0_induced];
     let mut basis_ris_starts: Vec<usize> = vec![0, initial_k];
     let mut basis_separations: Vec<F128> = vec![beta_0];
@@ -12009,6 +4213,8 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
         }
         let mut level_rs = Vec::with_capacity(k_i);
         for j in 0..k_i {
+            // Fold-challenge PoW mirror (level i+1's folds), tapered per round
+            // to (fold_bits − j) — see the prover's L0 loop.
             let bits = fold_bits(i + 1).saturating_sub(j as u32);
             if bits > 0 {
                 if fold_nonce_idx >= proof.fold_grinding_nonces.len() {
@@ -12050,6 +4256,7 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
             for v in yr {
                 challenger.observe_f128(*v);
             }
+            // PoW grinding check for last level (dense verifier).
             if nonce_idx >= proof.grinding_nonces.len() {
                 return false;
             }
@@ -12059,12 +4266,17 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
             ) {
                 return false;
             }
+            // (last nonce — nonce_idx is not advanced past it)
 
             let prev_block_len = 1usize << (prev_log_msg_cols + prev_log_inv_rate);
             let prev_num_interleaved = 1usize << prev_log_num_interleaved;
             let num_queries_last = config.queries[i + 1];
             let queries_last =
                 sample_distinct_queries(challenger, prev_block_len, num_queries_last);
+            // Final-level basis-induction challenge — sampled after `yr` and the
+            // queries are fixed. Same position as the succinct verifier
+            // (recursive_verifier_with_basis_succinct), which verifies the same
+            // proof, so both stay in lockstep.
             let alpha_last = challenger.sample_f128_vec(ceil_log2(num_queries_last));
             if !verify_level_opens(
                 &prev_root,
@@ -12078,6 +4290,11 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
                 return false;
             }
 
+            // Bind the LAST commitment to `yr`: induce its opened rows into the
+            // sumcheck exactly like every non-final level, batched with a fresh
+            // `beta_last`. Without this the last commitment is only Merkle-checked
+            // and `yr` is left unconstrained — a forged `yr` could open to any
+            // value. (Dense mirror of the succinct verifier fix.)
             let sks_vks_last = eval_sk_at_vks(n_current);
             let (basis_last_induced, enforced_sum_last) = induce_sumcheck_poly(
                 n_current,
@@ -12093,6 +4310,7 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
             basis_ris_starts.push(ris.len());
             basis_separations.push(beta_last);
 
+            // Residual check.
             let yr_len = yr.len();
             let mut combined = vec![F128::ZERO; yr_len];
             for (k, basis) in basis_polys.iter().enumerate() {
@@ -12110,6 +4328,7 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
                     *c += sep * rr;
                 }
             }
+            // OOD eq bases contribute the same way (dense tables).
             for (basis, start, beta) in &ood_bases {
                 let residual = partial_eval_lsb(basis, &ris[*start..]);
                 if residual.len() != yr_len {
@@ -12134,6 +4353,7 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
         next_root_idx += 1;
         challenger.observe_bytes(&root_next);
 
+        // OOD binding mirror for the L_{i+2} commit.
         for _ in 0..ood_count(i + 2) {
             let z = challenger.sample_f128_vec(n_current);
             if ood_idx >= proof.ood_values.len() {
@@ -12156,6 +4376,7 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
             ood_bases.push((build_eq_table(&z), ris.len(), beta));
         }
 
+        // PoW grinding check for this iteration (dense verifier mirror).
         if nonce_idx >= proof.grinding_nonces.len() {
             return false;
         }
@@ -12227,6 +4448,8 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
     unreachable!()
 }
 
+/// Shared body — runs after wtns_0 is in hand (whether freshly built or
+/// supplied externally).
 #[allow(clippy::too_many_arguments)]
 fn recursive_prover_inner<Ch: Challenger>(
     config: &ProverConfig,
@@ -12245,6 +4468,8 @@ fn recursive_prover_inner<Ch: Challenger>(
     macro_rules! tlog {
         ($($arg:tt)*) => { if trace { eprintln!($($arg)*); } }
     }
+    // The legacy (non-basis) path predates OOD binding and fold grinding;
+    // configs that use them must go through `recursive_prover_with_basis`.
     assert!(
         config.ood_samples.iter().all(|&s| s == 0)
             && config.fold_grinding_bits.iter().all(|&b| b == 0),
@@ -12258,6 +4483,7 @@ fn recursive_prover_inner<Ch: Challenger>(
     let initial_root = wtns_0.root();
     challenger.observe_bytes(&initial_root);
 
+    // ---- Partial-eval at z[0..initial_k] and commit f¹ (wtns_1) ----
     let v_challenges_0 = eval_point[..initial_k].to_vec();
     let f1 = partial_eval_lsb(poly, &v_challenges_0);
     let n1 = log_n - initial_k;
@@ -12280,6 +4506,7 @@ fn recursive_prover_inner<Ch: Challenger>(
     tlog!("  [ligerito]   L1 commit: {:.2?}", t_l1);
     challenger.observe_bytes(&wtns_1.root());
 
+    // ---- Queries + open wtns_0 ----
     let num_queries_0 = udr_queries(log_inv_rate_0);
     let queries_0 = sample_distinct_queries(challenger, wtns_0.block_len, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
@@ -12292,12 +4519,13 @@ fn recursive_prover_inner<Ch: Challenger>(
         merkle_proof: merkle_proof_0,
     };
 
+    // ---- Induce basis from wtns_0 opens ----
     let sks_vks_n1 = eval_sk_at_vks(n1);
     let t = std::time::Instant::now();
     let (basis_0_induced, enforced_sum_0) = induce_sumcheck_poly_auto(
         n1,
         log_inv_rate_0,
-        Some(&sks_vks_n1),
+        &sks_vks_n1,
         &opened_rows_0,
         &v_challenges_0,
         &queries_0,
@@ -12305,6 +4533,7 @@ fn recursive_prover_inner<Ch: Challenger>(
     );
     t_induce += t.elapsed();
 
+    // ---- Start sumcheck: f¹ · eq(z[initial_k..], ·) = claimed_value ----
     let eq_z_residual = build_eq_table(&eval_point[initial_k..]);
     let t = std::time::Instant::now();
     let (mut sc_prover, start_msg) = SumcheckProver::new(f1, eq_z_residual, claimed_value);
@@ -12312,12 +4541,14 @@ fn recursive_prover_inner<Ch: Challenger>(
     challenger.observe_f128(start_msg.u_0);
     challenger.observe_f128(start_msg.u_2);
 
+    // ---- Introduce induced basis + glue ----
     let intro_msg_0 = sc_prover.introduce_new(basis_0_induced, enforced_sum_0);
     challenger.observe_f128(intro_msg_0.u_0);
     challenger.observe_f128(intro_msg_0.u_2);
     let beta_0 = challenger.sample_f128();
     sc_prover.glue(beta_0);
 
+    // ---- Recursive levels ----
     let mut wtns_prev = wtns_1;
     let mut recursive_roots: Vec<Hash> = vec![wtns_prev.root()];
     let mut recursive_proofs: Vec<RecursiveProof> = Vec::new();
@@ -12344,10 +4575,12 @@ fn recursive_prover_inner<Ch: Challenger>(
                 t_opens,
                 t_total.elapsed()
             );
+            // Last iter: send residual yr + open wtns_prev.
             let yr = sc_prover.f().to_vec();
             for v in &yr {
                 challenger.observe_f128(*v);
             }
+            // wtns_prev's rate (= log_inv_rates[i+1] for wtns_{i+1}).
             let num_queries_last = udr_queries(config.log_inv_rates[i + 1]);
             let queries_last =
                 sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_last);
@@ -12367,13 +4600,15 @@ fn recursive_prover_inner<Ch: Challenger>(
                     opened_rows: opened_rows_last,
                     merkle_proof: merkle_proof_last,
                 },
-                sumcheck_transcript: std::mem::take(&mut sc_prover.transcript),
+                sumcheck_transcript: sc_prover.transcript().to_vec(),
                 grinding_nonces: Vec::new(), // legacy recursive_prover_inner: no grinding plumbed
                 ood_values: Vec::new(),
                 fold_grinding_nonces: Vec::new(),
             };
         }
 
+        // Non-last: commit the folded poly → wtns_next.
+        // wtns_next = wtns_{i+2}, uses log_inv_rates[i+2].
         let n_next = sc_prover.f().len().trailing_zeros() as usize;
         let log_num_interleaved_next = config.recursive_ks[i + 1];
         assert!(
@@ -12384,9 +4619,10 @@ fn recursive_prover_inner<Ch: Challenger>(
         let log_msg_cols_next = n_next - log_num_interleaved_next;
         let log_inv_rate_next = config.log_inv_rates[i + 2];
         let ntt_next = AdditiveNttF128::standard(log_msg_cols_next + log_inv_rate_next);
+        let f_evals = sc_prover.f().to_vec();
         let t = std::time::Instant::now();
         let wtns_next = ligero_commit(
-            sc_prover.f(),
+            &f_evals,
             log_msg_cols_next,
             log_num_interleaved_next,
             log_inv_rate_next,
@@ -12400,6 +4636,7 @@ fn recursive_prover_inner<Ch: Challenger>(
         challenger.observe_bytes(&root_next);
         recursive_roots.push(root_next);
 
+        // Open wtns_prev. wtns_prev = wtns_{i+1} uses log_inv_rates[i+1].
         let num_queries_i = udr_queries(config.log_inv_rates[i + 1]);
         let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
@@ -12416,6 +4653,7 @@ fn recursive_prover_inner<Ch: Challenger>(
             merkle_proof: merkle_proof_i,
         });
 
+        // Induce fresh basis from these opens.
         let sks_vks_i = eval_sk_at_vks(n_next);
         let (basis_i_induced, enforced_sum_i) = induce_sumcheck_poly(
             n_next,
@@ -12426,6 +4664,7 @@ fn recursive_prover_inner<Ch: Challenger>(
             &alpha_i,
         );
 
+        // Introduce + glue.
         let intro_msg_i = sc_prover.introduce_new(basis_i_induced, enforced_sum_i);
         challenger.observe_f128(intro_msg_i.u_0);
         challenger.observe_f128(intro_msg_i.u_2);
@@ -12438,6 +4677,8 @@ fn recursive_prover_inner<Ch: Challenger>(
     unreachable!("recursive loop should return on last iter")
 }
 
+/// Verify all opened rows against one root via a single octopus multi-proof.
+/// `queries` must be sorted ascending and aligned with `opened_rows`.
 fn verify_level_opens(
     root: &Hash,
     block_len: usize,
@@ -12466,6 +4707,7 @@ fn verify_level_opens(
     merkle::verify_merkle_multi_proof(root, block_len, queries, &leaf_hashes, multi_proof, kind)
 }
 
+/// Verifier counterpart to [`recursive_prover`]. Supports arbitrary `R ≥ 1`.
 pub fn recursive_verifier<Ch: Challenger>(
     config: &VerifierConfig,
     proof: &LigeritoProof,
@@ -12480,6 +4722,7 @@ pub fn recursive_verifier<Ch: Challenger>(
     if r < 1 || config.recursive_ks.len() != r || config.log_inv_rates.len() != r + 1 {
         return false;
     }
+    // The legacy (non-basis) path predates OOD binding and fold grinding.
     if config.ood_samples.iter().any(|&s| s != 0)
         || config.fold_grinding_bits.iter().any(|&b| b != 0)
     {
@@ -12490,6 +4733,7 @@ pub fn recursive_verifier<Ch: Challenger>(
     challenger.observe_f128(claimed_value);
     challenger.observe_f128_slice(eval_point);
 
+    // ---- Roots ----
     challenger.observe_bytes(&proof.initial_root);
     if proof.recursive_roots.len() != r {
         return false;
@@ -12497,6 +4741,7 @@ pub fn recursive_verifier<Ch: Challenger>(
     let root_1 = proof.recursive_roots[0];
     challenger.observe_bytes(&root_1);
 
+    // ---- Open wtns_0 + α₀ ----
     let log_inv_rate_0 = config.log_inv_rates[0];
     let log_msg_cols_0 = log_n - initial_k;
     let block_len_0 = 1usize << (log_msg_cols_0 + log_inv_rate_0);
@@ -12517,19 +4762,23 @@ pub fn recursive_verifier<Ch: Challenger>(
         return false;
     }
 
+    // ---- Induce basis_0 from wtns_0 opens ----
     let n1 = log_n - initial_k;
     let sks_vks_n1 = eval_sk_at_vks(n1);
     let (basis_0_induced, enforced_sum_0) = induce_sumcheck_poly_auto(
         n1,
         log_inv_rate_0,
-        Some(&sks_vks_n1),
+        &sks_vks_n1,
         &proof.initial_proof.opened_rows,
         &eval_point[..initial_k],
         &queries_0,
         &alpha_0,
     );
 
+    // ---- Set up running sumcheck state ----
     let eq_z_residual = build_eq_table(&eval_point[initial_k..]);
+    // basis_polys[k] are stored at the dim they were introduced. ris_starts[k] is
+    // the index in `ris` at the time basis_polys[k] was introduced.
     let mut basis_polys: Vec<Vec<F128>> = vec![eq_z_residual];
     let mut basis_ris_starts: Vec<usize> = vec![0];
     let mut basis_separations: Vec<F128> = Vec::new(); // separation for basis_polys[k+1]
@@ -12537,6 +4786,7 @@ pub fn recursive_verifier<Ch: Challenger>(
     let mut t_r = claimed_value;
     let mut tx_idx = 0usize;
 
+    // ---- Start message ----
     if tx_idx >= proof.sumcheck_transcript.len() {
         return false;
     }
@@ -12546,6 +4796,7 @@ pub fn recursive_verifier<Ch: Challenger>(
     challenger.observe_f128(start_msg.u_2);
     let mut running_quad = RoundQuad::from_msg(start_msg, t_r);
 
+    // ---- Intro basis_0 + glue β₀ ----
     if tx_idx >= proof.sumcheck_transcript.len() {
         return false;
     }
@@ -12561,6 +4812,7 @@ pub fn recursive_verifier<Ch: Challenger>(
     basis_ris_starts.push(0);
     basis_separations.push(beta_0);
 
+    // ---- Recursive iterations ----
     let mut prev_root = root_1;
     let mut prev_log_num_interleaved = config.recursive_ks[0];
     let mut prev_log_msg_cols = n1 - prev_log_num_interleaved;
@@ -12592,6 +4844,7 @@ pub fn recursive_verifier<Ch: Challenger>(
         n_current -= k_i;
 
         if i == r - 1 {
+            // Last iter: read yr + open prev_root.
             if tx_idx != proof.sumcheck_transcript.len() {
                 return false;
             }
@@ -12607,6 +4860,7 @@ pub fn recursive_verifier<Ch: Challenger>(
             let num_queries_last = udr_queries(prev_log_inv_rate);
             let queries_last =
                 sample_distinct_queries(challenger, prev_block_len, num_queries_last);
+            // Final-level basis-induction challenge (after yr + queries fixed).
             let alpha_last = challenger.sample_f128_vec(ceil_log2(num_queries_last));
             if !verify_level_opens(
                 &prev_root,
@@ -12620,6 +4874,9 @@ pub fn recursive_verifier<Ch: Challenger>(
                 return false;
             }
 
+            // Bind the LAST commitment to `yr`: induce its opened rows into the
+            // sumcheck like every non-final level (without this `yr` is
+            // unconstrained and a forged `yr` opens to any value).
             let sks_vks_last = eval_sk_at_vks(n_current);
             let (basis_last_induced, enforced_sum_last) = induce_sumcheck_poly(
                 n_current,
@@ -12635,6 +4892,9 @@ pub fn recursive_verifier<Ch: Challenger>(
             basis_ris_starts.push(ris.len());
             basis_separations.push(beta_last);
 
+            // ---- Final residual check ----
+            // Each basis_polys[k] is partially-evaluated at ris[ris_starts[k]..].
+            // basis_polys[0] has separation 1, basis_polys[k+1] has separation basis_separations[k].
             let yr_len = yr.len();
             let mut combined = vec![F128::ZERO; yr_len];
             for (k, basis) in basis_polys.iter().enumerate() {
@@ -12660,6 +4920,7 @@ pub fn recursive_verifier<Ch: Challenger>(
             return inner == t_r;
         }
 
+        // Non-last: read next root, sample queries on prev_root, induce basis, intro + glue.
         if next_root_idx >= proof.recursive_roots.len() {
             return false;
         }
@@ -12700,6 +4961,7 @@ pub fn recursive_verifier<Ch: Challenger>(
             &alpha_i,
         );
 
+        // Intro + glue
         if tx_idx >= proof.sumcheck_transcript.len() {
             return false;
         }
@@ -12715,6 +4977,7 @@ pub fn recursive_verifier<Ch: Challenger>(
         basis_ris_starts.push(ris.len());
         basis_separations.push(beta_i);
 
+        // Update prev for next iteration: prev_root = root_next, dims = next commit's dims.
         prev_root = root_next;
         let k_next = config.recursive_ks[i + 1];
         if n_current < k_next {
@@ -12730,826 +4993,19 @@ pub fn recursive_verifier<Ch: Challenger>(
 
 #[cfg(test)]
 mod tests {
-    /// Lane opus-pcs: strip-wise message accumulation (as fused into the
-    /// GFNI basis kernel) equals the two-pass block reduction and a scalar
-    /// oracle, for the ranked block length and short spans; negative control.
-    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-    #[test]
-    fn opus_strip_msg_accumulate_matches_block_reduce() {
-        use crate::challenger::Challenger;
-        let mut rng = crate::challenger::RandomChallenger::new(0x0905_F8B0);
-        for &n in &[64usize, 128, 2048] {
-            let f = rng.sample_f128_vec(n);
-            let b = rng.sample_f128_vec(n);
-            let whole = unsafe { msg_reduce_avx512(&f, &b) };
-            let mut oracle = (F128::ZERO, F128::ZERO);
-            for k in (0..n).step_by(2) {
-                oracle.0 += f[k] * b[k];
-                oracle.1 += (f[k] + f[k + 1]) * (b[k] + b[k + 1]);
-            }
-            assert_eq!(whole, oracle, "two-pass vs scalar n={n}");
-            let mut u0 = unsafe { crate::field::gf2_128::x86_64::WideGhashX4::zero() };
-            let mut u2 = unsafe { crate::field::gf2_128::x86_64::WideGhashX4::zero() };
-            for s in (0..n).step_by(64) {
-                unsafe { msg_accumulate_avx512(&f[s..s + 64], &b[s..s + 64], &mut u0, &mut u2) };
-            }
-            let fused = unsafe { (u0.fold().reduce(), u2.fold().reduce()) };
-            assert_eq!(fused, whole, "strip-fused vs two-pass n={n}");
-            let mut bad = b.clone();
-            bad[n - 2] += F128::ONE;
-            let mut v0 = unsafe { crate::field::gf2_128::x86_64::WideGhashX4::zero() };
-            let mut v2 = unsafe { crate::field::gf2_128::x86_64::WideGhashX4::zero() };
-            for s in (0..n).step_by(64) {
-                unsafe { msg_accumulate_avx512(&f[s..s + 64], &bad[s..s + 64], &mut v0, &mut v2) };
-            }
-            let corrupted = unsafe { (v0.fold().reduce(), v2.fold().reduce()) };
-            assert_ne!(corrupted, whole, "corrupted basis went undetected n={n}");
-        }
-    }
-
-    #[test]
-    fn opus_tntt_chunk_log_preserves_outputs() {
-        // Lane opus-pcs: any site-17/18 CHUNK_LOG only re-partitions the same
-        // butterflies. Check the retained outputs against the per-layer
-        // reference (site 17) and the incumbent C=16 (site 18) on a 16-thread
-        // pool (the scorer's split floor), incl. the ranked L0 shape d18/k10.
-        use crate::challenger::Challenger;
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(16).build().unwrap();
-        pool.install(|| {
-            let set = |c: Option<usize>| OPUS_TNTT_C_TEST.with(|x| x.set(c));
-            for &log_d in &[11usize, 12, 14, 16, 18] {
-                let ntt = AdditiveNttF128::standard(log_d);
-                let n = 1usize << log_d;
-                let mut ch = crate::challenger::RandomChallenger::new(0xC13 ^ log_d as u64);
-                let base: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
-                for &top in &[1usize, 4, 5, 8, log_d] {
-                    let mut want = base.clone();
-                    transpose_forward_ntt_dense_layers_per_layer(&ntt, &mut want, top);
-                    for dead in [0usize, 2.min(top)] {
-                        let keep = 1usize << (log_d - dead);
-                        for c in [10usize, 13, 14, 16, 20] {
-                            set(Some(c));
-                            let mut got = base.clone();
-                            transpose_forward_ntt_dense_layers_blocked_dead(&ntt, &mut got, top, dead);
-                            assert_eq!(
-                                &got[..keep],
-                                &want[..keep],
-                                "site17 log_d={log_d} top={top} dead={dead} C={c}"
-                            );
-                        }
-                    }
-                }
-                let mut positions: Vec<usize> = (0..218usize)
-                    .map(|i| (i.wrapping_mul(2_654_435_761) + 11) & (n - 1))
-                    .collect();
-                positions.sort_unstable();
-                positions.dedup();
-                let values = ch.sample_f128_vec(positions.len());
-                for k_override in [None, Some(4usize), Some(10)] {
-                    for dead in [0usize, 1, 3] {
-                        set(Some(16));
-                        let (want, _) = transpose_forward_ntt_sparse_inner_dead(
-                            &ntt, &positions, &values, log_d, None, k_override, dead,
-                        );
-                        let keep = 1usize << (log_d - dead);
-                        for c in [10usize, 12, 13, 14, 20] {
-                            set(Some(c));
-                            let (got, _) = transpose_forward_ntt_sparse_inner_dead(
-                                &ntt, &positions, &values, log_d, None, k_override, dead,
-                            );
-                            assert_eq!(
-                                &got[..keep],
-                                &want[..keep],
-                                "site18 log_d={log_d} k={k_override:?} dead={dead} C={c}"
-                            );
-                        }
-                        // Negative control: a perturbed value must change the output.
-                        set(Some(13));
-                        let mut bad = values.clone();
-                        bad[0] += F128::ONE;
-                        let (got, _) = transpose_forward_ntt_sparse_inner_dead(
-                            &ntt, &positions, &bad, log_d, None, k_override, dead,
-                        );
-                        assert_ne!(&got[..keep], &want[..keep], "perturbed input undetected");
-                    }
-                }
-            }
-            set(None);
-        });
-    }
-
-    #[test]
-    fn x1_batch_inverse_or_zero_matches_scalar_and_preserves_positions() {
-        use super::{batch_inverse_or_zero, eval_sk_at_vks};
-        use crate::field::F128;
-        let scalar = |values: &[F128]| -> Vec<F128> {
-            values
-                .iter()
-                .map(|&v| if v.is_zero() { F128::ZERO } else { v.inv() })
-                .collect()
-        };
-        let x = |lo: u64, hi: u64| F128::new(lo, hi);
-        let cases: Vec<Vec<F128>> = vec![
-            vec![],
-            vec![F128::ZERO],
-            vec![x(7, 0)],
-            vec![F128::ZERO, F128::ZERO, F128::ZERO],
-            vec![F128::ZERO, x(3, 9), F128::ZERO, x(0x1234, 0xffff_0000_0000_0001), F128::ZERO],
-            vec![x(1, 0), x(2, 0), x(u64::MAX, u64::MAX), x(5, 1 << 63)],
-            (1..40u64).map(|i| x(i.wrapping_mul(0x9e37_79b9_7f4a_7c15), i << 40)).collect(),
-            eval_sk_at_vks(10),
-            eval_sk_at_vks(16),
-        ];
-        for values in &cases {
-            assert_eq!(batch_inverse_or_zero(values), scalar(values), "{values:?}");
-        }
-    }
-
-    #[test]
-    fn sparse_transpose_dead_top_keeps_prefix() {
-        use crate::challenger::Challenger;
-        let mut rng = crate::challenger::RandomChallenger::new(0xDEAD_B077);
-        for &(log_d, n_pos) in &[(6usize, 5usize), (12, 40), (14, 200), (16, 218)] {
-            let ntt = AdditiveNttF128::standard(log_d);
-            let mut positions: Vec<usize> = (0..n_pos)
-                .map(|i| (i.wrapping_mul(2_654_435_761) + 7) & ((1usize << log_d) - 1))
-                .collect();
-            positions.sort_unstable();
-            positions.dedup();
-            let values = rng.sample_f128_vec(positions.len());
-            for dead in 0..=3usize {
-                for k_override in [None, Some(4usize), Some(8)] {
-                    let (full, _) = transpose_forward_ntt_sparse_inner(
-                        &ntt, &positions, &values, log_d, None, k_override,
-                    );
-                    let (cut, _) = transpose_forward_ntt_sparse_inner_dead(
-                        &ntt, &positions, &values, log_d, None, k_override, dead,
-                    );
-                    let keep = 1usize << (log_d - dead);
-                    assert_eq!(
-                        &full[..keep],
-                        &cut[..keep],
-                        "log_d={log_d} dead={dead} k={k_override:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn fold_with_deferred_basis_matches_two_fold_oracle() {
-        use crate::challenger::Challenger;
-        let mut rng = crate::challenger::RandomChallenger::new(0xDEF0_0E01);
-        for n in [64usize, 1024, 1 << 14] {
-            let f = rng.sample_f128_vec(n);
-            let b = rng.sample_f128_vec(n);
-            let basis = rng.sample_f128_vec(n);
-            let r = rng.sample_f128();
-            for alpha in [F128::ONE, rng.sample_f128()] {
-                let (nf, nb, msg) = fold_and_msg_lsb_inner(&f, &b, r, None, None, Some((&basis, alpha)));
-                let half = n / 2;
-                let mut u_0 = F128::ZERO;
-                let mut u_2 = F128::ZERO;
-                for j in 0..half {
-                    let ef = f[2 * j] + r * (f[2 * j] + f[2 * j + 1]);
-                    let eb = b[2 * j]
-                        + r * (b[2 * j] + b[2 * j + 1])
-                        + alpha * (basis[2 * j] + r * (basis[2 * j] + basis[2 * j + 1]));
-                    assert_eq!(nf[j], ef, "n={n} j={j} f");
-                    assert_eq!(nb[j], eb, "n={n} j={j} b");
-                }
-                let mut k = 0;
-                while k + 1 < half {
-                    u_0 += nf[k] * nb[k];
-                    u_2 += (nf[k] + nf[k + 1]) * (nb[k] + nb[k + 1]);
-                    k += 2;
-                }
-                assert_eq!((msg.u_0, msg.u_2), (u_0, u_2), "n={n} message");
-            }
-        }
-    }
-
     use super::*;
 
-    #[test]
-    fn query_phase_gathers_match_sequential_oracles() {
-        let mut state = 0x9A7B_5EED_F00D_u64;
-        let mut random_u64 = move || {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            state
-        };
-        for &(log_leaves, n_queries, row_len) in &[(12usize, 218usize, 64usize), (4, 3, 2)] {
-            let num_leaves = 1usize << log_leaves;
-            let mut tree: Vec<Hash> = Vec::with_capacity(2 * num_leaves - 1);
-            for _ in 0..(2 * num_leaves - 1) {
-                let mut h = [0u8; 32];
-                h[..8].copy_from_slice(&random_u64().to_le_bytes());
-                h[8..16].copy_from_slice(&random_u64().to_le_bytes());
-                tree.push(h);
-            }
-            let codeword: Vec<F128> = (0..num_leaves * row_len)
-                .map(|_| F128::new(random_u64(), random_u64()))
-                .collect();
-            let mut queries: Vec<usize> = (0..n_queries)
-                .map(|_| random_u64() as usize % num_leaves)
-                .collect();
-            queries.sort_unstable();
-            queries.dedup();
-
-            let row = |q: usize| &codeword[q * row_len..(q + 1) * row_len];
-            let rows_seq = gather_opened_rows(&queries, row, false);
-            let rows_par = gather_opened_rows(&queries, row, true);
-            assert_eq!(rows_par, rows_seq, "rows log_leaves={log_leaves}");
-
-            let proof_seq = multi_proof_gather(&tree, num_leaves, &queries, false);
-            let proof_par = multi_proof_gather(&tree, num_leaves, &queries, true);
-            assert_eq!(proof_par, proof_seq, "multi-proof log_leaves={log_leaves}");
-            assert_eq!(
-                proof_seq,
-                merkle::merkle_multi_proof(&tree, num_leaves, &queries),
-                "sequential arm drifted from the merkle oracle"
-            );
-
-            let mut bad_codeword = codeword.clone();
-            bad_codeword[queries[0] * row_len] += F128::ONE;
-            let bad_row = |q: usize| &bad_codeword[q * row_len..(q + 1) * row_len];
-            assert_ne!(
-                gather_opened_rows(&queries, bad_row, true),
-                rows_seq,
-                "corrupted row went undetected log_leaves={log_leaves}"
-            );
-            let sibling_indices = merkle::merkle_multi_proof_sibling_indices(num_leaves, &queries);
-            assert!(!sibling_indices.is_empty());
-            let mut bad_tree = tree.clone();
-            bad_tree[sibling_indices[0]][0] ^= 1;
-            assert_ne!(
-                multi_proof_gather(&bad_tree, num_leaves, &queries, true),
-                proof_seq,
-                "corrupted sibling went undetected log_leaves={log_leaves}"
-            );
-        }
-    }
-
-    #[test]
-    fn direct_ab_materialization_matches_full_basis_oracle() {
-        let mut state = 0xD1CE_F01D_u64;
-        let mut random = || {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            F128::new(state, state.rotate_left(29))
-        };
-        let n = 1usize << 8;
-        let f: Vec<F128> = (0..n).map(|_| random()).collect();
-        let ordinary_c: Vec<F128> = (0..n).map(|_| random()).collect();
-        let r0 = random();
-        let r1 = random();
-        let suffix: Vec<F128> = (0..8).map(|_| random()).collect();
-        let gamma = random();
-        let scaled_rdp: Vec<F128> = build_eq_table(
-            &(0..crate::pcs::LOG_PACKING)
-                .map(|_| random())
-                .collect::<Vec<_>>(),
-        )
-        .into_iter()
-        .map(|value| gamma * value)
-        .collect();
-        let direct_full =
-            super::super::ring_switch::fold_b128_elems(&build_eq_table(&suffix), &scaled_rdp);
-        let combined_full: Vec<F128> = ordinary_c
-            .iter()
-            .zip(direct_full)
-            .map(|(&ordinary, direct)| ordinary + direct)
-            .collect();
-        let (eq_lo, eq_hi) = super::super::ring_switch::build_eq_split(&suffix[2..], 3);
-        let direct = vec![super::super::ring_switch::DirectFold2Factors {
-            eq_lo,
-            eq_hi,
-            low_eq: build_eq_table(&suffix[..2]).try_into().unwrap(),
-            table: super::super::ring_switch::build_fold_byte_table(&scaled_rdp),
-            products: None,
-        }];
-
-        let mut want_f = f.clone();
-        let mut want_b = combined_full;
-        partial_eval_lsb_one(&mut want_f, r0);
-        partial_eval_lsb_one(&mut want_b, r0);
-        partial_eval_lsb_one(&mut want_f, r1);
-        partial_eval_lsb_one(&mut want_b, r1);
-        let want_msg = round_msg_lsb(&want_f, &want_b);
-        let (got_f, got_b, got_msg) = materialize_direct_ab_fold2(f, ordinary_c, &direct, r0, r1);
-        assert_eq!(got_f, want_f);
-        assert_eq!(got_b, want_b);
-        assert_eq!(got_msg, want_msg);
-    }
-
-    #[test]
-    fn direct_all_full_proof_matches_ordinary_transcript() {
-        use crate::challenger::Challenger;
-
-        let log_n = 12;
-        let initial_k = 2;
-        let k_0 = 2;
-        let log_inv_rate = 1;
-        let mut rng = crate::challenger::RandomChallenger::new(0xD1CE_AB02);
-        let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
-        let suffix_ab: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
-        let suffix_c: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
-        let scaled_rdp_ab: Vec<F128> = build_eq_table(
-            &(0..crate::pcs::LOG_PACKING)
-                .map(|_| rng.sample_f128())
-                .collect::<Vec<_>>(),
-        );
-        let scaled_rdp_c: Vec<F128> = build_eq_table(
-            &(0..crate::pcs::LOG_PACKING)
-                .map(|_| rng.sample_f128())
-                .collect::<Vec<_>>(),
-        );
-        let basis_ab =
-            super::super::ring_switch::fold_b128_elems(&build_eq_table(&suffix_ab), &scaled_rdp_ab);
-        let basis_c =
-            super::super::ring_switch::fold_b128_elems(&build_eq_table(&suffix_c), &scaled_rdp_c);
-        let combined_basis: Vec<F128> = basis_ab
-            .iter()
-            .zip(basis_c)
-            .map(|(&ab, c)| ab + c)
-            .collect();
-        let target = poly
-            .iter()
-            .zip(combined_basis.iter())
-            .map(|(&f, &b)| f * b)
-            .fold(F128::ZERO, |acc, value| acc + value);
-        let (round0, lookahead) = super::super::round0_and_round1_lookahead(&poly, &combined_basis);
-        let direct = [(&suffix_ab, &scaled_rdp_ab), (&suffix_c, &scaled_rdp_c)]
-            .into_iter()
-            .map(|(suffix, scaled_rdp)| {
-                let (eq_lo, eq_hi) =
-                    super::super::ring_switch::build_eq_split(&suffix[2..], (log_n - 2) / 2);
-                super::super::ring_switch::DirectFold2Factors {
-                    eq_lo,
-                    eq_hi,
-                    low_eq: build_eq_table(&suffix[..2]).try_into().unwrap(),
-                    table: super::super::ring_switch::build_fold_byte_table(scaled_rdp),
-                    products: None,
-                }
-            })
-            .collect();
-
-        let log_inv_rates = vec![log_inv_rate, log_inv_rate];
-        let cfg = ProverConfig {
-            log_inv_rates: log_inv_rates.clone(),
-            recursive_steps: 1,
-            initial_log_msg_cols: log_n - initial_k,
-            initial_log_num_interleaved: initial_k,
-            initial_k,
-            recursive_log_msg_cols: vec![log_n - initial_k - k_0],
-            recursive_ks: vec![k_0],
-            queries: log_inv_rates
-                .iter()
-                .map(|&rate| udr_queries(rate))
-                .collect(),
-            grinding_bits: vec![0; log_inv_rates.len()],
-            fold_grinding_bits: vec![0; 2],
-            ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
-        };
-        let ntt_0 = AdditiveNttF128::standard(log_n - initial_k + log_inv_rate);
-        let wtns_0 = ligero_commit(
-            &poly,
-            log_n - initial_k,
-            initial_k,
-            log_inv_rate,
-            &ntt_0,
-            HashKind::Sha256,
-        );
-
-        let mut ordinary_challenger =
-            crate::challenger::FsChallenger::new(b"direct-all-proof-byte-oracle");
-        let ordinary = recursive_prover_with_basis_precomputed_round0(
-            &cfg,
-            poly.clone(),
-            combined_basis,
-            target,
-            &wtns_0.mat,
-            &wtns_0.tree,
-            round0,
-            None,
-            &mut ordinary_challenger,
-        );
-        let mut direct_challenger =
-            crate::challenger::FsChallenger::new(b"direct-all-proof-byte-oracle");
-        let got = recursive_prover_with_basis_direct_ab_fold2(
-            &cfg,
-            poly,
-            Vec::new(),
-            direct,
-            target,
-            &wtns_0.mat,
-            &wtns_0.tree,
-            round0,
-            lookahead,
-            None,
-            &mut direct_challenger,
-        );
-
-        assert_eq!(got, ordinary);
-    }
-
-    #[test]
-    fn direct_fold4_full_proof_and_claim_bytes_match_ordinary() {
-        use crate::challenger::Challenger;
-
-        for (log_n, seed) in [(12usize, 0xD1CE_F004u64), (13, 0xD1CE_F005)] {
-            let initial_k = 6;
-            let k_0 = 2;
-            let log_inv_rate = 3;
-            let mut rng = crate::challenger::RandomChallenger::new(seed);
-            let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
-            let suffix_ab: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
-            let suffix_c: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
-            let scaled_rdp_ab: Vec<F128> = build_eq_table(
-                &(0..crate::pcs::LOG_PACKING)
-                    .map(|_| rng.sample_f128())
-                    .collect::<Vec<_>>(),
-            );
-            let scaled_rdp_c: Vec<F128> = build_eq_table(
-                &(0..crate::pcs::LOG_PACKING)
-                    .map(|_| rng.sample_f128())
-                    .collect::<Vec<_>>(),
-            );
-            let basis_ab = super::super::ring_switch::fold_b128_elems(
-                &build_eq_table(&suffix_ab),
-                &scaled_rdp_ab,
-            );
-            let basis_c = super::super::ring_switch::fold_b128_elems(
-                &build_eq_table(&suffix_c),
-                &scaled_rdp_c,
-            );
-            let combined_basis: Vec<F128> = basis_ab
-                .iter()
-                .zip(basis_c.iter())
-                .map(|(&ab, &c)| ab + c)
-                .collect();
-            let target = poly
-                .iter()
-                .zip(combined_basis.iter())
-                .map(|(&f, &b)| f * b)
-                .fold(F128::ZERO, |acc, value| acc + value);
-
-            let direct: Vec<super::super::ring_switch::DirectFold4Factors> = [
-                (&suffix_ab, &scaled_rdp_ab, &basis_ab),
-                (&suffix_c, &scaled_rdp_c, &basis_c),
-            ]
-            .into_iter()
-            .map(|(suffix, scaled_rdp, basis)| {
-                let mut products = [F128::ZERO; 256];
-                for high in 0..poly.len() / 16 {
-                    for e in 0..16 {
-                        for d in 0..16 {
-                            products[16 * e + d] += poly[16 * high + e] * basis[16 * high + d];
-                        }
-                    }
-                }
-                let (eq_lo, eq_hi) =
-                    super::super::ring_switch::build_eq_split(&suffix[4..], (log_n - 4) / 2);
-                super::super::ring_switch::DirectFold4Factors {
-                    eq_lo,
-                    eq_hi,
-                    low_eq: build_eq_table(&suffix[..4]).try_into().unwrap(),
-                    table: super::super::ring_switch::build_fold_byte_table(scaled_rdp),
-                    products,
-                }
-            })
-            .collect();
-            let (round0, round1, round2, round3) =
-                super::super::messages_from_direct_products_fold4(&direct);
-            let (round0_ref, round1_ref) =
-                super::super::round0_and_round1_lookahead(&poly, &combined_basis);
-            assert_eq!(round0, round0_ref, "round-0 message from products");
-            assert_eq!(round1, round1_ref, "round-1 lookahead from products");
-
-            let log_inv_rates = vec![log_inv_rate, log_inv_rate];
-            let cfg = ProverConfig {
-                log_inv_rates: log_inv_rates.clone(),
-                recursive_steps: 1,
-                initial_log_msg_cols: log_n - initial_k,
-                initial_log_num_interleaved: initial_k,
-                initial_k,
-                recursive_log_msg_cols: vec![log_n - initial_k - k_0],
-                recursive_ks: vec![k_0],
-                queries: log_inv_rates
-                    .iter()
-                    .map(|&rate| udr_queries(rate))
-                    .collect(),
-                grinding_bits: vec![0; log_inv_rates.len()],
-                fold_grinding_bits: vec![0; 2],
-                ood_samples: vec![0; 2],
-                merkle_hash: Default::default(),
-            };
-            let ntt_0 = AdditiveNttF128::standard(log_n - initial_k + log_inv_rate);
-            let wtns_0 = ligero_commit(
-                &poly,
-                log_n - initial_k,
-                initial_k,
-                log_inv_rate,
-                &ntt_0,
-                HashKind::Sha256,
-            );
-
-            let mut ordinary_challenger =
-                crate::challenger::FsChallenger::new(b"direct-fold4-proof-byte-oracle");
-            let ordinary = recursive_prover_with_basis_precomputed_round0(
-                &cfg,
-                poly.clone(),
-                combined_basis.clone(),
-                target,
-                &wtns_0.mat,
-                &wtns_0.tree,
-                round0,
-                None,
-                &mut ordinary_challenger,
-            );
-            let mut direct_challenger =
-                crate::challenger::FsChallenger::new(b"direct-fold4-proof-byte-oracle");
-            let got = recursive_prover_with_basis_direct_fold4(
-                &cfg,
-                poly,
-                Vec::new(),
-                direct,
-                target,
-                &wtns_0.mat,
-                &wtns_0.tree,
-                round0,
-                round1,
-                round2,
-                round3,
-                None,
-                &mut direct_challenger,
-            );
-
-            assert_eq!(got, ordinary, "direct-fold4 proof differs at log_n={log_n}");
-            assert_eq!(
-                bincode::serialize(&(got.clone(), target))
-                    .expect("serialize direct-fold4 proof/claim"),
-                bincode::serialize(&(ordinary, target)).expect("serialize ordinary proof/claim"),
-            );
-
-            let v_cfg = VerifierConfig {
-                log_inv_rates: log_inv_rates.clone(),
-                recursive_steps: 1,
-                initial_log_msg_cols: log_n - initial_k,
-                initial_log_num_interleaved: initial_k,
-                initial_k,
-                recursive_log_msg_cols: vec![log_n - initial_k - k_0],
-                recursive_ks: vec![k_0],
-                queries: log_inv_rates
-                    .iter()
-                    .map(|&rate| udr_queries(rate))
-                    .collect(),
-                grinding_bits: vec![0; log_inv_rates.len()],
-                fold_grinding_bits: vec![0; 2],
-                ood_samples: vec![0; 2],
-                merkle_hash: Default::default(),
-            };
-            let mut verifier_challenger =
-                crate::challenger::FsChallenger::new(b"direct-fold4-proof-byte-oracle");
-            assert!(recursive_verifier_with_basis(
-                &v_cfg,
-                &got,
-                &combined_basis,
-                target,
-                &wtns_0.root(),
-                &mut verifier_challenger,
-            ));
-        }
-    }
-
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    #[test]
-    fn fold_and_msg_leaf_x86_matches_generic() {
-        let mut state = 0x1234_5678_9abc_def0_u64;
-        let mut next = || {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            state
-        };
-        let mut f128 = || F128 {
-            lo: next(),
-            hi: next(),
-        };
-        for (n_pairs, base) in [(8usize, 0usize), (32, 4), (64, 16), (2048, 0)] {
-            let total = 2 * (base + n_pairs);
-            let f: Vec<F128> = (0..total).map(|_| f128()).collect();
-            let b: Vec<F128> = (0..total).map(|_| f128()).collect();
-            let r = f128();
-
-            let mut fc_ref = vec![F128::ZERO; n_pairs];
-            let mut bc_ref = vec![F128::ZERO; n_pairs];
-            crate::field::f128_slice::fold_pairs(&f, base, &mut fc_ref, r);
-            crate::field::f128_slice::fold_pairs(&b, base, &mut bc_ref, r);
-            let mut u0_ref = F128::ZERO;
-            let mut u2_ref = F128::ZERO;
-            let mut k = 0;
-            while k + 1 < n_pairs {
-                let (f0, f1, b0, b1) = (fc_ref[k], fc_ref[k + 1], bc_ref[k], bc_ref[k + 1]);
-                u0_ref += f0 * b0;
-                u2_ref += (f0 + f1) * (b0 + b1);
-                k += 2;
-            }
-            let (r_x4, r_x64) = unsafe {
-                use crate::field::gf2_128::x86_64::ghash_shift64_x4;
-                use core::arch::x86_64::*;
-                let r_x4 =
-                    _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
-                (r_x4, ghash_shift64_x4(r_x4))
-            };
-
-            for stream in [false, true] {
-                let mut fc_x86 = vec![F128::ZERO; n_pairs];
-                let mut bc_x86 = vec![F128::ZERO; n_pairs];
-                let (u0_x86, u2_x86) = unsafe {
-                    super::fold_and_msg_chunk_x86::<false>(
-                        &f, &b, base, &mut fc_x86, &mut bc_x86, r, r_x4, r_x64, stream, None,
-                        None,
-                    )
-                };
-                assert_eq!(fc_ref, fc_x86, "folded f mismatch n_pairs={n_pairs}");
-                assert_eq!(bc_ref, bc_x86, "folded b mismatch n_pairs={n_pairs}");
-                assert_eq!(u0_ref, u0_x86, "u0 mismatch n_pairs={n_pairs}");
-                assert_eq!(u2_ref, u2_x86, "u2 mismatch n_pairs={n_pairs}");
-            }
-        }
-    }
-
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    #[test]
-    fn fold_and_msg_nt_leaf_matches_generic() {
-        let mut state = 0x1234_5678_9abc_def0_u64;
-        let mut next = || {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            state
-        };
-        let mut f128 = || F128 {
-            lo: next(),
-            hi: next(),
-        };
-        for (n_pairs, base) in [(8usize, 0usize), (32, 4), (64, 16)] {
-            let total = 2 * (base + n_pairs);
-            let f: Vec<F128> = (0..total).map(|_| f128()).collect();
-            let b: Vec<F128> = (0..total).map(|_| f128()).collect();
-            let r = f128();
-
-            let mut fc_ref = vec![F128::ZERO; n_pairs];
-            let mut bc_ref = vec![F128::ZERO; n_pairs];
-            crate::field::f128_slice::fold_pairs(&f, base, &mut fc_ref, r);
-            crate::field::f128_slice::fold_pairs(&b, base, &mut bc_ref, r);
-            let mut u0_ref = F128::ZERO;
-            let mut u2_ref = F128::ZERO;
-            let mut k = 0;
-            while k + 1 < n_pairs {
-                let (f0, f1, b0, b1) = (fc_ref[k], fc_ref[k + 1], bc_ref[k], bc_ref[k + 1]);
-                u0_ref += f0 * b0;
-                u2_ref += (f0 + f1) * (b0 + b1);
-                k += 2;
-            }
-
-            let mut fc_nt = vec![F128::ZERO; n_pairs];
-            let mut bc_nt = vec![F128::ZERO; n_pairs];
-            let (u0_nt, u2_nt) =
-                unsafe { fold_and_msg_chunk_nt_neon(&f, &b, base, &mut fc_nt, &mut bc_nt, r) };
-            assert_eq!(fc_ref, fc_nt, "folded f mismatch n_pairs={n_pairs}");
-            assert_eq!(bc_ref, bc_nt, "folded b mismatch n_pairs={n_pairs}");
-            assert_eq!(u0_ref, u0_nt, "u0 mismatch n_pairs={n_pairs}");
-            assert_eq!(u2_ref, u2_nt, "u2 mismatch n_pairs={n_pairs}");
-        }
-    }
-
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    #[test]
-    fn fold_and_msg_soa_leaf_matches_nt_and_generic() {
-        let mut state = 0x0fed_cba9_8765_4321_u64;
-        let mut next = || {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            state
-        };
-        let mut f128 = || F128 {
-            lo: next(),
-            hi: next(),
-        };
-        for (n_pairs, base) in [(2usize, 0usize), (8, 0), (32, 4), (64, 16), (2048, 2048)] {
-            let total = 2 * (base + n_pairs);
-            let f: Vec<F128> = (0..total).map(|_| f128()).collect();
-            let b: Vec<F128> = (0..total).map(|_| f128()).collect();
-            let r = f128();
-
-            let mut fc_ref = vec![F128::ZERO; n_pairs];
-            let mut bc_ref = vec![F128::ZERO; n_pairs];
-            crate::field::f128_slice::fold_pairs(&f, base, &mut fc_ref, r);
-            crate::field::f128_slice::fold_pairs(&b, base, &mut bc_ref, r);
-            let mut u0_ref = F128::ZERO;
-            let mut u2_ref = F128::ZERO;
-            let mut k = 0;
-            while k + 1 < n_pairs {
-                let (f0, f1, b0, b1) = (fc_ref[k], fc_ref[k + 1], bc_ref[k], bc_ref[k + 1]);
-                u0_ref += f0 * b0;
-                u2_ref += (f0 + f1) * (b0 + b1);
-                k += 2;
-            }
-
-            let mut fc_nt = vec![F128::ZERO; n_pairs];
-            let mut bc_nt = vec![F128::ZERO; n_pairs];
-            let (u0_nt, u2_nt) =
-                unsafe { fold_and_msg_chunk_nt_neon(&f, &b, base, &mut fc_nt, &mut bc_nt, r) };
-
-            let mut fc_soa = vec![F128::ZERO; n_pairs];
-            let mut bc_soa = vec![F128::ZERO; n_pairs];
-            let (u0_soa, u2_soa) = unsafe {
-                fold_and_msg_chunk_nt_neon_soa::<true>(&f, &b, base, &mut fc_soa, &mut bc_soa, r)
-            };
-            let mut fc_soa_r = vec![F128::ZERO; n_pairs];
-            let mut bc_soa_r = vec![F128::ZERO; n_pairs];
-            let (u0_soa_r, u2_soa_r) = unsafe {
-                fold_and_msg_chunk_nt_neon_soa::<false>(
-                    &f,
-                    &b,
-                    base,
-                    &mut fc_soa_r,
-                    &mut bc_soa_r,
-                    r,
-                )
-            };
-
-            assert_eq!(fc_ref, fc_soa, "folded f mismatch n_pairs={n_pairs}");
-            assert_eq!(bc_ref, bc_soa, "folded b mismatch n_pairs={n_pairs}");
-            assert_eq!(u0_ref, u0_soa, "u0 vs generic n_pairs={n_pairs}");
-            assert_eq!(u2_ref, u2_soa, "u2 vs generic n_pairs={n_pairs}");
-            assert_eq!(fc_nt, fc_soa, "folded f vs NT n_pairs={n_pairs}");
-            assert_eq!(bc_nt, bc_soa, "folded b vs NT n_pairs={n_pairs}");
-            assert_eq!(u0_nt, u0_soa, "u0 vs NT n_pairs={n_pairs}");
-            assert_eq!(u2_nt, u2_soa, "u2 vs NT n_pairs={n_pairs}");
-            assert_eq!(fc_soa, fc_soa_r, "folded f NT vs stp n_pairs={n_pairs}");
-            assert_eq!(bc_soa, bc_soa_r, "folded b NT vs stp n_pairs={n_pairs}");
-            assert_eq!(u0_soa, u0_soa_r, "u0 NT vs stp n_pairs={n_pairs}");
-            assert_eq!(u2_soa, u2_soa_r, "u2 NT vs stp n_pairs={n_pairs}");
-        }
-    }
-
-    #[test]
-    fn fold_and_msg_serial_leaf_matches_two_mul() {
-        let mut state = 0xA5A5_5A5A_1234_5678_u64;
-        let mut next = || {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            state
-        };
-        let mut f128 = || F128 {
-            lo: next(),
-            hi: next(),
-        };
-        for n in [2usize, 4, 8, 16, 64, 256] {
-            let f: Vec<F128> = (0..n).map(|_| f128()).collect();
-            let b: Vec<F128> = (0..n).map(|_| f128()).collect();
-            let r = f128();
-            let one_plus_r = F128::ONE + r;
-            let half = n / 2;
-            let mut nf_ref = Vec::with_capacity(half);
-            let mut nb_ref = Vec::with_capacity(half);
-            for j in 0..half {
-                nf_ref.push(f[2 * j] * one_plus_r + f[2 * j + 1] * r);
-                nb_ref.push(b[2 * j] * one_plus_r + b[2 * j + 1] * r);
-            }
-            let mut u0 = F128::ZERO;
-            let mut u2 = F128::ZERO;
-            let mut k = 0;
-            while k + 1 < half {
-                u0 += nf_ref[k] * nb_ref[k];
-                u2 += (nf_ref[k] + nf_ref[k + 1]) * (nb_ref[k] + nb_ref[k + 1]);
-                k += 2;
-            }
-            let (nf, nb, msg) = fold_and_msg_lsb(&f, &b, r, None);
-            assert_eq!(&nf[..], nf_ref.as_slice(), "nf n={n}");
-            assert_eq!(&nb[..], nb_ref.as_slice(), "nb n={n}");
-            assert_eq!(msg.u_0, u0, "u0 n={n}");
-            assert_eq!(msg.u_2, u2, "u2 n={n}");
-        }
-    }
-
+    /// Worked example: `LigeritoSecurityConfig` for BLAKE3 m=29 at rate 1/2.
+    /// Paper-compatible m=29 fast example, mechanically derived in the
+    /// unique-decoding regime (Theorem 1.4, ε* = 10⁻³) targeting 100-bit
+    /// security.
     fn blake3_m29_udr_example() -> LigeritoSecurityConfig {
         LigeritoSecurityConfig::derive_paper_compatible(29, 1, 100).expect("derive m29 fast")
     }
 
+    /// Both embedded TOMLs (m29_fast at rate 1/2 and m29_slim at rate 1/4)
+    /// parse, validate, and produce ProverConfig/VerifierConfig agreeing
+    /// with the corresponding `default_config(22, 6, rate)` shape.
     #[test]
     fn ligerito_security_config_m29_toml_loads() {
         let toml_str = include_str!("../../configs/ligerito/m29_fast.toml");
@@ -13560,6 +5016,9 @@ mod tests {
         assert_eq!(cfg.initial_k, 6);
         assert_eq!(cfg.hash, "sha256");
         assert_eq!(cfg.levels.len(), 5);
+        // Fast = JohnsonOod profile: 218 L0 queries per-round at 100 bits (no
+        // list union bound — single-codeword binding via the opening claim /
+        // OOD samples), proximity-gap shortfall covered by fold-challenge grinding.
         assert_eq!(cfg.levels[0].regime, SoundnessRegime::JohnsonOod);
         assert_eq!(cfg.levels[0].queries, 218);
         assert_eq!(cfg.levels[0].grinding_bits, 0);
@@ -13572,10 +5031,12 @@ mod tests {
         assert_eq!(pv.recursive_ks, default.recursive_ks);
         assert_eq!(pv.queries[0], 218);
 
+        // Slim mode: rates start at 1/4.
         let toml_str = include_str!("../../configs/ligerito/m29_slim.toml");
         let cfg_slim = LigeritoSecurityConfig::from_toml_str(toml_str)
             .expect("m29_slim.toml must parse and validate");
         assert_eq!(cfg_slim.levels[0].log_inv_rate, 2);
+        // Slim = JohnsonOod at rate 1/4 with 16-bit query grinding.
         assert_eq!(cfg_slim.levels[0].queries, 90);
         assert_eq!(cfg_slim.levels[0].grinding_bits, 16);
         let (pv_slim, _vc_slim) = cfg_slim.to_prover_verifier_configs().unwrap();
@@ -13584,6 +5045,10 @@ mod tests {
         assert_eq!(pv_slim.recursive_ks, default_slim.recursive_ks);
     }
 
+    /// Helper: re-emit all the embedded TOMLs from `derive_paper_compatible`.
+    /// Writes to stdout (via eprintln) so the user can `>` redirect to disk.
+    /// Run with:
+    ///   cargo test --release --lib regen_embedded_tomls -- --ignored --nocapture
     #[test]
     #[ignore]
     fn regen_embedded_tomls() {
@@ -13605,6 +5070,10 @@ mod tests {
         }
     }
 
+    /// `validate()` rejects a config whose declared `expected_eps_pg_bits`
+    /// disagrees with what Theorem 1.5 predicts for the level's
+    /// `(eta, log_inv_rate, log_msg_cols)`. Enforces that the per-level
+    /// diagnostics weren't hand-waved.
     #[test]
     fn ligerito_security_config_rejects_paper_inconsistent_eps_pg() {
         let mut cfg = blake3_m29_udr_example();
@@ -13616,9 +5085,11 @@ mod tests {
         );
     }
 
+    /// Same enforcement on the query side.
     #[test]
     fn ligerito_security_config_rejects_paper_inconsistent_eps_query() {
         let mut cfg = blake3_m29_udr_example();
+        // Bump query bits by 5 — far outside tolerance.
         cfg.levels[0].expected_eps_query_bits += 5.0;
         let err = cfg.validate().unwrap_err();
         assert!(
@@ -13627,6 +5098,8 @@ mod tests {
         );
     }
 
+    /// All 6 embedded configs validate strictly (i.e. each is paper-compat
+    /// AND satisfies the security target).
     #[test]
     fn ligerito_all_embedded_configs_validate() {
         for &(key, toml) in EMBEDDED_CONFIGS {
@@ -13640,6 +5113,8 @@ mod tests {
         }
     }
 
+    /// `derive_paper_compatible` produces a config that validates for every
+    /// `(m, log_inv_rate)` combination we ship.
     #[test]
     fn ligerito_derive_paper_compatible_for_all_embedded() {
         let pairs: &[(usize, usize)] = &[(22, 1), (28, 1), (29, 1), (29, 2), (30, 1), (30, 2)];
@@ -13664,20 +5139,28 @@ mod tests {
         }
     }
 
+    /// `prover_config_for` is **strict** — only known `(m, log_inv_rate)`
+    /// pairs load. Unknown pairs return an `Err` so production callers can't
+    /// silently fall back to unaudited parameters.
     #[test]
     fn ligerito_prover_config_for_lookup() {
+        // m=29 fast: known → loads from TOML.
         let pv = prover_config_for(22, 6, LigeritoProfile::Fast).expect("m29 fast must load");
         assert_eq!(pv.queries[0], 218);
         assert_eq!(pv.fold_grinding_bits[0], 16);
 
+        // m=29 slim: known → loads from TOML.
         let pv = prover_config_for(22, 6, LigeritoProfile::Slim).expect("m29 slim must load");
         assert_eq!(pv.queries[0], 90);
         assert_eq!(pv.grinding_bits[0], 16);
 
+        // m=29 secure: known → loads from TOML (UDR, 120-bit).
         let pv = prover_config_for(22, 6, LigeritoProfile::Secure).expect("m29 secure must load");
         assert!(pv.queries[0] > 280);
         assert_eq!(pv.ood_samples.iter().sum::<usize>(), 0);
 
+        // m=36 (unknown — above the registered 22..=35 range): errors,
+        // no silent fallback.
         let err = prover_config_for(29, 6, LigeritoProfile::Fast).unwrap_err();
         assert!(
             err.contains("no security config registered"),
@@ -13685,6 +5168,8 @@ mod tests {
         );
     }
 
+    /// TOML round-trip via `to_toml_string` ↔ `from_toml_str` preserves
+    /// the config exactly (modulo validated invariants).
     #[test]
     fn ligerito_security_config_toml_roundtrip() {
         let cfg = blake3_m29_udr_example();
@@ -13696,6 +5181,7 @@ mod tests {
         assert_eq!(back.final_block.yr_log_n, cfg.final_block.yr_log_n);
     }
 
+    /// Schema validates the worked example end to end.
     #[test]
     fn ligerito_security_config_validates() {
         let cfg = blake3_m29_udr_example();
@@ -13703,6 +5189,8 @@ mod tests {
             .unwrap_or_else(|e| panic!("validate failed: {e}"));
     }
 
+    /// The config's `hash` field selects the Merkle hash and reaches both
+    /// derived configs — this is the knob the option is exposed through.
     #[test]
     fn ligerito_security_config_hash_field_selects_merkle_hash() {
         let mut cfg = blake3_m29_udr_example();
@@ -13716,12 +5204,15 @@ mod tests {
         assert_eq!(p.merkle_hash, HashKind::Blake3);
         assert_eq!(v.merkle_hash, HashKind::Blake3);
 
+        // Survives a TOML round-trip, so the option is settable from a file.
         cfg.validate().expect("blake3 config validates");
         let back = LigeritoSecurityConfig::from_toml_str(&cfg.to_toml_string().unwrap())
             .expect("toml roundtrip");
         assert_eq!(back.merkle_hash().unwrap(), HashKind::Blake3);
     }
 
+    /// A `hash` we do not implement must fail at validation rather than
+    /// silently committing under SHA-256.
     #[test]
     fn ligerito_security_config_rejects_unknown_hash() {
         let mut cfg = blake3_m29_udr_example();
@@ -13734,6 +5225,8 @@ mod tests {
         assert!(cfg.to_prover_verifier_configs().is_err());
     }
 
+    /// Every embedded config must name a hash we actually implement — a typo
+    /// in a checked-in TOML should fail here, not at proving time.
     #[test]
     fn embedded_configs_all_declare_a_supported_hash() {
         for &((m, profile), toml) in EMBEDDED_CONFIGS {
@@ -13744,6 +5237,8 @@ mod tests {
         }
     }
 
+    /// Lowering a level's expected_eps_query_bits below the required
+    /// (target − grinding) is caught by validation.
     #[test]
     fn ligerito_security_config_rejects_insufficient_queries() {
         let mut cfg = blake3_m29_udr_example();
@@ -13752,6 +5247,7 @@ mod tests {
         assert!(err.contains("expected_eps_query_bits"), "err = {err}");
     }
 
+    /// UDR regime must not carry an `eta` value.
     #[test]
     fn ligerito_security_config_rejects_udr_with_eta() {
         let mut cfg = blake3_m29_udr_example();
@@ -13760,6 +5256,7 @@ mod tests {
         assert!(err.contains("udr") && err.contains("eta"), "err = {err}");
     }
 
+    /// UDR regime requires `proximity_loss` to be set, not `eta`.
     #[test]
     fn ligerito_security_config_rejects_udr_without_proximity_loss() {
         let mut cfg = blake3_m29_udr_example();
@@ -13771,9 +5268,11 @@ mod tests {
         );
     }
 
+    /// `proximity_loss` is only valid for the UDR regime.
     #[test]
     fn ligerito_security_config_rejects_johnson_with_proximity_loss() {
         let mut cfg = blake3_m29_udr_example();
+        // JohnsonOod regime with proximity_loss set — should fail.
         cfg.levels[0].regime = SoundnessRegime::JohnsonOod;
         cfg.levels[0].eta = Some(0.02);
         cfg.levels[0].proximity_loss = Some(0.01);
@@ -13784,9 +5283,14 @@ mod tests {
         );
     }
 
+    /// End-to-end: a hand-built UDR-regime level validates against the
+    /// paper's Thm `ca-udr` bound (a = γ·n + 1) and the per-query/UDR formula.
     #[test]
     fn ligerito_security_config_udr_regime_validates() {
         let mut cfg = blake3_m29_udr_example();
+        // Convert L0 to UDR at the maximal radius γ = δ/2 − 3/(δ·n) − ε*
+        // (ε* = 0 → top of C.3's valid range). δ = 1 − ρ; per-query soundness
+        // is log₂(1/(1−γ)) and Q is sized so Q·per_q ≥ 100 bits.
         let eps_star = 0.0f64;
         let rho = 0.5f64;
         let delta = 1.0 - rho;
@@ -13794,6 +5298,9 @@ mod tests {
         let gamma = delta / 2.0 - 3.0 / (delta * n) - eps_star;
         let per_q = (1.0 / (1.0 - gamma)).log2();
         let queries = (100.0 / per_q).ceil() as usize;
+        // a = γ·n + 1; ε_pg = 128 − log₂ a with NO row-union penalty in the
+        // unique-decoding regime (list size 1; Diamond and Gruen). Any
+        // shortfall below the 100-bit target is covered by fold-grinding.
         let log_a_base = (gamma * n + 1.0).log2();
         let eps_pg = 128.0 - log_a_base;
         cfg.levels[0].regime = SoundnessRegime::Udr;
@@ -13808,6 +5315,8 @@ mod tests {
             .unwrap_or_else(|e| panic!("UDR config failed to validate: {e}"));
     }
 
+    /// Schema round-trips cleanly through serde JSON. (TOML would work too
+    /// once we add a toml dep.)
     #[test]
     fn ligerito_security_config_serde_roundtrip() {
         let cfg = blake3_m29_udr_example();
@@ -13815,10 +5324,17 @@ mod tests {
         let back: LigeritoSecurityConfig = serde_json::from_str(&json).expect("deserialize");
         back.validate().expect("roundtripped config validates");
         assert_eq!(back.levels.len(), cfg.levels.len());
+        // rate 1/2, 100-bit target, full UD radius γ = δ/2 (ε* = 0):
+        // per-query = log₂(1/(1−1/4)) ≈ 0.415 b/q → ⌈100/0.415⌉ = 241.
         assert_eq!(back.levels[0].queries, 241);
         assert_eq!(back.levels[0].grinding_bits, 0);
     }
 
+    /// End-to-end: a security config with **non-zero grinding** at L0 drives
+    /// an actual recursive_prover_with_basis → recursive_verifier_with_basis
+    /// roundtrip. Confirms the PoW step is plumbed into the FS transcript
+    /// on both sides (without grinding the proof would either be rejected
+    /// or the FS state would diverge between prover and verifier).
     #[test]
     fn ligerito_security_config_drives_roundtrip_with_grinding() {
         use crate::challenger::Challenger;
@@ -13838,6 +5354,8 @@ mod tests {
             .fold(F128::ZERO, |a, x| a + x);
 
         let log_inv_rates = vec![log_inv_rate, log_inv_rate];
+        // Hand-set queries + grinding (small but non-zero c so we exercise
+        // the SHA256 PoW search without blowing up test time).
         let queries: Vec<usize> = log_inv_rates.iter().map(|&r| udr_queries(r)).collect();
         let grinding_bits = vec![6usize, 0]; // L0 grinds 6 bits, L1 doesn't
         let cfg = ProverConfig {
@@ -13901,6 +5419,7 @@ mod tests {
             "verifier should accept proof with valid grinding nonces"
         );
 
+        // Tampering with the nonce flips the PoW check.
         let mut bad_proof = proof.clone();
         bad_proof.grinding_nonces[0] = bad_proof.grinding_nonces[0].wrapping_add(1);
         let mut v_ch = crate::challenger::FsChallenger::new(b"pow-test");
@@ -13912,6 +5431,9 @@ mod tests {
         );
     }
 
+    /// The security config produces ProverConfig/VerifierConfig matching the
+    /// existing `default_config(log_n=22, log_batch_size=6, log_inv_rate=1)`
+    /// in shape (rates + recursive_ks + initial_k all agree).
     #[test]
     fn ligerito_security_config_matches_default_config() {
         let cfg = blake3_m29_udr_example();
@@ -13922,6 +5444,12 @@ mod tests {
         assert_eq!(pv.initial_k, default.initial_k);
     }
 
+    /// Single-lane RS encoding round-trips through inv-NTT: forward-transforming
+    /// the zero-padded message and then inverse-transforming should give back the
+    /// padded message.
+    /// `partial_eval_lsb` followed by `eval_mle_lsb` on the residual equals
+    /// `eval_mle_lsb` on the full point — i.e. partial evaluation is
+    /// consistent with full evaluation under the same LSB-first convention.
     #[test]
     fn partial_eval_then_eval_equals_full_eval() {
         let n = 6;
@@ -13939,6 +5467,7 @@ mod tests {
             .collect();
 
         let full = eval_mle_lsb(&evals, &point);
+        // Split the point into a (k, n-k) partial/residual prefix.
         let k = 3;
         let (lo, hi) = point.split_at(k);
         let residual = partial_eval_lsb(&evals, lo);
@@ -13946,6 +5475,8 @@ mod tests {
         let after = eval_mle_lsb(&residual, hi);
         assert_eq!(full, after);
 
+        // Sanity: build_eq_table evaluated at `point` and dot-producted
+        // with `evals` should also equal `full` (LSB-first eq table).
         let eq = build_eq_table(&point);
         let dot = evals
             .iter()
@@ -13955,6 +5486,10 @@ mod tests {
         assert_eq!(dot, full);
     }
 
+    /// End-to-end sumcheck on a single basis poly: prove `Σ_x f(x)·b(x) = h`.
+    /// Stops one round early (yr length 2 sent in clear, à la Ligerito).
+    /// Verifier replays each round message, checks `q(0)+q(1)=T_r`, applies
+    /// the challenge, and confirms the residual inner product matches.
     #[test]
     fn stateful_sumcheck_single_basis_roundtrip() {
         use crate::challenger::Challenger;
@@ -13982,6 +5517,7 @@ mod tests {
             .map(|(&fi, &bi)| fi * bi)
             .fold(F128::ZERO, |a, v| a + v);
 
+        // Prover: 1 start message + (n-1) folds, leaving a length-2 residual.
         let (mut prover, _first) = SumcheckProver::new(f.clone(), b.clone(), h);
         let mut ch = crate::challenger::RandomChallenger::new(0xC0FFEE);
         let mut ris: Vec<F128> = Vec::new();
@@ -13993,6 +5529,8 @@ mod tests {
         assert_eq!(prover.f().len(), 2);
         assert_eq!(prover.combined_basis.len(), 2);
 
+        // Verifier replay: n messages (start + n-1 folds), n-1 prover-folds challenges
+        // (r_0..r_{n-2}) already in ris, plus one new r_last for the final residual.
         let msgs = prover.transcript().to_vec();
         assert_eq!(msgs.len(), n);
         let r_last = ch.sample_f128();
@@ -14013,6 +5551,7 @@ mod tests {
         assert_eq!(f_resid * b_resid, t_r, "residual inner product != t_r");
     }
 
+    /// Multi-basis sumcheck: introduce_new + glue mid-protocol. Verifier replays.
     #[test]
     fn stateful_sumcheck_introduce_glue() {
         use crate::challenger::Challenger;
@@ -14035,10 +5574,15 @@ mod tests {
         let (mut prover, _first) = SumcheckProver::new(f.clone(), b1.clone(), h1);
         let mut ch = crate::challenger::RandomChallenger::new(0xBEEF);
 
+        // Fold once before introducing b2 (must fold at the same dim as the introduced poly).
         let r0 = ch.sample_f128();
         prover.fold(r0);
+        // Partial-eval b2 too so it matches the prover's current f dim.
         let mut b2_folded = b2.clone();
         partial_eval_lsb_one(&mut b2_folded, r0);
+        // The h for b2 at the folded dim is Σ b2_folded · f_folded — but the verifier
+        // also gets to recompute this from the same shared inputs. For the test we
+        // pass it explicitly.
         let h2_folded: F128 = b2_folded
             .iter()
             .zip(prover.f().iter())
@@ -14048,6 +5592,8 @@ mod tests {
         let alpha = ch.sample_f128();
         prover.glue(alpha);
 
+        // Continue folding to length 2 residual: n total fold-vars used, but
+        // we've already used 1 (r0). One more r_last is the verifier's final.
         let mut ris = vec![r0];
         for _ in 0..(n - 2) {
             let r = ch.sample_f128();
@@ -14058,24 +5604,38 @@ mod tests {
         ris.push(r_last);
         assert_eq!(prover.f().len(), 2);
 
+        // Verifier replays: 1 start, 1 fold, 1 introduce_new (no T_r update), 1 glue
+        // (combine running quad with introduced, update T_r), then (n-2) folds.
         let msgs = prover.transcript().to_vec();
+        // start (idx 0) + fold(r0) → idx 1 + introduce_new → idx 2 + later folds
+        // Note: glue doesn't add a transcript entry; it just combines internal state.
         assert_eq!(msgs.len(), 1 + 1 + 1 + (n - 2));
 
         let mut t_r = h1;
+        // start
         let q0 = RoundQuad::from_msg(msgs[0], t_r);
         assert_eq!(q0.eval(F128::ZERO) + q0.eval(F128::ONE), t_r);
         t_r = q0.eval(r0); // fold(r0)
+        // fold msg (idx 1)
         let q1 = RoundQuad::from_msg(msgs[1], t_r);
         assert_eq!(q1.eval(F128::ZERO) + q1.eval(F128::ONE), t_r);
+        // introduce_new msg (idx 2): claim is h2_folded, not T_r
         let q_intro = RoundQuad::from_msg(msgs[2], h2_folded);
         assert_eq!(
             q_intro.eval(F128::ZERO) + q_intro.eval(F128::ONE),
             h2_folded
         );
+        // glue: running := q1 + alpha · q_intro; T_r := T_r + alpha · h2_folded
         let combined = RoundQuad::fold(&q1, &q_intro, alpha);
         t_r += alpha * h2_folded;
+        // The combined quad must satisfy sumcheck identity against the new T_r
         assert_eq!(combined.eval(F128::ZERO) + combined.eval(F128::ONE), t_r);
+        // Apply the rest of the folds; each subsequent msg supersedes `combined` after eval.
+        // After glue, the next fold uses challenge ris[1]. msgs[3] is from fold(ris[1]).
         let mut running = combined;
+        // Remaining prover folds: ris[1..n-1] correspond to msgs[3..n+1].
+        // Total prover-fold messages after start = (n-1) (single basis) ... but here we
+        // have 1 start + 1 fold + 1 intro + (n-2) more folds = n+1 messages.
         assert_eq!(msgs.len(), n + 1);
         for (k, &r) in ris.iter().enumerate().skip(1).take(n - 2) {
             t_r = running.eval(r);
@@ -14087,10 +5647,13 @@ mod tests {
                 "post-glue round k={k}"
             );
         }
+        // Final: apply r_last to the LAST message's quad
         t_r = running.eval(r_last);
 
         let one_plus_r = F128::ONE + r_last;
         let f_resid = prover.f()[0] * one_plus_r + prover.f()[1] * r_last;
+        // With the collapsed-basis design, combined_basis already holds
+        // eq + α·b2 at the residual dim.
         let combined_resid =
             prover.combined_basis[0] * one_plus_r + prover.combined_basis[1] * r_last;
         assert_eq!(
@@ -14100,6 +5663,10 @@ mod tests {
         );
     }
 
+    /// `induce_sumcheck_poly` is consistent with the codeword:
+    ///   1. `enforced_sum` equals `Σ_i α^i · c[q_i]` computed directly,
+    ///   2. `Σ_j msg[j] · basis_poly[j]` equals `enforced_sum` (the sumcheck
+    ///      claim that the verifier reduces to a residual eval).
     #[test]
     fn induce_sumcheck_poly_consistent_with_codeword() {
         use crate::challenger::Challenger;
@@ -14108,14 +5675,17 @@ mod tests {
         let msg_cols = 1usize << log_msg;
         let block_len = msg_cols << log_inv_rate;
 
+        // Single-lane (num_interleaved = 1, no v_challenges).
         let mut ch = crate::challenger::RandomChallenger::new(0xF00DCAFE);
         let msg: Vec<F128> = (0..msg_cols).map(|_| ch.sample_f128()).collect();
 
+        // Encode via Flock's NTT (zero-pad to block_len).
         let ntt = AdditiveNttF128::standard(log_msg + log_inv_rate);
         let mut codeword = vec![F128::ZERO; block_len];
         codeword[..msg_cols].copy_from_slice(&msg);
         ntt.forward_transform(&mut codeword);
 
+        // Pick random distinct query positions.
         let num_queries = 6;
         let mut queries: Vec<usize> = Vec::new();
         while queries.len() < num_queries {
@@ -14132,6 +5702,7 @@ mod tests {
             induce_sumcheck_poly(log_msg, &sks_vks, &opened_rows, &[], &queries, &alpha);
         assert_eq!(basis_poly.len(), msg_cols);
 
+        // Check 1: enforced_sum = Σ_i eq(α, i_bin) · c[q_i]
         let alpha_weights: Vec<F128> = crate::lincheck::build_eq_table(&alpha)
             .into_iter()
             .take(queries.len())
@@ -14143,6 +5714,9 @@ mod tests {
             .fold(F128::ZERO, |a, v| a + v);
         assert_eq!(enforced_sum, expected, "enforced_sum != eq(α)-batched c[q]");
 
+        // Check 2: Σ_j msg[j] · basis_poly[j] = enforced_sum.
+        // This is the LCH novel-basis identity: c[q] = Σ_j msg[j] · Ŵ_j(q_field),
+        // so Σ_i α^i · c[q_i] = Σ_j msg[j] · Σ_i α^i · Ŵ_j(q_i_field) = Σ_j msg[j] · basis_poly[j].
         let inner: F128 = msg
             .iter()
             .zip(basis_poly.iter())
@@ -14151,6 +5725,8 @@ mod tests {
         assert_eq!(inner, enforced_sum, "msg · basis_poly != enforced_sum");
     }
 
+    /// `induce_sumcheck_poly_via_ntt` must be byte-identical to dense across
+    /// shapes incl. the real m30_fast level dims.
     #[test]
     fn induce_sumcheck_poly_via_ntt_matches_dense() {
         use crate::challenger::Challenger;
@@ -14159,7 +5735,6 @@ mod tests {
             (3, 1, 2, 5),
             (6, 2, 3, 30),
             (10, 1, 6, 218),
-            (14, 2, 3, 106),
             (8, 3, 3, 71),
             (5, 5, 3, 43),
             (0, 2, 1, 3),
@@ -14204,933 +5779,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sparse_dual_l0_messages_and_fold2_materialization_match_dense() {
-        use crate::challenger::Challenger;
-
-        for (log_msg, log_inv_rate) in [
-            (5usize, 1usize),
-            (7, 1),
-            (10, 1),
-            (7, 2),
-            (8, 3),
-            (7, 4),
-            (6, 5),
-        ] {
-            let log_d = log_msg + log_inv_rate;
-            let msg_cols = 1usize << log_msg;
-            let block_len = 1usize << log_d;
-            let log_interleaved = 2usize;
-            let num_interleaved = 1usize << log_interleaved;
-            let mut ch = crate::challenger::RandomChallenger::new(
-                0xD0A1_2000 ^ ((log_msg * 8 + log_inv_rate) as u64),
-            );
-            let poly = ch.sample_f128_vec(msg_cols * num_interleaved);
-            let lane_challenges = ch.sample_f128_vec(log_interleaved);
-            let f = partial_eval_lsb(&poly, &lane_challenges);
-
-            let ntt = AdditiveNttF128::standard(log_d);
-            let mut l0_codeword = vec![F128::ZERO; block_len * num_interleaved];
-            ntt.rs_encode_interleaved(&poly, &mut l0_codeword, num_interleaved);
-
-            let mut queries = vec![1usize, 2, 3, 6, 7, 8, 9, 13];
-            queries.retain(|&q| q < block_len);
-            let opened_rows: Vec<Vec<F128>> = queries
-                .iter()
-                .map(|&q| l0_codeword[q * num_interleaved..(q + 1) * num_interleaved].to_vec())
-                .collect();
-            let alpha = ch.sample_f128_vec(ceil_log2(queries.len()));
-            let (basis, enforced) = induce_sumcheck_poly_via_ntt(
-                log_msg,
-                log_inv_rate,
-                &opened_rows,
-                &lane_challenges,
-                &queries,
-                &alpha,
-            );
-            for target_depth in 1..=4 {
-                let (dual, dual_enforced) = SparseDualL0::new(
-                    target_depth,
-                    log_d,
-                    log_inv_rate,
-                    &l0_codeword,
-                    num_interleaved,
-                    &lane_challenges,
-                    &queries,
-                    &alpha,
-                );
-                assert_eq!(dual_enforced, enforced);
-                assert_eq!(dual.round_msg(&[]), round_msg_lsb(&f, &basis));
-                let rs = ch.sample_f128_vec(target_depth);
-                for depth in 1..=target_depth {
-                    let folded_f = partial_eval_lsb(&f, &rs[..depth]);
-                    let folded_basis = partial_eval_lsb(&basis, &rs[..depth]);
-                    assert_eq!(
-                        dual.round_msg(&rs[..depth]),
-                        round_msg_lsb(&folded_f, &folded_basis),
-                        "log_msg={log_msg}: target={target_depth} depth={depth} message"
-                    );
-                    if depth == target_depth {
-                        assert_eq!(
-                            dual.materialize_after_folds(&rs[..depth]),
-                            folded_basis,
-                            "log_msg={log_msg}: target={target_depth} materialization"
-                        );
-                    }
-                }
-            }
-            let (mut dual, dual_enforced) = SparseDualL0::new(
-                2,
-                log_d,
-                log_inv_rate,
-                &l0_codeword,
-                num_interleaved,
-                &lane_challenges,
-                &queries,
-                &alpha,
-            );
-            assert_eq!(dual_enforced, enforced, "log_msg={log_msg}: enforced sum");
-            assert_eq!(
-                dual.round_msg(&[]),
-                round_msg_lsb(&f, &basis),
-                "log_msg={log_msg}: introduction message"
-            );
-
-            let rs = ch.sample_f128_vec(2);
-            for depth in 1..=2 {
-                let folded_f = partial_eval_lsb(&f, &rs[..depth]);
-                let folded_basis = partial_eval_lsb(&basis, &rs[..depth]);
-                assert_eq!(
-                    dual.round_msg(&rs[..depth]),
-                    round_msg_lsb(&folded_f, &folded_basis),
-                    "log_msg={log_msg}: depth={depth} message"
-                );
-                if depth == 2 {
-                    assert_eq!(
-                        dual.materialize_after_folds(&rs[..depth]),
-                        folded_basis,
-                        "log_msg={log_msg}: depth={depth} materialization"
-                    );
-                }
-            }
-
-            let base_basis = ch.sample_f128_vec(f.len());
-            let base_sum = f
-                .iter()
-                .zip(&base_basis)
-                .map(|(&x, &y)| x * y)
-                .fold(F128::ZERO, |x, y| x + y);
-            let (mut dense_prover, _) =
-                SumcheckProver::new(f.clone(), base_basis.clone(), base_sum);
-            let (mut dual_prover, _) = SumcheckProver::new(f.clone(), base_basis, base_sum);
-            let z = ch.sample_f128_vec(log_msg);
-            let (_, dense_ood_sum) = dense_prover.introduce_new_ood_factorized(&z).unwrap();
-            let (_, dual_ood_sum) = dual_prover.introduce_new_ood_factorized(&z).unwrap();
-            assert_eq!(dual_ood_sum, dense_ood_sum);
-            let ood_beta = ch.sample_f128();
-            dense_prover.glue_factorized_ood(ood_beta);
-            dual_prover.glue_factorized_ood(ood_beta);
-
-            let intro = dense_prover.introduce_new(basis.clone(), enforced);
-            assert_eq!(intro, dual.round_msg(&[]));
-            dual_prover.introduce_sparse_dual(intro);
-            let beta = ch.sample_f128();
-            dense_prover.glue_deferred_into_factorized_ood_fold(beta);
-            dual_prover.glue_sparse_dual(beta, enforced);
-            dual.scale(beta);
-
-            let fold_rs = ch.sample_f128_vec(3);
-            for depth in 1..=2 {
-                let want = dense_prover.fold(fold_rs[depth - 1]);
-                let _base = dual_prover.fold(fold_rs[depth - 1]);
-                let delta = dual.round_msg(&fold_rs[..depth]);
-                let got = dual_prover.add_to_last_message(delta);
-                assert_eq!(got, want, "log_msg={log_msg}: state depth={depth}");
-            }
-            dual_prover
-                .defer_folded_sparse_dual(dual.materialize_after_folds(&fold_rs[..2]), F128::ONE);
-            assert_eq!(dual_prover.fold(fold_rs[2]), dense_prover.fold(fold_rs[2]));
-            assert_eq!(&*dual_prover.f, &*dense_prover.f);
-            assert_eq!(&*dual_prover.combined_basis, &*dense_prover.combined_basis);
-            assert_eq!(dual_prover.t_r, dense_prover.t_r);
-            assert_eq!(dual_prover.transcript, dense_prover.transcript);
-        }
-    }
-
-    #[test]
-    fn sparse_dual_depth3_4_full_state_matches_dense() {
-        use crate::challenger::Challenger;
-
-        for target_depth in 3..=4 {
-            let log_msg = 7usize;
-            let log_d = log_msg + 1;
-            let msg_cols = 1usize << log_msg;
-            let block_len = 1usize << log_d;
-            let log_interleaved = 2usize;
-            let num_interleaved = 1usize << log_interleaved;
-            let mut ch =
-                crate::challenger::RandomChallenger::new(0xD0A1_3400 ^ target_depth as u64);
-            let poly = ch.sample_f128_vec(msg_cols * num_interleaved);
-            let lane_challenges = ch.sample_f128_vec(log_interleaved);
-            let f = partial_eval_lsb(&poly, &lane_challenges);
-            let ntt = AdditiveNttF128::standard(log_d);
-            let mut l0_codeword = vec![F128::ZERO; block_len * num_interleaved];
-            ntt.rs_encode_interleaved(&poly, &mut l0_codeword, num_interleaved);
-            let queries = vec![1usize, 2, 3, 6, 7, 8, 9, 13, 31, 32, 33];
-            if target_depth == 4 {
-                let mut reduced: Vec<usize> =
-                    queries.iter().map(|&query| query >> target_depth).collect();
-                reduced.sort_unstable();
-                assert!(
-                    reduced.windows(2).any(|pair| pair[0] == pair[1]),
-                    "k4 oracle must exercise reduced-position collisions"
-                );
-            }
-            let opened_rows: Vec<Vec<F128>> = queries
-                .iter()
-                .map(|&q| l0_codeword[q * num_interleaved..(q + 1) * num_interleaved].to_vec())
-                .collect();
-            let alpha = ch.sample_f128_vec(ceil_log2(queries.len()));
-            let (basis, enforced) = induce_sumcheck_poly_via_ntt(
-                log_msg,
-                1,
-                &opened_rows,
-                &lane_challenges,
-                &queries,
-                &alpha,
-            );
-            let (mut dual, dual_enforced) = SparseDualL0::new(
-                target_depth,
-                log_d,
-                1,
-                &l0_codeword,
-                num_interleaved,
-                &lane_challenges,
-                &queries,
-                &alpha,
-            );
-            assert_eq!(dual_enforced, enforced);
-
-            let base_basis = ch.sample_f128_vec(f.len());
-            let base_sum = f
-                .iter()
-                .zip(&base_basis)
-                .map(|(&x, &y)| x * y)
-                .fold(F128::ZERO, |x, y| x + y);
-            let (mut dense, _) = SumcheckProver::new(f.clone(), base_basis.clone(), base_sum);
-            let (mut sparse, _) = SumcheckProver::new(f, base_basis, base_sum);
-            let z = ch.sample_f128_vec(log_msg);
-            let (_, dense_ood_sum) = dense.introduce_new_ood_factorized(&z).unwrap();
-            let (_, sparse_ood_sum) = sparse.introduce_new_ood_factorized(&z).unwrap();
-            assert_eq!(sparse_ood_sum, dense_ood_sum);
-            let ood_beta = ch.sample_f128();
-            dense.glue_factorized_ood(ood_beta);
-            sparse.glue_factorized_ood(ood_beta);
-
-            let intro = dense.introduce_new(basis, enforced);
-            assert_eq!(intro, dual.round_msg(&[]));
-            sparse.introduce_sparse_dual(intro);
-            let beta = ch.sample_f128();
-            dense.glue_deferred_into_factorized_ood_fold(beta);
-            sparse.glue_sparse_dual(beta, enforced);
-            dual.scale(beta);
-
-            let fold_rs = ch.sample_f128_vec(target_depth);
-            for depth in 1..=target_depth {
-                let want = dense.fold(fold_rs[depth - 1]);
-                let _base = sparse.fold(fold_rs[depth - 1]);
-                let got = sparse.add_to_last_message(dual.round_msg(&fold_rs[..depth]));
-                assert_eq!(got, want, "target={target_depth} depth={depth}");
-            }
-            sparse.merge_folded_sparse_dual(dual.materialize_after_folds(&fold_rs));
-            assert_eq!(&*sparse.f, &*dense.f);
-            assert_eq!(&*sparse.combined_basis, &*dense.combined_basis);
-            assert_eq!(sparse.t_r, dense.t_r);
-            assert_eq!(sparse.transcript, dense.transcript);
-        }
-    }
-
-    #[test]
-    fn sparse_dual_k4_cross_level_proof_bytes_match_dense() {
-        use crate::challenger::Challenger;
-
-        let log_n = 12usize;
-        let initial_k = 2usize;
-        let (p_cfg, v_cfg) = ood_test_configs(
-            log_n,
-            initial_k,
-            &[3, 2],
-            vec![0, 1, 1],
-            vec![0, 0, 0],
-        );
-        let mut rng = crate::challenger::RandomChallenger::new(0x5A2E_D0A1_0004);
-        let poly = rng.sample_f128_vec(1usize << log_n);
-        let z = rng.sample_f128_vec(log_n);
-        let basis = build_eq_table(&z);
-        let target = poly
-            .iter()
-            .zip(&basis)
-            .map(|(&f, &b)| f * b)
-            .fold(F128::ZERO, |x, y| x + y);
-
-        let log_msg_cols_0 = log_n - initial_k;
-        let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + p_cfg.log_inv_rates[0]);
-        let wtns_0 = ligero_commit(
-            &poly,
-            log_msg_cols_0,
-            initial_k,
-            p_cfg.log_inv_rates[0],
-            &ntt_0,
-            p_cfg.merkle_hash,
-        );
-        let initial_root = wtns_0.root();
-
-        SPARSE_DUAL_TEST_DEPTH.with(|value| value.set(0));
-        let mut dense_ch = crate::challenger::FsChallenger::new(b"sparse-dual-k4-proof-byte");
-        let dense = recursive_prover_with_basis(
-            &p_cfg,
-            poly.clone(),
-            basis.clone(),
-            target,
-            &wtns_0.mat,
-            &wtns_0.tree,
-            &mut dense_ch,
-        );
-
-        SPARSE_DUAL_TEST_DEPTH.with(|value| value.set(4));
-        let mut sparse_ch = crate::challenger::FsChallenger::new(b"sparse-dual-k4-proof-byte");
-        let sparse = recursive_prover_with_basis(
-            &p_cfg,
-            poly,
-            basis.clone(),
-            target,
-            &wtns_0.mat,
-            &wtns_0.tree,
-            &mut sparse_ch,
-        );
-        SPARSE_DUAL_TEST_DEPTH.with(|value| value.set(0));
-
-        assert_eq!(sparse, dense);
-        assert_eq!(
-            bincode::serialize(&sparse).expect("serialize sparse proof"),
-            bincode::serialize(&dense).expect("serialize dense proof")
-        );
-        let mut verifier_ch =
-            crate::challenger::FsChallenger::new(b"sparse-dual-k4-proof-byte");
-        assert!(recursive_verifier_with_basis(
-            &v_cfg,
-            &sparse,
-            &basis,
-            target,
-            &initial_root,
-            &mut verifier_ch,
-        ));
-    }
-
-    #[test]
-    fn sparse_dual_deep_levels_proof_bytes_match_dense() {
-        use crate::challenger::Challenger;
-
-        let log_n = 14usize;
-        let initial_k = 2usize;
-        let (p_cfg, v_cfg) = ood_test_configs(
-            log_n,
-            initial_k,
-            &[3, 3, 2],
-            vec![0, 1, 1, 1],
-            vec![0, 0, 0, 0],
-        );
-        let mut rng = crate::challenger::RandomChallenger::new(0x5A2E_D0A1_0D33);
-        let poly = rng.sample_f128_vec(1usize << log_n);
-        let z = rng.sample_f128_vec(log_n);
-        let basis = build_eq_table(&z);
-        let target = poly
-            .iter()
-            .zip(&basis)
-            .map(|(&f, &b)| f * b)
-            .fold(F128::ZERO, |x, y| x + y);
-
-        let log_msg_cols_0 = log_n - initial_k;
-        let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + p_cfg.log_inv_rates[0]);
-        let wtns_0 = ligero_commit(
-            &poly,
-            log_msg_cols_0,
-            initial_k,
-            p_cfg.log_inv_rates[0],
-            &ntt_0,
-            p_cfg.merkle_hash,
-        );
-        let initial_root = wtns_0.root();
-
-        SPARSE_DUAL_TEST_DEPTH.with(|value| value.set(0));
-        SPARSE_DUAL_DEEP_TEST_DEPTH.with(|value| value.set(0));
-        let mut dense_ch = crate::challenger::FsChallenger::new(b"sparse-dual-deep-proof-byte");
-        let dense = recursive_prover_with_basis(
-            &p_cfg,
-            poly.clone(),
-            basis.clone(),
-            target,
-            &wtns_0.mat,
-            &wtns_0.tree,
-            &mut dense_ch,
-        );
-
-        SPARSE_DUAL_DEEP_TEST_DEPTH.with(|value| value.set(4));
-        let mut deep_ch = crate::challenger::FsChallenger::new(b"sparse-dual-deep-proof-byte");
-        let deep_only = recursive_prover_with_basis(
-            &p_cfg,
-            poly.clone(),
-            basis.clone(),
-            target,
-            &wtns_0.mat,
-            &wtns_0.tree,
-            &mut deep_ch,
-        );
-
-        SPARSE_DUAL_TEST_DEPTH.with(|value| value.set(4));
-        let mut sparse_ch = crate::challenger::FsChallenger::new(b"sparse-dual-deep-proof-byte");
-        let sparse = recursive_prover_with_basis(
-            &p_cfg,
-            poly,
-            basis.clone(),
-            target,
-            &wtns_0.mat,
-            &wtns_0.tree,
-            &mut sparse_ch,
-        );
-        SPARSE_DUAL_TEST_DEPTH.with(|value| value.set(0));
-        SPARSE_DUAL_DEEP_TEST_DEPTH.with(|value| value.set(0));
-
-        assert_eq!(deep_only, dense, "deep-only sparse arm");
-        assert_eq!(sparse, dense, "L0 + deep sparse arm");
-        assert_eq!(
-            bincode::serialize(&sparse).expect("serialize sparse proof"),
-            bincode::serialize(&dense).expect("serialize dense proof")
-        );
-        let mut verifier_ch =
-            crate::challenger::FsChallenger::new(b"sparse-dual-deep-proof-byte");
-        assert!(recursive_verifier_with_basis(
-            &v_cfg,
-            &sparse,
-            &basis,
-            target,
-            &initial_root,
-            &mut verifier_ch,
-        ));
-    }
-
-    #[test]
-    fn sparse_dual_exact_ranked_selector_positive_kill_and_negative() {
-        let mut config = prover_config_for(25, 6, LigeritoProfile::Fast)
-            .expect("exact ranked m32 Fast config");
-        config.merkle_hash = HashKind::Blake3;
-        let select = |cfg: &ProverConfig, sparse_disabled: bool, defer_disabled: bool| {
-            ranked_sparse_dual_l0_depth_selected(
-                cfg,
-                25,
-                19,
-                1usize << 19,
-                218,
-                1,
-                true,
-                true,
-                true,
-                sparse_disabled,
-                defer_disabled,
-                4,
-            )
-        };
-        assert_eq!(select(&config, false, false), Some(4));
-        assert_eq!(select(&config, true, false), None, "sparse kill must restore dense");
-        assert_eq!(select(&config, false, true), None, "defer kill must restore dense");
-
-        let mut wrong_queries = config.clone();
-        wrong_queries.queries[0] = 217;
-        assert_eq!(select(&wrong_queries, false, false), None);
-        let mut wrong_shape = config.clone();
-        wrong_shape.recursive_ks[0] = 4;
-        assert_eq!(select(&wrong_shape, false, false), None);
-    }
-
-    #[test]
-    fn sparse_dual_ranked_depth2_default_rollback_and_explicit_priority() {
-        let default = if op_bg_dual_enabled() { OP_BG_SPARSE_DUAL_DEPTH } else { 2 };
-        assert_eq!(ranked_sparse_dual_l0_depth_setting(None, false), default);
-        assert_eq!(ranked_sparse_dual_l0_depth_setting(None, true), 4);
-        for depth in 1..=4 {
-            let value = depth.to_string();
-            assert_eq!(
-                ranked_sparse_dual_l0_depth_setting(Some(&value), false),
-                depth
-            );
-            assert_eq!(
-                ranked_sparse_dual_l0_depth_setting(Some(&value), true),
-                depth,
-                "explicit depth must override the depth2 rollback"
-            );
-        }
-    }
-
-    #[test]
-    fn sparse_dual_deep_selector_covers_every_ranked_level() {
-        let mut config = prover_config_for(25, 6, LigeritoProfile::Fast)
-            .expect("exact ranked m32 Fast config");
-        config.merkle_hash = HashKind::Blake3;
-        let ladder: [(usize, usize, usize); 5] = [
-            (19, 218, 1),
-            (16, 106, 2),
-            (13, 71, 3),
-            (10, 53, 4),
-            (7, 43, 5),
-        ];
-        for &(n_level, n_queries, rate) in &ladder {
-            let select = |sparse_disabled: bool, defer_disabled: bool| {
-                ranked_sparse_dual_l0_depth_selected(
-                    &config,
-                    25,
-                    n_level,
-                    1usize << n_level,
-                    n_queries,
-                    rate,
-                    true,
-                    true,
-                    true,
-                    sparse_disabled,
-                    defer_disabled,
-                    4,
-                )
-            };
-            assert_eq!(select(false, false), Some(4), "level n={n_level}");
-            assert_eq!(select(true, false), None, "sparse kill at n={n_level}");
-            assert_eq!(select(false, true), None, "defer kill at n={n_level}");
-            assert_eq!(
-                ranked_sparse_dual_l0_depth_selected(
-                    &config,
-                    25,
-                    n_level,
-                    1usize << n_level,
-                    n_queries,
-                    rate + 1,
-                    true,
-                    true,
-                    true,
-                    false,
-                    false,
-                    4,
-                ),
-                None,
-                "wrong rate at n={n_level}"
-            );
-        }
-        assert_eq!(ranked_sparse_dual_deep_depth_for_level(19), None);
-        let mut materializations = vec![SPARSE_DUAL_MAX_DEPTH - 1];
-        for (level, n_level) in [16usize, 13, 10, 7].iter().copied().enumerate() {
-            let depth = ranked_sparse_dual_deep_depth_for_level(n_level)
-                .unwrap_or_else(|| panic!("no depth for ranked level n={n_level}"));
-            assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
-            let remaining = 3 * (4 - level);
-            assert!(depth <= remaining, "n={n_level}: depth {depth} > {remaining}");
-            materializations.push(3 * (level + 1) + depth - 1);
-        }
-        let mut sorted = materializations.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(
-            sorted.len(),
-            materializations.len(),
-            "materialization folds collide: {materializations:?}"
-        );
-    }
-
-    #[test]
-    #[ignore = "~2 GiB exact-ranked oracle; run alone in release mode"]
-    fn sparse_dual_exact_ranked_post_direct_fold8_messages_state_and_timings() {
-        use crate::challenger::Challenger;
-        use rayon::prelude::*;
-        use std::hint::black_box;
-        use std::time::Instant;
-
-        let mut config = prover_config_for(25, 6, LigeritoProfile::Fast)
-            .expect("exact ranked m32 Fast config");
-        config.merkle_hash = HashKind::Blake3;
-        assert_eq!(
-            ranked_sparse_dual_l0_depth_selected(
-                &config,
-                25,
-                19,
-                1usize << 19,
-                218,
-                1,
-                true,
-                true,
-                true,
-                false,
-                false,
-                4,
-            ),
-            Some(4),
-            "exact production selector must reach the sparse arm"
-        );
-        assert_eq!(
-            ranked_sparse_dual_l0_depth_selected(
-                &config,
-                25,
-                19,
-                1usize << 19,
-                218,
-                1,
-                true,
-                true,
-                true,
-                true,
-                false,
-                4,
-            ),
-            None,
-            "kill switch must restore the dense arm"
-        );
-
-        const LOG_N: usize = 25;
-        const LANE_LOG: usize = 6;
-        const LANES: usize = 1 << LANE_LOG;
-        const LOG_MSG: usize = LOG_N - LANE_LOG;
-        const LOG_D: usize = LOG_MSG + 1;
-        const Q: usize = 218;
-        let mut rng = crate::challenger::RandomChallenger::new(0xD12E_C7F8_0218_0064);
-        let poly = rng.sample_f128_vec(1usize << LOG_N);
-        let lane_challenges = rng.sample_f128_vec(LANE_LOG);
-        let f = partial_eval_lsb(&poly, &lane_challenges);
-        let ntt = AdditiveNttF128::standard(LOG_D);
-        let mut l0_codeword = vec![F128::ZERO; (1usize << LOG_D) * LANES];
-        let encode_start = Instant::now();
-        ntt.rs_encode_interleaved(&poly, &mut l0_codeword, LANES);
-        let encode_ms = encode_start.elapsed().as_secs_f64() * 1e3;
-        let mut queries: Vec<usize> = vec![1, 2];
-        queries.extend(
-            (0..Q - 2).map(|index| (index * 4093 + 17) & ((1usize << LOG_D) - 1)),
-        );
-        assert_eq!(queries.len(), Q);
-        let mut reduced_k4: Vec<usize> = queries.iter().map(|&query| query >> 4).collect();
-        reduced_k4.sort_unstable();
-        assert!(
-            reduced_k4.windows(2).any(|pair| pair[0] == pair[1]),
-            "exact k4 oracle must exercise reduced-position collisions"
-        );
-        let opened_rows: Vec<Vec<F128>> = queries
-            .iter()
-            .map(|&query| l0_codeword[query * LANES..(query + 1) * LANES].to_vec())
-            .collect();
-        let alpha = rng.sample_f128_vec(ceil_log2(Q));
-
-        let dense_start = Instant::now();
-        let (dense_basis, enforced_sum) = induce_sumcheck_poly_via_ntt(
-            LOG_MSG,
-            1,
-            &opened_rows,
-            &lane_challenges,
-            &queries,
-            &alpha,
-        );
-        let dense_induce_ms = dense_start.elapsed().as_secs_f64() * 1e3;
-        const INTRO_REPEATS: usize = 100;
-        let dense_intro_start = Instant::now();
-        for _ in 0..INTRO_REPEATS {
-            black_box(round_msg_lsb(black_box(&f), black_box(&dense_basis)));
-        }
-        let dense_intro_ms =
-            dense_intro_start.elapsed().as_secs_f64() * 1e3 / INTRO_REPEATS as f64;
-        let all_fold_challenges = rng.sample_f128_vec(5);
-
-        let mut depth4_dual = None;
-        for depth in 2..=4 {
-            let construct_start = Instant::now();
-            let (dual, sparse_enforced) = SparseDualL0::new(
-                depth,
-                LOG_D,
-                1,
-                &l0_codeword,
-                LANES,
-                &lane_challenges,
-                &queries,
-                &alpha,
-            );
-            let construct_ms = construct_start.elapsed().as_secs_f64() * 1e3;
-            assert_eq!(sparse_enforced, enforced_sum);
-            for prior in 0..=depth {
-                assert_eq!(
-                    dual.round_msg(&all_fold_challenges[..prior]),
-                    round_msg_lsb(
-                        &partial_eval_lsb(&f, &all_fold_challenges[..prior]),
-                        &partial_eval_lsb(&dense_basis, &all_fold_challenges[..prior]),
-                    ),
-                    "exact ranked depth={depth} prior={prior} message"
-                );
-            }
-            const MESSAGE_REPEATS: usize = 100;
-            let messages_start = Instant::now();
-            for _ in 0..MESSAGE_REPEATS {
-                for prior in 0..=depth {
-                    black_box(dual.round_msg(black_box(&all_fold_challenges[..prior])));
-                }
-            }
-            let messages_ms = messages_start.elapsed().as_secs_f64() * 1e3
-                / MESSAGE_REPEATS as f64;
-            let material_start = Instant::now();
-            let materialized = dual.materialize_after_folds(&all_fold_challenges[..depth]);
-            let materialize_ms = material_start.elapsed().as_secs_f64() * 1e3;
-            assert_eq!(
-                materialized,
-                partial_eval_lsb(&dense_basis, &all_fold_challenges[..depth]),
-                "exact ranked depth={depth} materialization"
-            );
-            let merge_ms = if depth == 3 {
-                const MERGE_REPEATS: usize = 100;
-                let mut dst = vec![F128::ZERO; materialized.len()];
-                let merge_start = Instant::now();
-                for _ in 0..MERGE_REPEATS {
-                    dst.par_iter_mut()
-                        .zip(materialized.par_iter())
-                        .for_each(|(value, &added)| *value += added);
-                    black_box(&dst);
-                }
-                merge_start.elapsed().as_secs_f64() * 1e3 / MERGE_REPEATS as f64
-            } else {
-                0.0
-            };
-            eprintln!(
-                "[sparse-dual-ranked] k={depth} construct={construct_ms:.6} ms messages={messages_ms:.6} ms materialize={materialize_ms:.6} ms seam_merge={merge_ms:.6} ms replacement={:.6} ms",
-                construct_ms + messages_ms + materialize_ms + merge_ms,
-            );
-            if depth == 4 {
-                depth4_dual = Some(dual);
-            }
-        }
-
-        let mut dual = depth4_dual.expect("k4 dual retained");
-        let base_basis = rng.sample_f128_vec(f.len());
-        let base_sum = f
-            .iter()
-            .zip(&base_basis)
-            .map(|(&x, &y)| x * y)
-            .fold(F128::ZERO, |x, y| x + y);
-        let (mut dense, _) = SumcheckProver::new(f.clone(), base_basis.clone(), base_sum);
-        let (mut sparse, _) = SumcheckProver::new(f, base_basis, base_sum);
-
-        let z_l1 = rng.sample_f128_vec(LOG_MSG);
-        let (_, dense_ood_sum) = dense.introduce_new_ood_factorized(&z_l1).unwrap();
-        let (_, sparse_ood_sum) = sparse.introduce_new_ood_factorized(&z_l1).unwrap();
-        assert_eq!(sparse_ood_sum, dense_ood_sum);
-        let ood_beta_l1 = rng.sample_f128();
-        dense.glue_factorized_ood(ood_beta_l1);
-        sparse.glue_factorized_ood(ood_beta_l1);
-        let dense_intro = dense.introduce_new(dense_basis, enforced_sum);
-        let sparse_intro = dual.round_msg(&[]);
-        assert_eq!(sparse_intro, dense_intro);
-        sparse.introduce_sparse_dual(sparse_intro);
-        let dual_beta = rng.sample_f128();
-        dense.glue_deferred_into_factorized_ood_fold(dual_beta);
-        sparse.glue_sparse_dual(dual_beta, enforced_sum);
-        dual.scale(dual_beta);
-
-        for depth in 1..=3 {
-            let want = dense.fold(all_fold_challenges[depth - 1]);
-            let _base = sparse.fold(all_fold_challenges[depth - 1]);
-            let got = sparse.add_to_last_message(dual.round_msg(&all_fold_challenges[..depth]));
-            assert_eq!(got, want, "exact ranked pre-boundary fold {depth}");
-        }
-
-        let z_l2 = rng.sample_f128_vec(LOG_MSG - 3);
-        let (dense_ood_msg, dense_ood_sum) = dense.introduce_new_ood_factorized(&z_l2).unwrap();
-        let (sparse_ood_msg, sparse_ood_sum) = sparse.introduce_new_ood_factorized(&z_l2).unwrap();
-        assert_eq!((sparse_ood_msg, sparse_ood_sum), (dense_ood_msg, dense_ood_sum));
-        let ood_beta_l2 = rng.sample_f128();
-        dense.glue_factorized_ood(ood_beta_l2);
-        sparse.glue_factorized_ood(ood_beta_l2);
-        let b1 = rng.sample_f128_vec(1usize << (LOG_MSG - 3));
-        let h1 = dense
-            .f()
-            .iter()
-            .zip(&b1)
-            .map(|(&x, &y)| x * y)
-            .fold(F128::ZERO, |x, y| x + y);
-        assert_eq!(dense.introduce_new(b1.clone(), h1), sparse.introduce_new(b1, h1));
-        let beta1 = rng.sample_f128();
-        dense.glue_deferred_into_factorized_ood_fold(beta1);
-        sparse.glue_deferred_into_factorized_ood_fold(beta1);
-
-        let want4 = dense.fold(all_fold_challenges[3]);
-        let _base4 = sparse.fold(all_fold_challenges[3]);
-        let got4 = sparse.add_to_last_message(dual.round_msg(&all_fold_challenges[..4]));
-        assert_eq!(got4, want4);
-        sparse.defer_folded_sparse_dual(
-            dual.materialize_after_folds(&all_fold_challenges[..4]),
-            F128::ONE,
-        );
-        assert_eq!(sparse.fold(all_fold_challenges[4]), dense.fold(all_fold_challenges[4]));
-        assert_eq!(&*sparse.f, &*dense.f);
-        assert_eq!(&*sparse.combined_basis, &*dense.combined_basis);
-        assert_eq!(sparse.t_r, dense.t_r);
-        assert_eq!(sparse.transcript, dense.transcript);
-        eprintln!(
-            "[sparse-dual-ranked] encode={encode_ms:.3} ms dense_induce={dense_induce_ms:.6} ms dense_intro={dense_intro_ms:.6} ms dense_removable={:.6} ms",
-            dense_induce_ms + dense_intro_ms,
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn sparse_dual_union_fold1_fold5_interaction_timings() {
-        use crate::challenger::Challenger;
-        use std::hint::black_box;
-        use std::time::Instant;
-
-        let mut rng = crate::challenger::RandomChallenger::new(0xD12E_F015_0005);
-        let r1 = rng.sample_f128();
-        let r5 = rng.sample_f128();
-        let gamma = rng.sample_f128();
-        let alpha = rng.sample_f128();
-
-        const N1: usize = 1 << 19;
-        const EQ_LO: usize = 2048;
-        let f1 = rng.sample_f128_vec(N1);
-        let b1 = rng.sample_f128_vec(N1);
-        let d1 = rng.sample_f128_vec(N1);
-        let eq_lo = rng.sample_f128_vec(EQ_LO);
-        let eq_hi = rng.sample_f128_vec((N1 / 2) / EQ_LO);
-
-        const N5: usize = 1 << 15;
-        let f5 = rng.sample_f128_vec(N5);
-        let b5 = rng.sample_f128_vec(N5);
-        let d5 = rng.sample_f128_vec(N5);
-
-        let fold1 = |basis: Option<(&[F128], F128)>| {
-            black_box(fold_and_msg_lsb_inner(
-                black_box(&f1),
-                black_box(&b1),
-                black_box(r1),
-                None,
-                Some((black_box(&eq_lo), black_box(&eq_hi), black_box(gamma))),
-                basis,
-            ))
-        };
-        let fold5 = |basis: Option<(&[F128], F128)>| {
-            black_box(fold_and_msg_lsb_inner(
-                black_box(&f5),
-                black_box(&b5),
-                black_box(r5),
-                None,
-                None,
-                basis,
-            ))
-        };
-
-        drop(fold1(None));
-        drop(fold1(Some((&d1, alpha))));
-        drop(fold5(None));
-        drop(fold5(Some((&d5, alpha))));
-
-        fn sample_ms(mut f: impl FnMut(), repeats: usize) -> f64 {
-            let start = Instant::now();
-            for _ in 0..repeats {
-                f();
-            }
-            start.elapsed().as_secs_f64() * 1e3 / repeats as f64
-        }
-
-        const FOLD1_REPEATS: usize = 24;
-        const FOLD5_REPEATS: usize = 160;
-        let dense_fold1_ms = sample_ms(
-            || drop(fold1(Some((black_box(&d1), black_box(alpha))))),
-            FOLD1_REPEATS,
-        );
-        let sparse_fold1_ms = sample_ms(|| drop(fold1(None)), FOLD1_REPEATS);
-        let dense_fold5_ms = sample_ms(|| drop(fold5(None)), FOLD5_REPEATS);
-        let sparse_fold5_ms = sample_ms(
-            || drop(fold5(Some((black_box(&d5), black_box(alpha))))),
-            FOLD5_REPEATS,
-        );
-        let fold1_saved_ms = dense_fold1_ms - sparse_fold1_ms;
-        let fold5_tax_ms = sparse_fold5_ms - dense_fold5_ms;
-        eprintln!(
-            "[sparse-dual-union-seams] dense_fold1={dense_fold1_ms:.6} ms sparse_fold1={sparse_fold1_ms:.6} ms fold1_saved={fold1_saved_ms:.6} ms dense_fold5={dense_fold5_ms:.6} ms sparse_fold5={sparse_fold5_ms:.6} ms fold5_tax={fold5_tax_ms:.6} ms net={:.6} ms",
-            fold1_saved_ms - fold5_tax_ms,
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn sparse_dual_round_msg_serial_vs_chunked_m4() {
-        use crate::challenger::Challenger;
-        use std::hint::black_box;
-        use std::time::Instant;
-
-        let depth = 4usize;
-        let log_d = 20usize;
-        let query_count = 218usize;
-        let mut rng = crate::challenger::RandomChallenger::new(0x5E21_A1C4_0218);
-        let queries: Vec<usize> = (0..query_count)
-            .map(|index| (index * 4093 + 17) & ((1usize << log_d) - 1))
-            .collect();
-        let alpha_pows = rng.sample_f128_vec(query_count);
-        let inverse_local_blocks = (0..query_count)
-            .map(|_| {
-                let values = rng.sample_f128_vec(32);
-                let mut block = [F128::ZERO; 32];
-                block.copy_from_slice(&values);
-                block
-            })
-            .collect();
-        let dual = SparseDualL0 {
-            ntt: AdditiveNttF128::standard(log_d),
-            log_d,
-            log_inv_rate: 1,
-            depth,
-            cache_len: 32,
-            queries,
-            alpha_pows,
-            w0_pows: Vec::new(),
-            w2_pows: Vec::new(),
-            folded_k: 0,
-            inverse_local_blocks,
-            rows: Vec::new(),
-            round0_msg: SumcheckMessage {
-                u_0: F128::ZERO,
-                u_2: F128::ZERO,
-            },
-            snapshots: false,
-            lane_x4: true,
-        };
-        let challenges = rng.sample_f128_vec(depth);
-        for k in 0..=depth {
-            assert_eq!(
-                dual.round_msg(&challenges[..k]),
-                dual.round_msg_chunked(&challenges[..k])
-            );
-        }
-
-        const REPEATS: usize = 200;
-        let serial_start = Instant::now();
-        for _ in 0..REPEATS {
-            for k in 0..=depth {
-                black_box(dual.round_msg(black_box(&challenges[..k])));
-            }
-        }
-        let serial = serial_start.elapsed();
-        let chunked_start = Instant::now();
-        for _ in 0..REPEATS {
-            for k in 0..=depth {
-                black_box(dual.round_msg_chunked(black_box(&challenges[..k])));
-            }
-        }
-        let chunked = chunked_start.elapsed();
-        eprintln!(
-            "[sparse-dual-msg] serial={:.6} ms/proof chunked={:.6} ms/proof ratio={:.3}",
-            serial.as_secs_f64() * 1e3 / REPEATS as f64,
-            chunked.as_secs_f64() * 1e3 / REPEATS as f64,
-            chunked.as_secs_f64() / serial.as_secs_f64(),
-        );
-    }
-
+    /// The sparse-prefix transpose must equal the baseline dense transpose on
+    /// the same scattered input, across sizes (incl. > and < the k=8 prefix gate).
     #[test]
     fn transpose_sparse_matches_dense() {
         use crate::challenger::Challenger;
@@ -15150,6 +5800,7 @@ mod tests {
                         values.push(ch.sample_f128());
                     }
                 }
+                // Baseline: scatter then dense transpose.
                 let mut dense = vec![F128::ZERO; n];
                 for (&p, &v) in positions.iter().zip(&values) {
                     dense[p] += v;
@@ -15161,622 +5812,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn singleton_window_matches_dense_for_every_position() {
-        use crate::challenger::Challenger;
-        const K: usize = 8;
-        for &log_d in &[12usize, 18, 20] {
-            let ntt = AdditiveNttF128::standard(log_d);
-            let last_w = (1usize << (log_d - K)) - 1;
-            for &w in &[0usize, 1, last_w] {
-                let mut ch = crate::challenger::RandomChallenger::new(
-                    0x51A6_1E70 ^ ((log_d * 257 + w) as u64),
-                );
-                for p in 0..(1usize << K) {
-                    let value = if p == 0 { F128::ONE } else { ch.sample_f128() };
-                    let mut dense = vec![F128::ZERO; 1usize << K];
-                    dense[p] = value;
-                    let want = transpose_forward_ntt_window_dense(&ntt, log_d, K, w, dense);
-                    let got = transpose_forward_ntt_window_singleton(&ntt, log_d, K, w, p, value);
-                    assert_eq!(got, want, "log_d={log_d} w={w} p={p}");
-                }
-            }
-        }
-    }
-
-    fn sparse_dense_oracle(log_d: usize, positions: &[usize], values: &[F128]) -> Vec<F128> {
-        let mut dense = vec![F128::ZERO; 1usize << log_d];
-        for (&p, &v) in positions.iter().zip(values) {
-            dense[p] += v;
-        }
-        let ntt = AdditiveNttF128::standard(log_d);
-        transpose_forward_ntt(&ntt, &mut dense, log_d);
-        dense
-    }
-
-    #[test]
-    fn singleton_sparse_collision_falls_back_exactly() {
-        use crate::challenger::Challenger;
-        let log_d = 12usize;
-        let w = 3usize;
-        let positions = vec![(w << 8) + 1, (w << 8) + 7, (w << 8) + 201];
-        let mut ch = crate::challenger::RandomChallenger::new(0xC011_1510);
-        let values: Vec<F128> = positions.iter().map(|_| ch.sample_f128()).collect();
-        let ntt = AdditiveNttF128::standard(log_d);
-        let want = sparse_dense_oracle(log_d, &positions, &values);
-        let (got, stats) = transpose_forward_ntt_sparse_inner(
-            &ntt,
-            &positions,
-            &values,
-            log_d,
-            Some(true),
-            Some(8),
-        );
-        let (off, _) = transpose_forward_ntt_sparse_inner(
-            &ntt,
-            &positions,
-            &values,
-            log_d,
-            Some(false),
-            Some(8),
-        );
-        assert_eq!(got, want);
-        assert_eq!(off, want);
-        assert_eq!(stats.singleton_hits, 0);
-        assert_eq!(stats.multi_hits, 1);
-        assert_eq!(stats.collision_fallbacks, 0);
-    }
-
-    #[test]
-    fn singleton_sparse_mixed_windows_match_dense() {
-        use crate::challenger::Challenger;
-        let log_d = 12usize;
-        let positions = vec![
-            (1usize << 8) + 2,
-            (1usize << 8) + 91,
-            (5usize << 8) + 17,
-            (11usize << 8) + 233,
-        ];
-        let mut ch = crate::challenger::RandomChallenger::new(0x51A6_C011);
-        let values: Vec<F128> = positions.iter().map(|_| ch.sample_f128()).collect();
-        let ntt = AdditiveNttF128::standard(log_d);
-        let want = sparse_dense_oracle(log_d, &positions, &values);
-        let (got, stats) = transpose_forward_ntt_sparse_inner(
-            &ntt,
-            &positions,
-            &values,
-            log_d,
-            Some(true),
-            Some(8),
-        );
-        assert_eq!(got, want);
-        assert_eq!(stats.singleton_hits, 2);
-        assert_eq!(stats.multi_hits, 1);
-        assert_eq!(stats.collision_fallbacks, 0);
-    }
-
-    #[test]
-    fn induce_window_k_selects_documented_optima() {
-        assert_eq!(induce_window_k(20, 218, 16, true), 12);
-        assert_eq!(induce_window_k(18, 106, 16, true), 11);
-        assert_eq!(induce_window_k(20, 218, 16, false), 8);
-        assert_eq!(induce_window_k(18, 106, 16, false), 8);
-        assert_eq!(induce_window_k(12, 218, 16, false), 8);
-        assert_eq!(induce_window_k(11, 218, 16, true), 0);
-        assert_eq!(induce_window_k(20, 0, 16, true), 0);
-        assert_eq!(induce_window_k(20, 218, 256, true), 10);
-        assert_eq!(induce_window_k(12, 106, 16, true), 8);
-        assert_eq!(induce_window_k(20, 218, 4096, true), 8);
-        assert_eq!(induce_window_k(20, 1, 1, true), 12);
-        assert_eq!(induce_window_k(20, 100_000, 16, true), 8);
-    }
-
-    #[test]
-    fn multi_singleton_matches_dense_across_threshold() {
-        use crate::challenger::Challenger;
-        let log_d = 14usize;
-        for &k in &[8usize, 10, 12] {
-            let ntt = AdditiveNttF128::standard(log_d);
-            let wlen = 1usize << k;
-            let last_w = (1usize << (log_d - k)) - 1;
-            for &w in &[0usize, last_w] {
-                let mut ch =
-                    crate::challenger::RandomChallenger::new(0x0117_15EE ^ ((k * 8191 + w) as u64));
-                for nnz in 1..=(k / 2 + 1) {
-                    let mut ps: Vec<usize> = vec![0, wlen - 1];
-                    ps.truncate(nnz);
-                    while ps.len() < nnz {
-                        let p = (ch.sample_f128().lo as usize) % wlen;
-                        if !ps.contains(&p) {
-                            ps.push(p);
-                        }
-                    }
-                    let vs: Vec<F128> = ps.iter().map(|_| ch.sample_f128()).collect();
-                    let mut dense = vec![F128::ZERO; wlen];
-                    for (&p, &v) in ps.iter().zip(&vs) {
-                        dense[p] += v;
-                    }
-                    let (_, want) = transpose_forward_ntt_window_dense(&ntt, log_d, k, w, dense);
-                    let mut buf = take_singleton_buf(k);
-                    expand_singleton_into(&ntt, log_d, k, w, ps[0], vs[0], &mut buf);
-                    let mut scratch = take_singleton_buf(k);
-                    for i in 1..nnz {
-                        expand_singleton_into(&ntt, log_d, k, w, ps[i], vs[i], &mut scratch);
-                        for (d, &s) in buf.iter_mut().zip(scratch.iter()) {
-                            *d += s;
-                        }
-                    }
-                    assert_eq!(buf, want, "k={k} w={w} nnz={nnz}");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn sparse_transpose_matches_dense_at_every_forced_k() {
-        use crate::challenger::Challenger;
-        for &log_d in &[12usize, 16, 18] {
-            let n = 1usize << log_d;
-            let ntt = AdditiveNttF128::standard(log_d);
-            let mut ch = crate::challenger::RandomChallenger::new(0x7357_0A11 ^ log_d as u64);
-            let mut positions: Vec<usize> = Vec::new();
-            while positions.len() < 80.min(n / 4) {
-                let p = (ch.sample_f128().lo as usize) % n;
-                if !positions.contains(&p) {
-                    positions.push(p);
-                }
-            }
-            let values: Vec<F128> = positions.iter().map(|_| ch.sample_f128()).collect();
-            let want = sparse_dense_oracle(log_d, &positions, &values);
-            for k in 8..=12.min(log_d) {
-                let (got, _) = transpose_forward_ntt_sparse_inner(
-                    &ntt,
-                    &positions,
-                    &values,
-                    log_d,
-                    None,
-                    Some(k),
-                );
-                assert_eq!(got, want, "log_d={log_d} k={k}");
-            }
-        }
-    }
-
-    #[test]
-    fn densify_windows_fused_matches_two_pass() {
-        use crate::challenger::Challenger;
-        for &(log_d, k) in &[
-            (12usize, 8usize),
-            (16, 8),
-            (20, 8),
-            (13, 8),
-            (20, 12),
-            (18, 11),
-            (16, 10),
-        ] {
-            let n = 1usize << log_d;
-            let nwin = n >> k;
-            for &active in &[0usize, 1, 214.min(nwin), nwin] {
-                let mut ch = crate::challenger::RandomChallenger::new(
-                    0x0DE5_1F17 ^ ((log_d * 8191 + active) as u64),
-                );
-                let mut processed: Vec<(usize, Vec<F128>)> = Vec::new();
-                let mut seen = vec![false; nwin];
-                while processed.len() < active {
-                    let w = (ch.sample_f128().lo as usize) % nwin;
-                    if seen[w] {
-                        continue;
-                    }
-                    seen[w] = true;
-                    processed.push((w, (0..(1usize << k)).map(|_| ch.sample_f128()).collect()));
-                }
-                let mut want = vec![F128::ZERO; n];
-                for (w, buf) in &processed {
-                    want[(w << k)..((w + 1) << k)].copy_from_slice(buf);
-                }
-                let got = densify_windows_fused(n, k, window_slots(nwin, processed));
-                assert_eq!(got.len(), want.len(), "log_d={log_d} active={active}");
-                assert!(got == want, "log_d={log_d} k={k} active={active}");
-            }
-        }
-    }
-
-    #[test]
-    fn eq_split_matches_serial() {
-        use crate::challenger::Challenger;
-        for d in 0..=20usize {
-            let mut ch = crate::challenger::RandomChallenger::new(0x3EE7_u64 ^ d as u64);
-            let point: Vec<F128> = (0..d).map(|_| ch.sample_f128()).collect();
-            assert_eq!(
-                build_eq_table_split(&point),
-                build_eq_table(&point),
-                "d={d}"
-            );
-        }
-    }
-
-    #[test]
-    fn factorized_ood_intro_matches_dense() {
-        use crate::challenger::Challenger;
-        for &d in &[4usize, 12, 19] {
-            let mut ch = crate::challenger::RandomChallenger::new(0xFA17_00D0 ^ d as u64);
-            let z = ch.sample_f128_vec(d);
-            let f: Vec<F128> = (0..(1usize << d)).map(|_| ch.sample_f128()).collect();
-            let dense = build_eq_table(&z);
-            let want = round_msg_and_eval_lsb(&f, &dense);
-            let split = (d - 1).min(LAZY_OOD_EQ_SPLIT_LOW_LOG);
-            let eq_lo = build_eq_table(&z[1..1 + split]);
-            let eq_hi = build_eq_table(&z[1 + split..]);
-            let got = round_msg_and_eval_lsb_factorized_eq(&f, &eq_lo, &eq_hi, z[0]);
-            assert_eq!(got, want, "factorized OOD introduction d={d}");
-        }
-    }
-
-    #[test]
-    fn lazy_ood_corrected_fold_matches_dense_glue() {
-        use crate::challenger::Challenger;
-        let d = 13usize;
-        let n = 1usize << d;
-        let mut ch = crate::challenger::RandomChallenger::new(0x1A2E_00D5);
-        let z = ch.sample_f128_vec(d);
-        let f: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
-        let b: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
-        let beta = ch.sample_f128();
-        let r = ch.sample_f128();
-
-        let dense_eq = build_eq_table(&z);
-        let mut dense_basis = b.clone();
-        crate::field::f128_slice::add_scaled(&mut dense_basis, &dense_eq, beta);
-        let (want_f, want_b, want_msg) = fold_and_msg_lsb(&f, &dense_basis, r, None);
-
-        let eq_lo = build_eq_table(&z[1..12]);
-        let eq_hi = build_eq_table(&z[12..]);
-        assert_eq!(eq_lo.len(), 2048);
-        let gamma = beta * (F128::ONE + z[0] + r);
-        let (got_f, got_b, got_msg) =
-            fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)), None);
-        assert_eq!(&*got_f, &*want_f);
-        assert_eq!(&*got_b, &*want_b);
-        assert_eq!(got_msg, want_msg);
-    }
-
-    #[test]
-    fn lazy_ood_state_machine_matches_dense_across_ordinary_glue() {
-        use crate::challenger::Challenger;
-        let d = 13usize;
-        let n = 1usize << d;
-        let mut ch = crate::challenger::RandomChallenger::new(0x57A7_E00D);
-        let f: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
-        let b: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
-        let z = ch.sample_f128_vec(d);
-        let ordinary: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
-        let ordinary_claim = ch.sample_f128();
-        let beta = ch.sample_f128();
-        let alpha = ch.sample_f128();
-        let r = ch.sample_f128();
-        let target = ch.sample_f128();
-
-        let (mut dense, dense_start) = SumcheckProver::new(f.clone(), b.clone(), target);
-        let (mut lazy, lazy_start) = SumcheckProver::new(f.clone(), b.clone(), target);
-        let (mut deferred, deferred_start) = SumcheckProver::new(f, b, target);
-        assert_eq!(lazy_start, dense_start);
-        assert_eq!(deferred_start, dense_start);
-
-        let (dense_intro, dense_y) = dense.introduce_new_with_eval(build_eq_table(&z));
-        let (lazy_intro, lazy_y) = lazy.introduce_new_ood_factorized(&z).unwrap();
-        let (deferred_intro, deferred_y) = deferred.introduce_new_ood_factorized(&z).unwrap();
-        assert_eq!((lazy_intro, lazy_y), (dense_intro, dense_y));
-        assert_eq!((deferred_intro, deferred_y), (dense_intro, dense_y));
-        dense.glue(beta);
-        lazy.glue_factorized_ood(beta);
-        deferred.glue_factorized_ood(beta);
-
-        let dense_ordinary = dense.introduce_new(ordinary.clone(), ordinary_claim);
-        let lazy_ordinary = lazy.introduce_new(ordinary.clone(), ordinary_claim);
-        let deferred_ordinary = deferred.introduce_new(ordinary, ordinary_claim);
-        assert_eq!(lazy_ordinary, dense_ordinary);
-        assert_eq!(deferred_ordinary, dense_ordinary);
-        dense.glue(alpha);
-        lazy.glue(alpha);
-        deferred.glue_deferred_into_factorized_ood_fold(alpha);
-        assert!(deferred.pending_fold_basis.is_some());
-
-        let dense_msg = dense.fold(r);
-        assert_eq!(lazy.fold(r), dense_msg);
-        assert_eq!(deferred.fold(r), dense_msg);
-        assert!(deferred.pending_fold_basis.is_none());
-        assert_eq!(&*lazy.f, &*dense.f);
-        assert_eq!(&*lazy.combined_basis, &*dense.combined_basis);
-        assert_eq!(lazy.t_r, dense.t_r);
-        assert_eq!(lazy.transcript, dense.transcript);
-        assert_eq!(&*deferred.f, &*dense.f);
-        assert_eq!(&*deferred.combined_basis, &*dense.combined_basis);
-        assert_eq!(deferred.t_r, dense.t_r);
-        assert_eq!(deferred.transcript, dense.transcript);
-    }
-
-    #[test]
-    fn ranked_lazy_ood_selector_is_exact() {
-        let security = LigeritoSecurityConfig::from_toml_str(include_str!(
-            "../../configs/ligerito/m32_fast.toml"
-        ))
-        .unwrap();
-        let (config, _) = security.to_prover_verifier_configs().unwrap();
-        let selected = |log_n, n1, count, len, direct, platform, disabled| {
-            ranked_l1_lazy_ood_eq_selected(
-                &config, log_n, n1, count, len, direct, platform, disabled,
-            )
-        };
-        assert!(selected(25, 19, 1, 1 << 19, true, true, false));
-        assert!(!selected(24, 19, 1, 1 << 19, true, true, false));
-        assert!(!selected(25, 18, 1, 1 << 19, true, true, false));
-        assert!(!selected(25, 19, 2, 1 << 19, true, true, false));
-        assert!(!selected(25, 19, 1, 1 << 18, true, true, false));
-        assert!(!selected(25, 19, 1, 1 << 19, false, true, false));
-        assert!(!selected(25, 19, 1, 1 << 19, true, false, false));
-        assert!(!selected(25, 19, 1, 1 << 19, true, true, true));
-    }
-
-    #[test]
-    fn ranked_deferred_induced_glue_selector_is_exact() {
-        let security = LigeritoSecurityConfig::from_toml_str(include_str!(
-            "../../configs/ligerito/m32_fast.toml"
-        ))
-        .unwrap();
-        let (mut config, _) = security.to_prover_verifier_configs().unwrap();
-        config.merkle_hash = HashKind::Blake3;
-        let selected = |config: &ProverConfig,
-                        log_n,
-                        n_level,
-                        len,
-                        queries,
-                        rate,
-                        lazy,
-                        direct8,
-                        platform,
-                        disabled| {
-            ranked_deferred_induced_glue_selected(
-                config, log_n, n_level, len, queries, rate, lazy, direct8, platform, disabled,
-            )
-        };
-        for &(n_level, queries, rate) in &[
-            (19, 218, 1),
-            (16, 106, 2),
-            (13, 71, 3),
-            (10, 53, 4),
-            (7, 43, 5),
-        ] {
-            assert!(selected(
-                &config,
-                25,
-                n_level,
-                1 << n_level,
-                queries,
-                rate,
-                true,
-                true,
-                true,
-                false,
-            ));
-        }
-        assert!(!selected(
-            &config,
-            25,
-            4,
-            1 << 4,
-            36,
-            6,
-            true,
-            true,
-            true,
-            false,
-        ));
-        assert!(!selected(
-            &config,
-            25,
-            19,
-            1 << 19,
-            218,
-            1,
-            false,
-            true,
-            true,
-            false,
-        ));
-        assert!(!selected(
-            &config,
-            25,
-            19,
-            1 << 19,
-            218,
-            1,
-            true,
-            false,
-            true,
-            false,
-        ));
-        assert!(!selected(
-            &config,
-            25,
-            19,
-            1 << 19,
-            218,
-            1,
-            true,
-            true,
-            false,
-            false,
-        ));
-        assert!(!selected(
-            &config,
-            25,
-            19,
-            1 << 19,
-            218,
-            1,
-            true,
-            true,
-            true,
-            true,
-        ));
-        let mut wrong_ladder = config.clone();
-        wrong_ladder.queries[1] += 1;
-        assert!(!selected(
-            &wrong_ladder,
-            25,
-            19,
-            1 << 19,
-            218,
-            1,
-            true,
-            true,
-            true,
-            false,
-        ));
-    }
-
-    #[test]
-    fn deep_factorized_ood_intro_matches_dense() {
-        use crate::challenger::Challenger;
-        for &d in &[7usize, 10, 13, 16] {
-            let mut ch = crate::challenger::RandomChallenger::new(0xDEE9_00D0 ^ d as u64);
-            let z = ch.sample_f128_vec(d);
-            let f: Vec<F128> = (0..(1usize << d)).map(|_| ch.sample_f128()).collect();
-            let dense = build_eq_table(&z);
-            let want = round_msg_and_eval_lsb(&f, &dense);
-            let split = (d - 1).min(LAZY_OOD_EQ_SPLIT_LOW_LOG);
-            let mut eq_lo = build_eq_table(&z[1..1 + split]);
-            let eq_hi = build_eq_table(&z[1 + split..]);
-            let got = round_msg_and_eval_lsb_factorized_eq(&f, &eq_lo, &eq_hi, z[0]);
-            assert_eq!(got, want, "deep factorized OOD introduction d={d}");
-            eq_lo[1] += F128::ONE;
-            let bad = round_msg_and_eval_lsb_factorized_eq(&f, &eq_lo, &eq_hi, z[0]);
-            assert_ne!(bad, want, "corrupted low factor went undetected d={d}");
-        }
-    }
-
-    #[test]
-    fn deep_lazy_ood_corrected_fold_matches_dense_glue() {
-        use crate::challenger::Challenger;
-        for &d in &[7usize, 10, 13, 16] {
-            let n = 1usize << d;
-            let mut ch = crate::challenger::RandomChallenger::new(0xDEE9_F01D ^ d as u64);
-            let z = ch.sample_f128_vec(d);
-            let f: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
-            let b: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
-            let beta = ch.sample_f128();
-            let r = ch.sample_f128();
-
-            let dense_eq = build_eq_table(&z);
-            let mut dense_basis = b.clone();
-            crate::field::f128_slice::add_scaled(&mut dense_basis, &dense_eq, beta);
-            let (want_f, want_b, want_msg) = fold_and_msg_lsb(&f, &dense_basis, r, None);
-
-            let split = (d - 1).min(LAZY_OOD_EQ_SPLIT_LOW_LOG);
-            let eq_lo = build_eq_table(&z[1..1 + split]);
-            let mut eq_hi = build_eq_table(&z[1 + split..]);
-            let gamma = beta * (F128::ONE + z[0] + r);
-            let (got_f, got_b, got_msg) =
-                fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)), None);
-            assert_eq!(&*got_f, &*want_f, "folded witness d={d}");
-            assert_eq!(&*got_b, &*want_b, "corrected basis d={d}");
-            assert_eq!(got_msg, want_msg, "next-round message d={d}");
-
-            eq_hi[0] += F128::ONE;
-            let (_, bad_b, _) =
-                fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)), None);
-            assert_ne!(
-                &*bad_b, &*want_b,
-                "corrupted high factor went undetected d={d}"
-            );
-        }
-    }
-
-    #[test]
-    fn deep_lazy_ood_state_machine_matches_dense_across_ordinary_glue() {
-        use crate::challenger::Challenger;
-        for &d in &[10usize, 16] {
-            let n = 1usize << d;
-            let mut ch = crate::challenger::RandomChallenger::new(0xDEE9_57A7 ^ d as u64);
-            let f: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
-            let b: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
-            let z = ch.sample_f128_vec(d);
-            let ordinary: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
-            let ordinary_claim = ch.sample_f128();
-            let beta = ch.sample_f128();
-            let alpha = ch.sample_f128();
-            let r = ch.sample_f128();
-            let target = ch.sample_f128();
-
-            let (mut dense, dense_start) = SumcheckProver::new(f.clone(), b.clone(), target);
-            let (mut lazy, lazy_start) = SumcheckProver::new(f, b, target);
-            assert_eq!(lazy_start, dense_start);
-
-            let (dense_intro, dense_y) = dense.introduce_new_with_eval(build_eq_table(&z));
-            let (lazy_intro, lazy_y) = lazy.introduce_new_ood_factorized(&z).unwrap();
-            assert_eq!((lazy_intro, lazy_y), (dense_intro, dense_y));
-            dense.glue(beta);
-            lazy.glue_factorized_ood(beta);
-
-            let dense_ordinary = dense.introduce_new(ordinary.clone(), ordinary_claim);
-            let lazy_ordinary = lazy.introduce_new(ordinary, ordinary_claim);
-            assert_eq!(lazy_ordinary, dense_ordinary);
-            dense.glue(alpha);
-            lazy.glue(alpha);
-
-            assert_eq!(lazy.fold(r), dense.fold(r), "d={d}");
-            assert_eq!(&*lazy.f, &*dense.f, "d={d}");
-            assert_eq!(&*lazy.combined_basis, &*dense.combined_basis, "d={d}");
-            assert_eq!(lazy.t_r, dense.t_r, "d={d}");
-            assert_eq!(lazy.transcript, dense.transcript, "d={d}");
-        }
-    }
-
-    #[test]
-    fn ranked_deep_lazy_ood_selector_is_exact() {
-        let security = LigeritoSecurityConfig::from_toml_str(include_str!(
-            "../../configs/ligerito/m32_fast.toml"
-        ))
-        .unwrap();
-        let (config, _) = security.to_prover_verifier_configs().unwrap();
-        let selected = |log_n, nl, count, len, direct, platform, disabled| {
-            ranked_deep_lazy_ood_eq_selected(
-                &config, log_n, nl, count, len, direct, platform, disabled,
-            )
-        };
-        for &nl in &[16usize, 13, 10, 7] {
-            assert!(selected(25, nl, 1, 1 << nl, true, true, false));
-            assert!(!selected(24, nl, 1, 1 << nl, true, true, false));
-            assert!(!selected(25, nl, 2, 1 << nl, true, true, false));
-            assert!(!selected(25, nl, 1, 1 << (nl - 1), true, true, false));
-            assert!(!selected(25, nl, 1, 1 << nl, false, true, false));
-            assert!(!selected(25, nl, 1, 1 << nl, true, false, false));
-            assert!(!selected(25, nl, 1, 1 << nl, true, true, true));
-        }
-        assert!(!selected(25, 19, 1, 1 << 19, true, true, false));
-        assert!(!selected(25, 15, 1, 1 << 15, true, true, false));
-        assert!(!selected(25, 4, 1, 1 << 4, true, true, false));
-    }
-
-    #[test]
-    fn transpose_blocked_matches_per_layer() {
-        use crate::challenger::Challenger;
-        for &log_d in &[0usize, 1, 2, 5, 8, 12, 16, 18, 20] {
-            let ntt = AdditiveNttF128::standard(log_d.max(1));
-            for top in 0..=log_d {
-                let n = 1usize << log_d;
-                let mut ch =
-                    crate::challenger::RandomChallenger::new(0x7A5E ^ ((log_d * 37 + top) as u64));
-                let base: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
-                let mut a = base.clone();
-                let mut b = base;
-                transpose_forward_ntt_dense_layers_per_layer(&ntt, &mut a, top);
-                transpose_forward_ntt_dense_layers_blocked(&ntt, &mut b, top);
-                assert_eq!(a, b, "log_d={log_d}, top={top}");
-            }
-        }
-    }
-
+    /// As above, with num_interleaved > 1 and non-empty v_challenges (the
+    /// partial-eval challenges used to fold lanes).
     #[test]
     fn induce_sumcheck_poly_with_interleaving_and_v_challenges() {
         use crate::challenger::Challenger;
@@ -15789,12 +5826,16 @@ mod tests {
         let poly_len = msg_cols * num_interleaved;
 
         let mut ch = crate::challenger::RandomChallenger::new(0xDEAD_BEEF);
+        // poly[lane * msg_cols + col] convention (matches ligero_commit input).
         let poly: Vec<F128> = (0..poly_len).map(|_| ch.sample_f128()).collect();
 
+        // v_challenges fold the lanes after commit. Under the LSB-lane layout,
+        // f_folded is just partial_eval_lsb of the poly at v_challenges.
         let v_challenges: Vec<F128> = (0..log_interleaved).map(|_| ch.sample_f128()).collect();
         let f_folded = partial_eval_lsb(&poly, &v_challenges);
         assert_eq!(f_folded.len(), msg_cols);
 
+        // Encode via ligero_commit (so we use the same matrix layout).
         let ntt = AdditiveNttF128::standard(log_msg + log_inv_rate);
         let w = ligero_commit(
             &poly,
@@ -15827,6 +5868,7 @@ mod tests {
             &alpha,
         );
 
+        // The folded polynomial f_folded should satisfy Σ_j f_folded[j] · basis_poly[j] = enforced_sum.
         let inner: F128 = f_folded
             .iter()
             .zip(basis_poly.iter())
@@ -15838,6 +5880,8 @@ mod tests {
         );
     }
 
+    /// End-to-end roundtrip: prover proves `poly(z) = v`, verifier accepts.
+    /// R = 1 (one recursive step).
     #[test]
     fn ligerito_r1_roundtrip_accepts() {
         use crate::challenger::Challenger;
@@ -15851,6 +5895,7 @@ mod tests {
         let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
         let z: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
 
+        // True value v = poly(z)
         let eq = build_eq_table(&z);
         let v: F128 = poly
             .iter()
@@ -15891,14 +5936,20 @@ mod tests {
         };
         let _ = num_queries; // queries derived per-level from log_inv_rates now
 
+        // Prove
         let mut p_ch = crate::challenger::FsChallenger::new(b"test");
         let proof = recursive_prover(&prover_cfg, &poly, &z, v, &mut p_ch);
 
+        // Verify
         let mut v_ch = crate::challenger::FsChallenger::new(b"test");
         let ok = recursive_verifier(&verifier_cfg, &proof, &z, v, &mut v_ch);
         assert!(ok, "verifier rejected a valid proof");
     }
 
+    /// Run the size measurement at the configured (log_n, initial_k, ks, rates).
+    /// `log_inv_rates.len()` must equal `recursive_ks.len() + 1` (one per commit).
+    /// Also times the prover (best of 3 runs). Returns the measured proof size
+    /// in bytes.
     fn size_breakdown_at(
         log_n: usize,
         initial_k: usize,
@@ -15909,6 +5960,7 @@ mod tests {
         use std::time::Instant;
         assert_eq!(log_inv_rates.len(), recursive_ks.len() + 1);
 
+        // dims sanity: n1 = 16; after k_0=4 → 12; after k_1=3 → 9 → yr = 512 elems.
         let r = recursive_ks.len();
         let mut recursive_log_msg_cols = Vec::with_capacity(r);
         let mut n_running = log_n - initial_k;
@@ -15964,6 +6016,7 @@ mod tests {
             merkle_hash: Default::default(),
         };
 
+        // Time the prover, best of 3.
         let mut best = std::time::Duration::from_secs(3600);
         let mut proof = {
             let mut p_ch = crate::challenger::FsChallenger::new(b"size-test");
@@ -15984,16 +6037,20 @@ mod tests {
         );
         proof.print_size_breakdown();
 
+        // Smoke-check it verifies (so we know the proof is valid, not just plausibly-sized).
         let mut v_ch = crate::challenger::FsChallenger::new(b"size-test");
         assert!(recursive_verifier(&v_cfg, &proof, &z, v, &mut v_ch));
         proof.size_bytes()
     }
 
+    /// Uniform rate (basefold-style) baseline at m=20.
     #[test]
     fn ligerito_size_breakdown_m20_uniform_rate() {
         size_breakdown_at(20, 4, vec![4, 3], vec![1, 1, 1]);
     }
 
+    /// **The actual Ligerito design**: rate decreases at deeper levels, so
+    /// fewer queries are needed there.
     #[test]
     fn ligerito_size_breakdown_m20_decreasing_rate() {
         size_breakdown_at(20, 4, vec![4, 3], vec![1, 2, 4]);
@@ -16001,12 +6058,14 @@ mod tests {
 
     #[test]
     fn ligerito_size_breakdown_m20_decreasing_rate_thin() {
+        // More levels with thin lanes + aggressive rate decrease.
         size_breakdown_at(20, 4, vec![3, 3, 3], vec![1, 2, 3, 4]);
     }
 
     #[test]
     #[ignore]
     fn ligerito_size_breakdown_m24_aggressive() {
+        // Thin initial lanes + steep rate decrease.
         size_breakdown_at(24, 3, vec![3, 3, 3, 3, 3], vec![1, 2, 3, 4, 5, 6]);
     }
 
@@ -16028,6 +6087,8 @@ mod tests {
         size_breakdown_at(22, 4, vec![4, 4, 3], vec![1, 2, 3, 4]);
     }
 
+    /// Same total scale as m=22 but with initial_k=6 (64-lane initial leaves)
+    /// to make the L0 commit shape exactly match basefold's.
     #[test]
     #[ignore]
     fn ligerito_size_breakdown_m22_initial_k6() {
@@ -16040,6 +6101,11 @@ mod tests {
         size_breakdown_at(23, 4, vec![4, 4, 3, 3], vec![1, 2, 3, 4, 5]);
     }
 
+    /// Count the merkle multi-proof siblings that would be needed for `positions`
+    /// against a tree with `num_leaves` leaves. Same algorithm as
+    /// `merkle::merkle_multi_proof` but counts only — no tree allocation,
+    /// O(positions.len() · log num_leaves). For size estimation at scales where
+    /// the actual tree wouldn't fit in memory.
     fn multi_proof_num_siblings(positions: &[usize], num_leaves: usize) -> usize {
         let mut active: Vec<usize> = positions.to_vec();
         active.sort_unstable();
@@ -16066,6 +6132,10 @@ mod tests {
         sib_count
     }
 
+    /// Analytical size estimator — runs **only** the challenger-driven query
+    /// sampling + merkle-multi-proof counting. Does NOT materialize the
+    /// polynomial or any merkle tree, so it scales to m=29, m=30+.
+    /// Returns total bytes; prints a per-level breakdown.
     fn estimate_size_at(
         log_n: usize,
         initial_k: usize,
@@ -16085,6 +6155,7 @@ mod tests {
             }
         };
 
+        // Dim/lane/queries per commit (R+1 commits).
         let mut log_num_interleaved: Vec<usize> = vec![initial_k];
         log_num_interleaved.extend_from_slice(&recursive_ks);
         let mut log_msg_cols: Vec<usize> = Vec::with_capacity(r + 1);
@@ -16111,6 +6182,7 @@ mod tests {
             recursive_ks, log_inv_rates, queries_per_level
         );
 
+        // Drive a challenger-deterministic query sampling, count siblings.
         let mut ch = crate::challenger::FsChallenger::new(b"estimate");
         let mut total_opened = 0usize;
         let mut total_merkle = 0usize;
@@ -16147,6 +6219,7 @@ mod tests {
         }
         let yr_b = (1usize << yr_log_n) * ELEM;
         let roots_b = (r + 1) * 32;
+        // Transcript: 1 start + 1 intro per recursive boundary (R) + sum(k_i) folds, all (u_0, u_2).
         let sumcheck_msgs = 1 + r + recursive_ks.iter().sum::<usize>();
         let tx_b = sumcheck_msgs * 2 * ELEM;
         let total = total_opened + total_merkle + yr_b + roots_b + tx_b;
@@ -16162,29 +6235,40 @@ mod tests {
         total
     }
 
+    /// Verify the estimator matches the actual measurement at m=20.
     #[test]
     fn estimator_matches_actual_m20() {
         let estimated = estimate_size_at(20, 4, vec![4, 3], vec![1, 2, 4]);
+        // Measure the real proof at the same shape (cheap at m=20) instead of
+        // hardcoding a baseline that goes stale when query counts change.
         let actual = size_breakdown_at(20, 4, vec![4, 3], vec![1, 2, 4]);
         let diff = estimated.abs_diff(actual);
         eprintln!("estimator={estimated}  actual={actual}  diff={diff}");
+        // Drift is from different challenger seeds producing different query
+        // positions (and hence slightly different octopus sibling counts).
+        // 5% is plenty of room.
         assert!(
             diff < actual / 20,
             "estimator drift too large: {diff} bytes"
         );
     }
 
+    /// **The headline measurement**: Ligerito at m=29 with decreasing rate.
     #[test]
     fn estimate_ligerito_m29() {
         eprintln!("\n=== Ligerito m=29 — decreasing rate (the real Ligerito design) ===");
+        // Pick a reasonable config: thin lanes, aggressive rate decrease.
         estimate_size_at(29, 4, vec![4, 4, 4, 4, 3], vec![1, 2, 3, 4, 5, 6]);
 
         eprintln!(
             "\n=== Ligerito m=29 — uniform rate 1/2 (basefold-style baseline, infeasible at deepest level) ==="
         );
+        // Uniform rate with deep recursion: block_len at L5 = 2^6 = 64 < 221 queries.
+        // Show this is structurally bad without aggressive rate decrease.
         estimate_size_at(29, 4, vec![4, 4, 4, 4, 3], vec![1, 1, 1, 1, 1, 1]);
 
         eprintln!("\n=== Ligerito m=29 — uniform rate, shallower (R=2) ===");
+        // To make uniform rate feasible, use fewer levels with bigger ks.
         estimate_size_at(29, 4, vec![10, 10], vec![1, 1, 1]);
 
         eprintln!("\n=== Ligerito m=29 — thinner lanes ===");
@@ -16210,11 +6294,14 @@ mod tests {
         );
     }
 
+    /// Apples-to-apples vs basefold: same initial interleaving factor
+    /// `2^6 = 64` lanes at L0 (basefold's log_batch_size = 6).
     #[test]
     fn estimate_ligerito_m29_initial_k6() {
         eprintln!(
             "\n=== Ligerito m=29 — initial_k=6 (matches basefold's 64-lane initial leaves) ==="
         );
+        // initial_k = 6, then ks chosen to keep deeper levels thin.
         eprintln!("\n  Config A: thin recursive lanes, aggressive rate decrease");
         estimate_size_at(29, 6, vec![3, 3, 3, 3, 3, 2], vec![1, 2, 3, 4, 5, 6, 7]);
 
@@ -16240,6 +6327,7 @@ mod tests {
         estimate_size_at(30, 6, vec![4, 4, 4, 4, 3, 3], vec![1, 2, 3, 4, 5, 6, 7]);
     }
 
+    /// Multi-level (R = 2) roundtrip.
     #[test]
     fn ligerito_r2_roundtrip_accepts() {
         use crate::challenger::Challenger;
@@ -16260,6 +6348,10 @@ mod tests {
             .map(|(&a, &b)| a * b)
             .fold(F128::ZERO, |a, x| a + x);
 
+        // wtns_0: log_n - initial_k = 9, num_interleaved = 8
+        // wtns_1: dim n1 = 9, num_interleaved = 2^k_0 = 8, msg_cols = 2^(9-3) = 64
+        // After k_0 folds: dim 6. wtns_2: num_interleaved = 2^k_1 = 4, msg_cols = 2^(6-2) = 16
+        // After k_1 folds: dim 4. yr = 16 elems.
         let log_inv_rates = vec![log_inv_rate; 3];
         let _ = num_queries;
         let cfg = ProverConfig {
@@ -16301,6 +6393,7 @@ mod tests {
         assert!(ok, "R=2 verifier rejected valid proof");
     }
 
+    /// `LigeritoProof` bincode-roundtrips identically.
     #[test]
     fn ligerito_proof_bincode_roundtrip() {
         use crate::challenger::Challenger;
@@ -16342,6 +6435,10 @@ mod tests {
         eprintln!("LigeritoProof bincode size: {} bytes", bytes.len());
     }
 
+    /// `recursive_prover_with_basis` + `recursive_verifier_with_basis`
+    /// roundtrip — this is the basefold-compatible signature that
+    /// `pcs::open_batch` will call. Single-claim case (`b = eq(z, ·)`,
+    /// `target = poly(z)`) — must round-trip cleanly.
     #[test]
     fn recursive_prover_with_basis_roundtrip_single_claim() {
         use crate::challenger::Challenger;
@@ -16419,350 +6516,8 @@ mod tests {
         assert!(ok, "basis-based verifier rejected valid proof");
     }
 
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))]
-    #[test]
-    fn direct_fold8_four_map_gfni_matches_fold_one_slot_sum() {
-        use crate::zerocheck::multilinear::kernels::x86_64::{
-            build_row_fold_mats, gfni_fold64_four_maps_staged,
-        };
-        let mut state = 0xB6F1_6408_5EED_191Du64;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        let tables: Vec<Vec<F128>> = (0..4)
-            .map(|_| {
-                let generators: Vec<F128> = (0..128)
-                    .map(|_| F128 {
-                        lo: next(),
-                        hi: next(),
-                    })
-                    .collect();
-                super::super::ring_switch::build_fold_byte_table(&generators)
-            })
-            .collect();
-        let values: Vec<Vec<u64>> = (0..4).map(|_| (0..64).map(|_| next()).collect()).collect();
-        let mats: Vec<[u64; 128]> = tables
-            .iter()
-            .map(|table| build_row_fold_mats(&table[..8 * 256]))
-            .collect();
-        let mut got = vec![F128::ZERO; 64];
-        let mut planes = vec![F128::ZERO; 64];
-        unsafe {
-            gfni_fold64_four_maps_staged(
-                values[0].as_ptr().cast::<u8>(),
-                &mats[0],
-                values[1].as_ptr().cast::<u8>(),
-                &mats[1],
-                values[2].as_ptr().cast::<u8>(),
-                &mats[2],
-                values[3].as_ptr().cast::<u8>(),
-                &mats[3],
-                got.as_mut_ptr(),
-                planes.as_mut_ptr().cast(),
-            );
-        }
-        for i in 0..64 {
-            let expect = (0..4).fold(F128::ZERO, |acc, map| {
-                acc + super::super::ring_switch::fold_one_slot(
-                    F128::new(values[map][i], 0),
-                    &tables[map],
-                )
-            });
-            assert_eq!(got[i], expect);
-        }
-    }
-
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))]
-    #[test]
-    fn direct_fold4_two_claim_gfni_matches_composed_table_oracle() {
-        use crate::zerocheck::multilinear::kernels::x86_64::{
-            build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
-        };
-        use core::arch::x86_64::_mm512_setzero_si512;
-
-        let mut state = 0xD1CE_F004_5EED_191Du64;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        let direct_tables: Vec<Vec<F128>> = (0..2)
-            .map(|_| {
-                let generators: Vec<F128> = (0..128).map(|_| F128::new(next(), next())).collect();
-                super::super::ring_switch::build_fold_byte_table(&generators)
-            })
-            .collect();
-        let eq_hi = [F128::new(next(), next()), F128::new(next(), next())];
-        let rows: Vec<(Vec<u64>, Vec<u64>)> = (0..2)
-            .map(|_| {
-                (
-                    (0..64).map(|_| next()).collect(),
-                    (0..64).map(|_| next()).collect(),
-                )
-            })
-            .collect();
-        let cols0 = super::super::ring_switch::compose_block_cols(&direct_tables[0], eq_hi[0]);
-        let cols1 = super::super::ring_switch::compose_block_cols(&direct_tables[1], eq_hi[1]);
-        let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
-        let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
-        let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
-        let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
-        let mut got = vec![F128::ZERO; 64];
-        let mut planes = unsafe { [_mm512_setzero_si512(); 16] };
-        unsafe {
-            gfni_fold64_four_maps_staged(
-                rows[0].0.as_ptr().cast::<u8>(),
-                &mats0_lo,
-                rows[0].1.as_ptr().cast::<u8>(),
-                &mats0_hi,
-                rows[1].0.as_ptr().cast::<u8>(),
-                &mats1_lo,
-                rows[1].1.as_ptr().cast::<u8>(),
-                &mats1_hi,
-                got.as_mut_ptr(),
-                planes.as_mut_ptr(),
-            );
-        }
-        let mut composed0 = vec![F128::ZERO; super::super::ring_switch::FOLD_TABLE_TOTAL];
-        let mut composed1 = vec![F128::ZERO; super::super::ring_switch::FOLD_TABLE_TOTAL];
-        super::super::ring_switch::compose_block_table(&direct_tables[0], eq_hi[0], &mut composed0);
-        super::super::ring_switch::compose_block_table(&direct_tables[1], eq_hi[1], &mut composed1);
-        for slot in 0..64 {
-            let expect = super::super::ring_switch::fold_one_slot(
-                F128::new(rows[0].0[slot], rows[0].1[slot]),
-                &composed0,
-            ) + super::super::ring_switch::fold_one_slot(
-                F128::new(rows[1].0[slot], rows[1].1[slot]),
-                &composed1,
-            );
-            assert_eq!(got[slot], expect, "slot {slot}");
-        }
-    }
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))]
-    #[test]
-    fn direct_fold8_composed_mats_match_column_builder() {
-        use crate::zerocheck::multilinear::kernels::x86_64::build_row_fold_mats_from_cols;
-
-        let mut state = 0xD1CE_F008_5EED_191Du64;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        for _ in 0..3 {
-            let generators: Vec<F128> = (0..128)
-                .map(|_| F128::new(next(), next()))
-                .collect();
-            let table = super::super::ring_switch::build_fold_byte_table(&generators);
-            let e_hi = F128::new(next(), next());
-            let map =
-                super::super::ring_switch::build_gfni_direct_fold_map_from_generators(&generators);
-            let (got_lo, got_hi) =
-                super::super::ring_switch::compose_block_mats_gfni(&map, e_hi);
-            let cols = super::super::ring_switch::compose_block_cols(&table, e_hi);
-            assert_eq!(
-                got_lo,
-                build_row_fold_mats_from_cols(&cols[..64]),
-                "low matrix mismatch"
-            );
-            assert_eq!(
-                got_hi,
-                build_row_fold_mats_from_cols(&cols[64..]),
-                "high matrix mismatch"
-            );
-        }
-    }
-
-
-    #[test]
-    fn direct_fold4_gfni_gate_is_ranked_shape_only() {
-        assert!(direct_fold4_b_gfni_shape(2, false, 64));
-        assert!(direct_fold4_b_gfni_shape(2, false, 8192));
-        assert!(!direct_fold4_b_gfni_shape(1, false, 64));
-        assert!(!direct_fold4_b_gfni_shape(3, false, 64));
-        assert!(!direct_fold4_b_gfni_shape(2, true, 64));
-        assert!(!direct_fold4_b_gfni_shape(2, false, 60));
-    }
-
-    #[test]
-    fn direct_fold8_sparse_k4_cross_level_proof_bytes_match_ordinary() {
-        use crate::challenger::Challenger;
-
-        let log_n = 12;
-        let initial_k = 6;
-        let recursive_ks = vec![3usize, 2];
-        let log_inv_rate = 1;
-        let mut rng = crate::challenger::RandomChallenger::new(0xD1CE_F008);
-        let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
-        let suffix: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
-        let scaled_rdp: Vec<F128> = build_eq_table(
-            &(0..crate::pcs::LOG_PACKING)
-                .map(|_| rng.sample_f128())
-                .collect::<Vec<_>>(),
-        );
-        let combined_basis =
-            super::super::ring_switch::fold_b128_elems(&build_eq_table(&suffix), &scaled_rdp);
-        let target = poly
-            .iter()
-            .zip(combined_basis.iter())
-            .map(|(&f, &b)| f * b)
-            .fold(F128::ZERO, |acc, value| acc + value);
-
-        let n_packed = 1usize << crate::pcs::LOG_PACKING;
-        let tail_eq = build_eq_table(&suffix[6..]);
-        let table = super::super::ring_switch::build_fold_byte_table(&scaled_rdp);
-        let low_eq = build_eq_table(&suffix[..6]);
-        let mut a_state = vec![F128::ZERO; 64 * n_packed];
-        for e in 0..64 {
-            let strided: Vec<F128> = (0..poly.len() / 64)
-                .map(|rest| poly[64 * rest + e])
-                .collect();
-            let bank = super::super::ring_switch::fold_1b_rows_naive(&strided, &tail_eq);
-            let transposed = super::super::ring_switch::tensor_algebra_transpose(&bank);
-            for (bit, value) in transposed.into_iter().enumerate() {
-                a_state[bit * 64 + e] = value;
-            }
-        }
-        let mut w_state = vec![F128::ZERO; 64 * n_packed];
-        for d_low in 0..64 {
-            let mut basis_product = low_eq[d_low];
-            w_state[d_low] = super::super::ring_switch::fold_one_slot(basis_product, &table);
-            for bit in 1..n_packed {
-                basis_product = crate::field::mul_by_x(basis_product);
-                w_state[bit * 64 + d_low] =
-                    super::super::ring_switch::fold_one_slot(basis_product, &table);
-            }
-        }
-        let mut round0 = (F128::ZERO, F128::ZERO);
-        for i in (0..a_state.len()).step_by(2) {
-            let a0 = a_state[i];
-            let a1 = a_state[i + 1];
-            let b0 = w_state[i];
-            let b1 = w_state[i + 1];
-            round0.0 += a0 * b0;
-            round0.1 += (a0 + a1) * (b0 + b1);
-        }
-        let (eq_lo, eq_hi) =
-            super::super::ring_switch::build_eq_split(&suffix[6..], (log_n - 6) / 2);
-        let direct = vec![super::super::ring_switch::DirectFold8Factors {
-            eq_lo,
-            eq_hi,
-            a_state,
-            w_state,
-            round0,
-        }];
-
-        let log_inv_rates = vec![1usize, 2, 3];
-        let cfg = ProverConfig {
-            log_inv_rates: log_inv_rates.clone(),
-            recursive_steps: 2,
-            initial_log_msg_cols: log_n - initial_k,
-            initial_log_num_interleaved: initial_k,
-            initial_k,
-            recursive_log_msg_cols: vec![3, 1],
-            recursive_ks: recursive_ks.clone(),
-            queries: vec![8; 3],
-            grinding_bits: vec![0; log_inv_rates.len()],
-            fold_grinding_bits: vec![0; 3],
-            ood_samples: vec![0, 1, 1],
-            merkle_hash: Default::default(),
-        };
-        let ntt_0 = AdditiveNttF128::standard(log_n - initial_k + log_inv_rate);
-        let wtns_0 = ligero_commit(
-            &poly,
-            log_n - initial_k,
-            initial_k,
-            log_inv_rate,
-            &ntt_0,
-            HashKind::Sha256,
-        );
-
-        let mut ordinary_challenger =
-            crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
-        SPARSE_DUAL_TEST_DEPTH.with(|value| value.set(0));
-        let ordinary = recursive_prover_with_basis_precomputed_round0(
-            &cfg,
-            poly.clone(),
-            combined_basis.clone(),
-            target,
-            &wtns_0.mat,
-            &wtns_0.tree,
-            round0,
-            None,
-            &mut ordinary_challenger,
-        );
-        let mut direct_challenger =
-            crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
-        SPARSE_DUAL_TEST_DEPTH.with(|value| value.set(4));
-        let got = recursive_prover_with_basis_direct_fold8(
-            &cfg,
-            poly,
-            Vec::new(),
-            direct,
-            target,
-            &wtns_0.mat,
-            &wtns_0.tree,
-            round0,
-            None,
-            &mut direct_challenger,
-        );
-        SPARSE_DUAL_TEST_DEPTH.with(|value| value.set(0));
-
-        assert_eq!(got, ordinary);
-        assert_eq!(
-            bincode::serialize(&(got.clone(), target)).expect("serialize direct-fold8 proof/claim"),
-            bincode::serialize(&(ordinary, target)).expect("serialize ordinary proof/claim"),
-        );
-
-        let v_cfg = VerifierConfig {
-            log_inv_rates: log_inv_rates.clone(),
-            recursive_steps: 2,
-            initial_log_msg_cols: log_n - initial_k,
-            initial_log_num_interleaved: initial_k,
-            initial_k,
-            recursive_log_msg_cols: vec![3, 1],
-            recursive_ks,
-            queries: vec![8; 3],
-            grinding_bits: vec![0; log_inv_rates.len()],
-            fold_grinding_bits: vec![0; 3],
-            ood_samples: vec![0, 1, 1],
-            merkle_hash: Default::default(),
-        };
-        let mut verifier_challenger =
-            crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
-        assert!(recursive_verifier_with_basis(
-            &v_cfg,
-            &got,
-            &combined_basis,
-            target,
-            &wtns_0.root(),
-            &mut verifier_challenger,
-        ));
-    }
-
+    /// `induce_sumcheck_evaluate_at_residual` matches dense
+    /// `induce_sumcheck_poly` + `partial_eval_lsb`.
     #[test]
     fn induce_sumcheck_evaluate_at_residual_matches_dense() {
         use crate::challenger::Challenger;
@@ -16787,6 +6542,7 @@ mod tests {
         let ris_for_basis: Vec<F128> = (0..prefix_len).map(|_| rng.sample_f128()).collect();
         let sks_vks = eval_sk_at_vks(log_msg_cols);
 
+        // Dense path
         let (basis_dense, dense_enforced_sum) = induce_sumcheck_poly(
             log_msg_cols,
             &sks_vks,
@@ -16797,6 +6553,7 @@ mod tests {
         );
         let dense_residual = partial_eval_lsb(&basis_dense, &ris_for_basis);
 
+        // Succinct path
         let succinct_enforced_sum =
             induce_sumcheck_enforced_sum(&opened_rows, &v_challenges, &queries, &alpha);
         let succinct_residual = induce_sumcheck_evaluate_at_residual(
@@ -16826,6 +6583,20 @@ mod tests {
         }
     }
 
+    /// Regression for the final-level proximity binding (the Ligerito
+    /// soundness fix). Every non-final recursion level folds its opened rows
+    /// into the running sumcheck via `induce_sumcheck`; the final level used to
+    /// only Merkle-check its opened rows, leaving `yr` (the claimed final
+    /// message) constrained by a single scalar equation — so a malicious prover
+    /// could solve for a `yr` that opens the commitment to an arbitrary value.
+    ///
+    /// The fixed verifier ties `yr` to the committed codeword by checking
+    /// `enforced_sum_last == ⟨yr, induced_basis_last⟩`, exactly as every other
+    /// level does. This test pins that identity against a *real* `ligero_commit`
+    /// codeword: the honest `yr` (the committed message) satisfies it, and any
+    /// perturbed `yr` violates it. If `ligero_commit`'s additive-NTT encoding
+    /// and the verifier's LCH novel-basis (`induce_sumcheck_evaluate_at_residual`)
+    /// ever diverged, the honest assertion here would fail.
     #[test]
     fn final_level_binding_pins_yr_to_committed_codeword() {
         use crate::challenger::Challenger;
@@ -16836,10 +6607,12 @@ mod tests {
         let block_len = msg_cols << log_inv_rate;
 
         let mut rng = crate::challenger::RandomChallenger::new(0xB19D_1235);
+        // num_interleaved = 1 ⇒ no lane fold (level_rs empty) ⇒ yr == the message.
         let yr: Vec<F128> = (0..msg_cols).map(|_| rng.sample_f128()).collect();
         let ntt = AdditiveNttF128::standard(log_msg_cols + log_inv_rate);
         let wtns = ligero_commit(&yr, log_msg_cols, 0, log_inv_rate, &ntt, HashKind::Sha256);
 
+        // Distinct query positions (the protocol always samples distinct ones).
         let mut queries: Vec<usize> = Vec::new();
         let mut q = 1usize;
         while queries.len() < num_queries {
@@ -16855,6 +6628,7 @@ mod tests {
             .map(|_| rng.sample_f128())
             .collect();
 
+        // The two quantities the fixed verifier batches into the final check.
         let enforced_sum = induce_sumcheck_enforced_sum(&opened_rows, &level_rs, &queries, &alpha);
         let sks_vks = eval_sk_at_vks(log_msg_cols);
         let induced_basis = induce_sumcheck_evaluate_at_residual(
@@ -16872,12 +6646,15 @@ mod tests {
                 .fold(F128::ZERO, |s, x| s + x)
         };
 
+        // Honest yr (the committed message) satisfies the proximity tie.
         assert_eq!(
             inner(&yr),
             enforced_sum,
             "honest yr must satisfy ⟨yr, induced_basis⟩ == enforced_sum"
         );
 
+        // A forged yr violates it: perturb a coordinate with nonzero basis weight,
+        // so the change to the inner product is provably nonzero.
         let jnz = induced_basis
             .iter()
             .position(|b| !b.is_zero())
@@ -16891,6 +6668,9 @@ mod tests {
         );
     }
 
+    /// Succinct verifier accepts the same proof as the dense verifier when
+    /// given an `eval_b` closure that returns the same values as the dense
+    /// `b_initial[idx]` at multilinear `point = bit-decomp(idx)`.
     #[test]
     fn recursive_verifier_with_basis_succinct_matches_dense() {
         use crate::challenger::Challenger;
@@ -16963,11 +6743,13 @@ mod tests {
             merkle_hash: Default::default(),
         };
 
+        // Dense verifier
         let mut v_ch = crate::challenger::FsChallenger::new(b"succ-cmp");
         let dense_ok =
             recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_root, &mut v_ch);
         assert!(dense_ok, "dense verifier must accept");
 
+        // Succinct verifier — batch eval_b is just eq(z, ris ++ y_bits) by construction
         let mut v_ch2 = crate::challenger::FsChallenger::new(b"succ-cmp");
         let eval_b_residual = |ris: &[F128], yr_log_n: usize| -> Vec<F128> {
             let yr_len = 1usize << yr_log_n;
@@ -16998,6 +6780,10 @@ mod tests {
         assert!(succ_ok, "succinct verifier must accept");
     }
 
+    /// Build a matching (ProverConfig, VerifierConfig) pair with explicit
+    /// OOD samples and fold-challenge grinding, for the OOD-path tests below.
+    /// Shape: L0 (initial_k) → r recursive levels of `k`; small query counts
+    /// and grind bits keep the test fast while still exercising every path.
     fn ood_test_configs(
         log_n: usize,
         initial_k: usize,
@@ -17046,12 +6832,18 @@ mod tests {
         (p, v)
     }
 
+    /// End-to-end OOD binding + fold-challenge grinding: a JohnsonOod-shaped
+    /// config (explicit OOD samples at L1/L2, a few fold-grind bits at every
+    /// level) round-trips through BOTH the dense and succinct verifiers, and
+    /// tampering with either an OOD value or a fold-grinding nonce makes both
+    /// reject. Exercises every new prover/verifier code path.
     #[test]
     fn ligerito_ood_and_fold_grinding_roundtrip_and_tamper() {
         use crate::challenger::Challenger;
         let log_n = 12;
         let initial_k = 2;
         let ks = [2usize, 2];
+        // OOD at L1 and L2 (L0 must be 0); 3 fold-grind bits at each level.
         let (p_cfg, v_cfg) = ood_test_configs(log_n, initial_k, &ks, vec![0, 2, 2], vec![3, 3, 3]);
 
         let mut rng = crate::challenger::RandomChallenger::new(0x00D_7E57);
@@ -17087,7 +6879,9 @@ mod tests {
             &mut p_ch,
         );
 
+        // Sanity: the new proof fields are populated.
         assert_eq!(proof.ood_values.len(), 4, "2 OOD samples each at L1 and L2");
+        // 2 lane folds (L0) + 2 + 2 recursive folds, each with 3 grind bits.
         assert_eq!(proof.fold_grinding_nonces.len(), initial_k + ks[0] + ks[1]);
 
         let dense = |proof: &LigeritoProof| {
@@ -17130,6 +6924,7 @@ mod tests {
         assert!(dense(&proof), "dense verifier must accept OOD proof");
         assert!(succinct(&proof), "succinct verifier must accept OOD proof");
 
+        // Tamper an OOD value → both verifiers reject.
         let mut bad_ood = proof.clone();
         bad_ood.ood_values[0] += F128::ONE;
         assert!(!dense(&bad_ood), "dense must reject tampered OOD value");
@@ -17138,6 +6933,8 @@ mod tests {
             "succinct must reject tampered OOD value"
         );
 
+        // Tamper a fold-grinding nonce → both verifiers reject (PoW fails or
+        // the FS state diverges).
         let mut bad_nonce = proof.clone();
         bad_nonce.fold_grinding_nonces[0] ^= 0xDEAD_BEEF;
         assert!(!dense(&bad_nonce), "dense must reject tampered fold nonce");
@@ -17147,6 +6944,10 @@ mod tests {
         );
     }
 
+    /// A real embedded profile config (m=22 fast = JohnsonOod) drives a full
+    /// prover→verifier round-trip through the basis opening path. This is the
+    /// production shape: OOD samples and fold grinding come straight from the
+    /// derived TOML, not a hand-built config.
     #[test]
     fn ligerito_fast_profile_m22_roundtrip() {
         use crate::challenger::Challenger;
@@ -17157,6 +6958,7 @@ mod tests {
             .expect("m22 fast prover config");
         let v_cfg = verifier_config_for(log_n, initial_k, LigeritoProfile::Fast)
             .expect("m22 fast verifier config");
+        // The fast profile must actually use the new features.
         assert!(p_cfg.ood_samples.iter().skip(1).any(|&s| s > 0));
         assert!(p_cfg.fold_grinding_bits.iter().any(|&g| g > 0));
 
@@ -17200,66 +7002,10 @@ mod tests {
         );
     }
 
-    #[test]
-    #[ignore]
-    fn open_sumcheck_kernel_e2e_transcript_digest() {
-        use crate::challenger::Challenger;
-        use std::hash::{Hash as _, Hasher as _};
-        let m = 29usize;
-        let log_n = m - crate::pcs::LOG_PACKING;
-        let initial_k = 6;
-        let mut p_cfg = prover_config_for(log_n, initial_k, LigeritoProfile::Fast)
-            .expect("m29 fast prover config");
-        let mut v_cfg = verifier_config_for(log_n, initial_k, LigeritoProfile::Fast)
-            .expect("m29 fast verifier config");
-        p_cfg.merkle_hash = HashKind::Blake3;
-        v_cfg.merkle_hash = HashKind::Blake3;
-
-        let mut rng = crate::challenger::RandomChallenger::new(0x50A0_0AC1E_u64);
-        let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
-        let z: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
-        let b = build_eq_table(&z);
-        let target: F128 = poly
-            .iter()
-            .zip(b.iter())
-            .map(|(&a, &c)| a * c)
-            .fold(F128::ZERO, |a, x| a + x);
-
-        let log_inv_rate_0 = p_cfg.log_inv_rates[0];
-        let log_msg_cols_0 = log_n - initial_k;
-        let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + log_inv_rate_0);
-        let wtns_0 = ligero_commit(
-            &poly,
-            log_msg_cols_0,
-            initial_k,
-            log_inv_rate_0,
-            &ntt_0,
-            HashKind::Blake3,
-        );
-        let initial_root = wtns_0.root();
-
-        let mut p_ch = crate::challenger::FsChallenger::with_hash(b"soa-oracle", HashKind::Blake3);
-        let proof = recursive_prover_with_basis(
-            &p_cfg,
-            poly,
-            b.clone(),
-            target,
-            &wtns_0.mat,
-            &wtns_0.tree,
-            &mut p_ch,
-        );
-
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        format!("{proof:?}").hash(&mut h);
-        eprintln!("PROOF_DIGEST {:016x}", h.finish());
-
-        let mut v_ch = crate::challenger::FsChallenger::with_hash(b"soa-oracle", HashKind::Blake3);
-        assert!(
-            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_root, &mut v_ch),
-            "m29 blake3 proof must verify"
-        );
-    }
-
+    /// End-to-end under BLAKE3: the same recursion, every Merkle commitment
+    /// (L0 and each recursive level) built and checked with the other hash.
+    /// Also pins the failure mode of a hash mismatch — a verifier configured
+    /// for the wrong hash must reject, since the roots commit to the hash.
     #[test]
     fn ligerito_m22_roundtrip_under_blake3() {
         use crate::challenger::Challenger;
@@ -17270,6 +7016,8 @@ mod tests {
             .expect("m22 fast prover config");
         let mut v_cfg = verifier_config_for(log_n, initial_k, LigeritoProfile::Fast)
             .expect("m22 fast verifier config");
+        // The embedded configs all declare sha256; override to exercise the
+        // other arm of the option end to end.
         assert_eq!(p_cfg.merkle_hash, HashKind::Sha256);
         p_cfg.merkle_hash = HashKind::Blake3;
         v_cfg.merkle_hash = HashKind::Blake3;
@@ -17313,6 +7061,8 @@ mod tests {
             "blake3 Merkle proof must verify"
         );
 
+        // Same proof, verifier configured for SHA-256 → every opening's
+        // recomputed root disagrees, so it must reject.
         let mut wrong_cfg = v_cfg.clone();
         wrong_cfg.merkle_hash = HashKind::Sha256;
         let mut w_ch = crate::challenger::FsChallenger::new(b"m22-blake3");
@@ -17329,6 +7079,10 @@ mod tests {
         );
     }
 
+    /// The Merkle hash and the Fiat-Shamir transcript hash are independent
+    /// options: all four combinations must prove and verify. Also pins the
+    /// failure mode of a transcript-hash mismatch, the FS analogue of the
+    /// Merkle mismatch checked above.
     #[test]
     fn ligerito_m22_roundtrip_over_hash_matrix() {
         use crate::challenger::Challenger;
@@ -17384,6 +7138,8 @@ mod tests {
                     "merkle={merkle_hash} fs={fs_hash} must verify"
                 );
 
+                // Verifier on the other transcript hash: challenges diverge
+                // from the first sample, so it must reject.
                 let other_fs = match fs_hash {
                     HashKind::Sha256 => HashKind::Blake3,
                     HashKind::Blake3 => HashKind::Sha256,
@@ -17404,6 +7160,9 @@ mod tests {
         }
     }
 
+    /// Multi-claim batched basis: `b = γ_1·eq(z_1, ·) + γ_2·eq(z_2, ·)`,
+    /// `target = γ_1·poly(z_1) + γ_2·poly(z_2)`. This is the shape ring_switch
+    /// produces.
     #[test]
     fn recursive_prover_with_basis_roundtrip_batched_claims() {
         use crate::challenger::Challenger;
@@ -17496,6 +7255,9 @@ mod tests {
         assert!(ok, "batched-basis verifier rejected valid proof");
     }
 
+    /// `recursive_prover_with_l0` (external L0 path, for integration with
+    /// Flock's `pcs::commit`) produces a byte-identical proof to
+    /// `recursive_prover` when given a matching pre-built L0.
     #[test]
     fn recursive_prover_with_l0_matches_full() {
         use crate::challenger::Challenger;
@@ -17530,9 +7292,11 @@ mod tests {
             merkle_hash: Default::default(),
         };
 
+        // Path 1: built-in L0 commit.
         let mut p_ch = crate::challenger::FsChallenger::new(b"l0-test");
         let proof_a = recursive_prover(&cfg, &poly, &z, v, &mut p_ch);
 
+        // Path 2: build L0 externally via ligero_commit, then call _with_l0.
         let log_msg_cols_0 = log_n - initial_k;
         let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + log_inv_rate);
         let mut wtns_0_external = ligero_commit(
@@ -17554,6 +7318,7 @@ mod tests {
             &mut p_ch_b,
         );
 
+        // Proofs must be byte-identical (same FS state, same prover work).
         assert_eq!(proof_a.initial_root, proof_b.initial_root);
         assert_eq!(proof_a.recursive_roots, proof_b.recursive_roots);
         assert_eq!(proof_a.final_proof.yr, proof_b.final_proof.yr);
@@ -17569,6 +7334,7 @@ mod tests {
             assert_eq!(ma.u_0, mb.u_0);
             assert_eq!(ma.u_2, mb.u_2);
         }
+        // And both must verify against the same VerifierConfig.
         let v_cfg = VerifierConfig {
             log_inv_rates: log_inv_rates.clone(),
             recursive_steps: 1,
@@ -17587,6 +7353,7 @@ mod tests {
         assert!(recursive_verifier(&v_cfg, &proof_b, &z, v, &mut v_ch));
     }
 
+    /// Mutation rejection: change one element of yr → verify should fail.
     #[test]
     fn ligerito_r1_rejects_mutated_yr() {
         use crate::challenger::Challenger;
@@ -17640,6 +7407,7 @@ mod tests {
         let mut p_ch = crate::challenger::FsChallenger::new(b"test-mut");
         let mut proof = recursive_prover(&prover_cfg, &poly, &z, v, &mut p_ch);
 
+        // Mutate yr.
         proof.final_proof.yr[0] += F128::ONE;
 
         let mut v_ch = crate::challenger::FsChallenger::new(b"test-mut");
@@ -17656,6 +7424,7 @@ mod tests {
         let num_interleaved = 1 << log_interleaved;
         let block_len = msg_cols << log_inv_rate;
 
+        // Deterministic dummy polynomial.
         let poly: Vec<F128> = (0..num_interleaved * msg_cols)
             .map(|i| {
                 F128::new(
@@ -17678,6 +7447,8 @@ mod tests {
         assert_eq!(w.num_interleaved, num_interleaved);
         assert_eq!(w.mat.len(), block_len * num_interleaved);
 
+        // Per-lane inv-NTT should recover the padded message. Under the LSB-lane
+        // layout, lane `lane`'s col `col` message lives at `poly[col * num_interleaved + lane]`.
         for lane in 0..num_interleaved {
             let mut col: Vec<F128> = (0..block_len)
                 .map(|pos| w.mat[pos * num_interleaved + lane])
@@ -17699,6 +7470,8 @@ mod tests {
             }
         }
 
+        // Merkle root is deterministic: re-running the same commit yields the
+        // same root.
         let w2 = ligero_commit(
             &poly,
             log_msg,
@@ -17709,67 +7482,4 @@ mod tests {
         );
         assert_eq!(w.root(), w2.root());
     }
-
-    #[test]
-    fn gpu_open_merkle_tree_matches_cpu() {
-        if !crate::gpu::merkle::available() {
-            eprintln!("SKIP gpu_open_merkle_tree_matches_cpu: Metal unavailable");
-            return;
-        }
-        for log_leaves in [16usize, 18] {
-            let n_leaves = 1usize << log_leaves;
-            let leaf_size = 128usize;
-            let data: Vec<F128> = (0..n_leaves * leaf_size / 16)
-                .map(|i| F128::new(i as u64, (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)))
-                .collect();
-            let bytes: &[u8] =
-                unsafe { core::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 16) };
-            let mut busy_ms = 0.0f64;
-            let gpu_tree = gpu_merkle_tree_for_open(bytes, n_leaves, leaf_size, &mut busy_ms)
-                .expect("GPU open-merkle session must complete when Metal is available");
-            let cpu_tree = merkle::merkle_tree(bytes, n_leaves, HashKind::Blake3);
-            assert_eq!(
-                gpu_tree, cpu_tree,
-                "GPU open-merkle tree != CPU at 2^{log_leaves} leaves"
-            );
-        }
-    }
-    #[test]
-    fn transpose_pass_b_zero_leaf_matches_general() {
-        use crate::challenger::Challenger;
-        assert!(tnt_pass_b_zero_selected(false));
-        assert!(!tnt_pass_b_zero_selected(true));
-        let ntt = AdditiveNttF128::standard(12);
-        let mut ch = crate::challenger::RandomChallenger::new(0xB10C_0000_7E80);
-        for &(stride, layer) in &[(1usize, 3usize), (2, 2), (4, 1), (8, 0)] {
-            assert_eq!(ntt.twiddle(layer, 0), F128::ZERO);
-            for &tile in &[1usize, 3, 4, 7, 16, 65] {
-                let base: Vec<Vec<F128>> = (0..2 * stride)
-                    .map(|_| (0..tile).map(|_| ch.sample_f128()).collect())
-                    .collect();
-                let mut got = base.clone();
-                let mut want = base.clone();
-                {
-                    let mut cols: Vec<&mut [F128]> =
-                        got.iter_mut().map(Vec::as_mut_slice).collect();
-                    transpose_pass_b_block_zero_xor(&mut cols, stride, layer, &ntt);
-                }
-                {
-                    let mut cols: Vec<&mut [F128]> =
-                        want.iter_mut().map(Vec::as_mut_slice).collect();
-                    transpose_pass_b_block_zero_general(&mut cols, stride, layer, &ntt);
-                }
-                assert_eq!(got, want, "stride={stride} tile={tile}");
-                for u in 0..stride {
-                    for i in 0..tile {
-                        assert_eq!(got[u][i], base[u][i] + base[u + stride][i]);
-                        assert_eq!(got[u + stride][i], base[u + stride][i]);
-                    }
-                }
-            }
-        }
-    }
 }
-
-
-

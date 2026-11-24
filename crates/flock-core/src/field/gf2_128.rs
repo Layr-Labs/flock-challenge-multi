@@ -54,49 +54,18 @@ impl F128 {
         ghash_mul_unreduced(self, rhs)
     }
 
-    /// Exact field square; characteristic two cancels the cross term.
-    #[inline]
-    pub fn square(self) -> Self {
-        #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
-        { unsafe { x86_64::ghash_square_register(self) } }
-        #[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
-        { self * self }
-    }
-
-    #[inline]
-    fn square_n(mut self, count: usize) -> Self {
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "avx512bw",
-            target_feature = "avx512vbmi",
-            target_feature = "gfni"
-        ))]
-        if let Some(value) = frobenius::apply(self, count) {
-            return value;
-        }
-        for _ in 0..count { self = self.square(); }
-        self
-    }
-
-    /// x^(2^128 - 2), using a fixed addition chain for 2^127 - 1.
-    /// Zero retains the previous convention of mapping to zero.
+    /// Multiplicative inverse via Fermat: x^{2^128 − 2}.
+    /// Used in one-time setup (Lagrange weight computation), not in hot paths.
     pub fn inv(self) -> Self {
-        // a_k = x^(2^k - 1). The chain for k is
-        // 1,2,3,6,7,14,21,42,63,126,127: 127 squares and ten products.
-        let a2 = self.square() * self;
-        let a3 = a2.square() * self;
-        let a6 = a3.square_n(3) * a3;
-        let a7 = a6.square() * self;
-        let a14 = a7.square_n(7) * a7;
-        let a21 = a14.square_n(7) * a7;
-        let a42 = a21.square_n(21) * a21;
-        let a63 = a42.square_n(21) * a21;
-        let a126 = a63.square_n(63) * a63;
-        let a127 = a126.square() * self;
-        a127.square()
+        // x^{2^128 - 2} = ∏_{i=1..127} x^{2^i}
+        let mut r = Self::ONE;
+        let mut cur = self * self; // x^2
+        for _ in 1..128 {
+            r *= cur;
+            cur = cur * cur;
+        }
+        r
     }
-
 }
 
 impl Add for F128 {
@@ -118,25 +87,6 @@ impl AddAssign for F128 {
     }
 }
 
-/// `a * b` for a multiplier already known to satisfy `b.hi == 0`.
-///
-/// Field-identical to `a * b`; on x86 it takes a 2-CLMUL path instead of the
-/// general 5-CLMUL one. Other targets fall back to the ordinary product, so
-/// callers may use it unconditionally once the precondition holds.
-#[inline]
-pub fn mul_low_rhs(a: F128, b: F128) -> F128 {
-    debug_assert_eq!(b.hi, 0, "mul_low_rhs requires a zero high limb");
-    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
-    {
-        // SAFETY: pclmulqdq is enabled at compile time; b.hi is zero.
-        unsafe { x86_64::ghash_mul_low_rhs(a, b.lo) }
-    }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
-    {
-        a * b
-    }
-}
-
 impl Mul for F128 {
     type Output = Self;
     #[inline]
@@ -149,10 +99,10 @@ impl Mul for F128 {
         #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
         {
             // SAFETY: pclmulqdq target feature is enabled at compile time.
-            // A/B probe 2: karatsuba (3 CLMUL + shift-only ghash_reduce) vs
-            // binius (6 CLMUL). Lowest CLMUL count; shift-reduce latency is
-            // hidden in throughput-bound NTT/fold muls. Field-identical.
-            unsafe { x86_64::ghash_mul_karatsuba_vec(self, rhs) }
+            // On Zen4, karatsuba+barrett is ~17% faster in throughput (the
+            // dominant mode for the bulk parallel F128 work) than binius, which
+            // only wins the latency microbench. (M-series picked binius.)
+            unsafe { x86_64::ghash_mul_karatsuba_barrett(self, rhs) }
         }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_feature = "aes"),
@@ -330,48 +280,6 @@ mod tests {
                 lo: self.next_u64(),
                 hi: self.next_u64(),
             }
-        }
-    }
-
-    #[test]
-    fn register_arithmetic_matches_bitwise_oracle() {
-        let basis = |i: usize| if i < 64 { F128::new(1u64 << i, 0) }
-            else { F128::new(0, 1u64 << (i - 64)) };
-        for i in 0..128 {
-            let x = basis(i);
-            assert_eq!(x.square(), software::ghash_mul(x, x));
-            for j in 0..128 {
-                let y = basis(j);
-                assert_eq!(x * y, software::ghash_mul(x, y), "basis {i} {j}");
-            }
-        }
-        let mut rng = Rng::new(0xa6412732);
-        for _ in 0..1024 {
-            let x = rng.next_f128(); let y = rng.next_f128();
-            assert_eq!(x * y, software::ghash_mul(x, y));
-            assert_eq!(x.square(), software::ghash_mul(x, x));
-        }
-    }
-
-    #[test]
-    fn inverse_chain_matches_previous_fermat() {
-        let old = |x: F128| {
-            let mut r = F128::ONE;
-            let mut cur = software::ghash_mul(x, x);
-            for _ in 1..128 {
-                r = software::ghash_mul(r, cur);
-                cur = software::ghash_mul(cur, cur);
-            }
-            r
-        };
-        for x in [F128::ZERO, F128::ONE, F128::new(u64::MAX,u64::MAX), F128::new(0,1<<63)] {
-            assert_eq!(x.inv(), old(x));
-        }
-        let mut rng = Rng::new(0x127128);
-        for _ in 0..1024 {
-            let x = rng.next_f128(); let inverse = x.inv();
-            assert_eq!(inverse, old(x));
-            if !x.is_zero() { assert_eq!(x * inverse, F128::ONE); }
         }
     }
 
@@ -663,12 +571,3 @@ mod tests {
         }
     }
 }
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512bw",
-    target_feature = "avx512vbmi",
-    target_feature = "gfni"
-))]
-mod frobenius;

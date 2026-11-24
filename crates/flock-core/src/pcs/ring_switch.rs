@@ -59,7 +59,7 @@
 
 use crate::bits::transpose_8x8_bits;
 use crate::challenger::Challenger;
-use crate::field::{F128, F256Unreduced};
+use crate::field::F128;
 use crate::zerocheck::PaddingSpec;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
 use crate::zerocheck::univariate_skip::build_eq;
@@ -286,38 +286,33 @@ pub fn fold_1b_rows_multi_padded(
 fn build_eq_parallel(r: &[F128]) -> Vec<F128> {
     use rayon::prelude::*;
     let n = r.len();
-    // Threshold below which rayon dispatch overhead beats the parallel work.
-    const PAR_THRESHOLD: usize = 1 << 12;
-    if (1usize << n) <= PAR_THRESHOLD {
-        return crate::lincheck::build_eq_table(r);
-    }
     // Uninit alloc — at iter `i`, the loop reads from t[..2^i] (always written
     // by an earlier iter or the t[0] = ONE seed) and writes to t[2^i..2^(i+1)]
     // (purely written, never read first). So every slot is written before any
     // read; uninit is safe.
     let mut t = crate::alloc_uninit_f128_vec(1usize << n);
     t[0] = F128::ONE;
+    // Threshold below which rayon dispatch overhead beats the parallel work.
+    const PAR_THRESHOLD: usize = 1 << 12;
     for i in 0..n {
         let r_i = r[i];
+        let one_minus_r = F128::ONE + r_i;
         let half = 1usize << i;
         let (lo, hi_rest) = t.split_at_mut(half);
         let hi = &mut hi_rest[..half];
-        // Char-2: v*(1+r) = v + v*r. One GHASH plus an XOR per old entry.
         if half < PAR_THRESHOLD {
             for (lo_x, hi_x) in lo.iter_mut().zip(hi.iter_mut()) {
                 let old = *lo_x;
-                let prod = old * r_i;
-                *hi_x = prod;
-                *lo_x = old + prod;
+                *hi_x = old * r_i;
+                *lo_x = old * one_minus_r;
             }
         } else {
             lo.par_iter_mut()
                 .zip(hi.par_iter_mut())
                 .for_each(|(lo_x, hi_x)| {
                     let old = *lo_x;
-                    let prod = old * r_i;
-                    *hi_x = prod;
-                    *lo_x = old + prod;
+                    *hi_x = old * r_i;
+                    *lo_x = old * one_minus_r;
                 });
         }
     }
@@ -358,15 +353,6 @@ pub fn build_eq_split(r: &[F128], n_lo: usize) -> (Vec<F128>, Vec<F128>) {
 /// split path requires `len` divisible by 16).
 pub fn split_n_lo(n: usize) -> usize {
     (n / 2).clamp(4, n)
-}
-
-/// Coarser split for deferred table-composition kernels: keep the streamed
-/// low factor within private L2 while amortizing each composed-table build
-/// over many output slots.
-fn deferred_split_n_lo(n: usize) -> usize {
-    let balanced = split_n_lo(n);
-    let coarse = n.saturating_sub(8).min(15);
-    coarse.max(balanced)
 }
 
 /// Build the 16-entry subset-sum lookup table over 4 F128 elements.
@@ -1317,265 +1303,6 @@ pub fn s_hat_v_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> Vec<F12
         )
 }
 
-/// Four-bank AB sufficient statistic for direct materialization after the
-/// first two Ligerito folds.
-///
-/// The two least-significant packed-polynomial index variables are retained
-/// instead of being folded at `x_inner_rest_tail[..2]`. Collapsing the banks
-/// with `eq(x_inner_rest_tail[..2], ·)` recovers [`s_hat_v_from_z_vec`].
-pub fn s_hat_v_quad_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> Vec<F128> {
-    use rayon::prelude::*;
-
-    assert!(
-        x_inner_rest_tail.len() >= 2,
-        "quad s_hat_v requires two retained packed-index coordinates"
-    );
-    let n_packed = 1usize << LOG_PACKING;
-    let n_tail = 1usize << x_inner_rest_tail.len();
-    assert_eq!(
-        z_vec.len(),
-        n_packed * n_tail,
-        "z_vec length {} mismatches 2^(LOG_PACKING + tail.len()) = {}",
-        z_vec.len(),
-        n_packed * n_tail,
-    );
-
-    let eq_tail = build_eq_parallel(&x_inner_rest_tail[2..]);
-    eq_tail
-        .par_iter()
-        .enumerate()
-        .fold(
-            || vec![F128::ZERO; 4 * n_packed],
-            |mut acc, (k, &weight)| {
-                let base = 4 * k * n_packed;
-                for q in 0..4 {
-                    let block = &z_vec[base + q * n_packed..base + (q + 1) * n_packed];
-                    for b in 0..n_packed {
-                        acc[q * n_packed + b] += weight * block[b];
-                    }
-                }
-                acc
-            },
-        )
-        .reduce(
-            || vec![F128::ZERO; 4 * n_packed],
-            |mut left, right| {
-                for (out, value) in left.iter_mut().zip(right) {
-                    *out += value;
-                }
-                left
-            },
-        )
-}
-
-/// Sixteen-bank sufficient statistic for the direct-fold4 PCS opening. The
-/// four least-significant packed-polynomial index variables are retained
-/// instead of being folded at `x_inner_rest_tail[..4]`.
-///
-/// Banks are stored contiguously in little-endian coordinate order:
-/// `bank = e_small + 4 * q`, followed by the 128 packed-prefix entries. This
-/// is also the intake layout used by the retained-coordinate C producer.
-pub fn s_hat_v_fold4_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> Vec<F128> {
-    use rayon::prelude::*;
-
-    assert!(
-        x_inner_rest_tail.len() >= 4,
-        "fold4 s_hat_v requires four retained packed-index coordinates"
-    );
-    let n_packed = 1usize << LOG_PACKING;
-    let n_tail = 1usize << x_inner_rest_tail.len();
-    assert_eq!(
-        z_vec.len(),
-        n_packed * n_tail,
-        "z_vec length {} mismatches 2^(LOG_PACKING + tail.len()) = {}",
-        z_vec.len(),
-        n_packed * n_tail,
-    );
-
-    let eq_tail = build_eq_parallel(&x_inner_rest_tail[4..]);
-    eq_tail
-        .par_iter()
-        .enumerate()
-        .fold(
-            || vec![F128::ZERO; 16 * n_packed],
-            |mut acc, (k, &weight)| {
-                let base = 16 * k * n_packed;
-                for bank in 0..16 {
-                    let block = &z_vec[base + bank * n_packed..base + (bank + 1) * n_packed];
-                    for packed in 0..n_packed {
-                        acc[bank * n_packed + packed] += weight * block[packed];
-                    }
-                }
-                acc
-            },
-        )
-        .reduce(
-            || vec![F128::ZERO; 16 * n_packed],
-            |mut a, b| {
-                for (out, value) in a.iter_mut().zip(b) {
-                    *out += value;
-                }
-                a
-            },
-        )
-}
-
-/// Collapse the sixteen-bank direct-fold4 intake under the first four suffix
-/// coordinates, recovering the canonical transcript-visible 128-vector.
-pub(crate) fn collapse_s_hat_v_fold4(s_hat_v_fold4: &[F128], low_point: &[F128]) -> Vec<F128> {
-    debug_assert_eq!(s_hat_v_fold4.len(), 16 * (1usize << LOG_PACKING));
-    debug_assert_eq!(low_point.len(), 4);
-    let n_packed = 1usize << LOG_PACKING;
-    let low_eq = build_eq(low_point);
-    if rs_tail_par_enabled() && rs_bank_major_enabled() {
-        // Bank-major collapse with one reduction per output (deferred over
-        // the sixteen banks): the same field sum as the scalar loop below.
-        let mut out = crate::alloc_uninit_vec::<F128>(n_packed);
-        crate::field::f128_slice::collapse_banks(s_hat_v_fold4, &low_eq, &mut out);
-        return out;
-    }
-    let mut out = vec![F128::ZERO; n_packed];
-    for bank in 0..16 {
-        for packed in 0..n_packed {
-            out[packed] += low_eq[bank] * s_hat_v_fold4[bank * n_packed + packed];
-        }
-    }
-    out
-}
-
-pub(crate) fn collapse_s_hat_v_quad(s_hat_v_quad: &[F128], low_point: &[F128]) -> Vec<F128> {
-    debug_assert_eq!(s_hat_v_quad.len(), 4 * (1usize << LOG_PACKING));
-    debug_assert_eq!(low_point.len(), 2);
-    let low_eq = build_eq(low_point);
-    let n_packed = 1usize << LOG_PACKING;
-    if rs_tail_par_enabled() {
-        // Bank-major collapse with one reduction per output (deferred over
-        // the four banks), as [`collapse_s_hat_v_fold8`]: the same field sum
-        // as the scalar loop below (XOR addition, F2-linear reduction).
-        let mut out = crate::alloc_uninit_vec::<F128>(n_packed);
-        if rs_bank_major_enabled() {
-            crate::field::f128_slice::collapse_banks(s_hat_v_quad, &low_eq, &mut out);
-        } else {
-            crate::field::f128_slice::scale_slice(&mut out, &s_hat_v_quad[..n_packed], low_eq[0]);
-            for q in 1..4 {
-                crate::field::f128_slice::add_scaled(&mut out, &s_hat_v_quad[q * n_packed..(q + 1) * n_packed], low_eq[q]);
-            }
-        }
-        return out;
-    }
-    let mut out = vec![F128::ZERO; n_packed];
-    for q in 0..4 {
-        for b in 0..n_packed {
-            out[b] += low_eq[q] * s_hat_v_quad[q * n_packed + b];
-        }
-    }
-    out
-}
-
-/// Sixty-four-bank sufficient statistic for the direct-fold8 PCS opening. The
-/// six least-significant packed-polynomial index variables are retained
-/// instead of being folded at `x_inner_rest_tail[..6]`.
-///
-/// Banks are stored contiguously in little-endian coordinate order:
-/// `bank = e_small + 4 * q_med + 16 * q_high`, followed by the 128
-/// packed-prefix entries. Same intake layout as the fold4 statistic, one
-/// level wider; every `z_vec` element is touched exactly once.
-pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> Vec<F128> {
-    use rayon::prelude::*;
-
-    assert!(
-        x_inner_rest_tail.len() >= 6,
-        "fold8 s_hat_v requires six retained packed-index coordinates"
-    );
-    let n_packed = 1usize << LOG_PACKING;
-    let n_tail = 1usize << x_inner_rest_tail.len();
-    assert_eq!(
-        z_vec.len(),
-        n_packed * n_tail,
-        "z_vec length {} mismatches 2^(LOG_PACKING + tail.len()) = {}",
-        z_vec.len(),
-        n_packed * n_tail,
-    );
-
-    if x_inner_rest_tail.len() == 7 {
-        // Ranked shape: retain six coordinates and bind the sole remaining
-        // coordinate with the characteristic-two one-multiply form directly
-        // into an uninitialized destination buffer on the calling thread,
-        // avoiding a 128 KiB `to_vec()` memcpy and a 16-thread Rayon barrier.
-        let r = x_inner_rest_tail[6];
-        let half = 64 * n_packed;
-        let (z0, z1) = z_vec.split_at(half);
-        let mut out = crate::alloc_uninit_vec::<F128>(half);
-        crate::field::f128_slice::bind_split_half_into(&mut out, z0, z1, r);
-        return out;
-    }
-
-    let eq_tail = build_eq_parallel(&x_inner_rest_tail[6..]);
-    eq_tail
-        .par_iter()
-        .enumerate()
-        .fold(
-            || vec![F128::ZERO; 64 * n_packed],
-            |mut acc, (k, &weight)| {
-                let base = 64 * k * n_packed;
-                for bank in 0..64 {
-                    let block = &z_vec[base + bank * n_packed..base + (bank + 1) * n_packed];
-                    for packed in 0..n_packed {
-                        acc[bank * n_packed + packed] += weight * block[packed];
-                    }
-                }
-                acc
-            },
-        )
-        .reduce(
-            || vec![F128::ZERO; 64 * n_packed],
-            |mut a, b| {
-                for (out, value) in a.iter_mut().zip(b) {
-                    *out += value;
-                }
-                a
-            },
-        )
-}
-
-/// Collapse the sixty-four-bank direct-fold8 intake under the first six
-/// suffix coordinates, recovering the canonical transcript-visible
-/// 128-vector. Bitwise identical to `collapse_s_hat_v_fold4` of the 16-bank
-/// statistic: both are the same F2-linear fold regrouped, and GF(2^128)
-/// addition is XOR.
-pub(crate) fn collapse_s_hat_v_fold8(s_hat_v_fold8: &[F128], low_point: &[F128]) -> Vec<F128> {
-    debug_assert_eq!(s_hat_v_fold8.len(), 64 * (1usize << LOG_PACKING));
-    debug_assert_eq!(low_point.len(), 6);
-    let n_packed = 1usize << LOG_PACKING;
-    let low_eq = crate::lincheck::build_eq_table(low_point);
-    crate::rstrace::ev("col:eq", 0);
-    if rs_tail_par_enabled() {
-        // Bank-major collapse: one unreduced accumulator per four outputs over
-        // all sixty-four banks and one reduction per output, instead of a
-        // reduction per product and an output load/store per bank. The same
-        // field sum as the scalar loop below (XOR addition, F2-linear
-        // reduction).
-        let mut out = crate::alloc_uninit_vec::<F128>(n_packed);
-        if rs_bank_major_enabled() {
-            crate::field::f128_slice::collapse_banks(s_hat_v_fold8, &low_eq, &mut out);
-        } else {
-            crate::field::f128_slice::scale_slice(&mut out, &s_hat_v_fold8[..n_packed], low_eq[0]);
-            for bank in 1..64 {
-                crate::field::f128_slice::add_scaled(&mut out, &s_hat_v_fold8[bank * n_packed..(bank + 1) * n_packed], low_eq[bank]);
-            }
-        }
-        crate::rstrace::ev("col:end", 0);
-        return out;
-    }
-    let mut out = vec![F128::ZERO; n_packed];
-    for bank in 0..64 {
-        for packed in 0..n_packed {
-            out[packed] += low_eq[bank] * s_hat_v_fold8[bank * n_packed + packed];
-        }
-    }
-    out
-}
-
 /// Compute the slice-MLE vector `s_hat_v` (length 128) from a packed witness
 /// and a tensor-expanded suffix point.
 ///
@@ -1648,89 +1375,13 @@ pub fn claim_check(weights: &[F128], s_hat_v: &[F128]) -> F128 {
 }
 
 /// Standard inner product `Σ_i a[i] · b[i]` over F_{2^128}.
-///
-/// Reduction modulo the GHASH polynomial is F₂-linear, so
-/// `Σ (aᵢ·bᵢ) mod p = (Σ aᵢ·bᵢ) mod p` — the identity already documented
-/// on [`F128::mul_unreduced`]. The portable path XOR-accumulates unreduced
-/// 256-bit schoolbook products and reduces **once**. On the ranked host
-/// (`avx512f` + `vpclmulqdq`, c7i.4xlarge SPR) the same identity is 4-wide
-/// via [`crate::field::gf2_128::x86_64::WideGhashX4`] — the crate's existing
-/// deferred-reduction primitive (`fold16_banked`). Kill switch
-/// `FLOCK_NO_IP_WIDE=1` keeps the portable one-reduce loop (still not the
-/// old per-product reduce). Ranked env is cleared, so the wide path fires.
 pub fn inner_product(a: &[F128], b: &[F128]) -> F128 {
     assert_eq!(a.len(), b.len());
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    {
-        if inner_product_wide_enabled() {
-            // SAFETY: the cfg gate supplies avx512f + vpclmulqdq; sse4.1 is
-            // part of every AVX-512 profile the crate already compiles for.
-            return unsafe { inner_product_wide(a, b) };
-        }
-    }
-    inner_product_unreduced(a, b)
-}
-
-/// Portable one-reduce inner product. Bit-identical to the historical
-/// `acc += x * y` loop because reduction commutes with XOR.
-fn inner_product_unreduced(a: &[F128], b: &[F128]) -> F128 {
-    let mut acc = F256Unreduced::ZERO;
+    let mut acc = F128::ZERO;
     for (&x, &y) in a.iter().zip(b.iter()) {
-        acc ^= x.mul_unreduced(y);
+        acc += x * y;
     }
-    acc.reduce()
-}
-
-/// `FLOCK_NO_IP_WIDE=1` disables the AVX-512 4-wide path (exact A/B).
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-fn inner_product_wide_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_IP_WIDE").is_none());
-    *ON
-}
-
-/// 4-wide unreduced CLMUL accumulate + one horizontal fold + one reduce.
-///
-/// # Safety
-/// Caller guarantees `avx512f` + `vpclmulqdq` (+ `sse4.1` for `fold`).
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-#[target_feature(enable = "avx512f,vpclmulqdq,sse4.1")]
-unsafe fn inner_product_wide(a: &[F128], b: &[F128]) -> F128 {
-    use crate::field::gf2_128::x86_64::WideGhashX4;
-    use core::arch::x86_64::*;
-    debug_assert_eq!(a.len(), b.len());
-    // SAFETY: cfg + target_feature; loads are unaligned; F128 is 16-byte
-    // and four consecutive values fill one ZMM. Tail uses the same
-    // `mul_unreduced` the portable path uses.
-    unsafe {
-        let n = a.len();
-        let mut acc = WideGhashX4::zero();
-        let mut i = 0usize;
-        while i + 4 <= n {
-            let x = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
-            let y = _mm512_loadu_si512(b.as_ptr().add(i) as *const __m512i);
-            acc.mul_acc(x, y);
-            i += 4;
-        }
-        let mut tail = acc.fold();
-        while i < n {
-            tail ^= a[i].mul_unreduced(b[i]);
-            i += 1;
-        }
-        tail.reduce()
-    }
+    acc
 }
 
 /// **TensorAlgebra transpose** (a.k.a. "bit transpose" of `s_hat_v`).
@@ -1748,175 +1399,14 @@ unsafe fn inner_product_wide(a: &[F128], b: &[F128]) -> F128 {
 /// the "vertical" and "horizontal" dimensions swapped. The BaseFold target is
 /// `T = ⟨s_hat_u, eq_ind(r'')⟩`.
 ///
-/// Tiled as sixteen 8-row stripes. Each half-stripe delegates its 8×64 bit
-/// matrix to the shared architecture-optimized transpose, then the 64 output
-/// bytes are scattered into one byte column of the 128 output elements. This
-/// replaces 16,384 branchy bit tests/deposits with 32 fixed 64-byte
-/// transposes while preserving the exact polynomial-basis layout.
-#[allow(clippy::uninit_vec)]
+/// Naive O(128²) bit-extract implementation. NEON acceleration via bit
+/// transpose intrinsics is future work.
 pub fn tensor_algebra_transpose(s_hat_v: &[F128]) -> Vec<F128> {
-    let mut out = crate::alloc_uninit_vec::<F128>(128);
-    let out_arr: &mut [F128; 128] = (&mut out[..]).try_into().expect("128 elements");
-    tensor_algebra_transpose_into(s_hat_v, out_arr);
-    out
-}
-
-#[inline]
-pub fn tensor_algebra_transpose_into(s_hat_v: &[F128], out: &mut [F128; 128]) {
-    debug_assert_eq!(s_hat_v.len(), 128);
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512bw",
-        target_feature = "avx512vbmi",
-        target_feature = "gfni"
-    ))]
-    {
-        // SAFETY: the `cfg` supplies exactly the features the callee enables,
-        // and the callee initializes all 128 elements of `out`.
-        unsafe {
-            transpose128_gfni(s_hat_v.as_ptr(), out.as_mut_ptr());
-        }
-    }
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512bw",
-        target_feature = "avx512vbmi",
-        target_feature = "gfni"
-    )))]
-    {
-        assert_eq!(s_hat_v.len(), 1 << LOG_PACKING);
-        let mut out_bytes = [[0u8; 16]; 1 << LOG_PACKING];
-        for row_group in 0..16 {
-            let rows = &s_hat_v[row_group * 8..row_group * 8 + 8];
-            let lo: [u64; 8] = std::array::from_fn(|i| rows[i].lo);
-            let hi: [u64; 8] = std::array::from_fn(|i| rows[i].hi);
-            let mut lo_columns = [0u8; 64];
-            let mut hi_columns = [0u8; 64];
-            crate::bits::transpose_8_u64s_to_64_bytes(&lo, &mut lo_columns);
-            crate::bits::transpose_8_u64s_to_64_bytes(&hi, &mut hi_columns);
-            for bit in 0..64 {
-                out_bytes[bit][row_group] = lo_columns[bit];
-                out_bytes[bit + 64][row_group] = hi_columns[bit];
-            }
-        }
-        for (dst, b) in out.iter_mut().zip(out_bytes.iter()) {
-            *dst = F128 {
-                lo: u64::from_le_bytes(b[0..8].try_into().expect("8 bytes")),
-                hi: u64::from_le_bytes(b[8..16].try_into().expect("8 bytes")),
-            };
-        }
-    }
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512bw",
-    target_feature = "avx512vbmi",
-    target_feature = "gfni"
-))]
-#[rustfmt::skip]
-#[inline]
-#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
-unsafe fn transpose128_gfni(p: *const F128, out: *mut F128) {
-    use core::arch::x86_64::*;
-    const L: [u8; 64] = [112,96,80,64,48,32,16,0,113,97,81,65,49,33,17,1,114,98,82,66,50,34,18,2,115,99,83,67,51,35,19,3,116,100,84,68,52,36,20,4,117,101,85,69,53,37,21,5,118,102,86,70,54,38,22,6,119,103,87,71,55,39,23,7];
-    const H: [u8; 64] = [120,104,88,72,56,40,24,8,121,105,89,73,57,41,25,9,122,106,90,74,58,42,26,10,123,107,91,75,59,43,27,11,124,108,92,76,60,44,28,12,125,109,93,77,61,45,29,13,126,110,94,78,62,46,30,14,127,111,95,79,63,47,31,15];
-    unsafe {
-        let l = _mm512_loadu_si512(L.as_ptr() as *const __m512i);
-        let h = _mm512_loadu_si512(H.as_ptr() as *const __m512i);
-        let i0 = _mm512_set_epi64(11,3,10,2,9,1,8,0);
-        let i1 = _mm512_set_epi64(15,7,14,6,13,5,12,4);
-        let d = out as *mut __m512i;
-        let a = transpose64_gfni(p, l);
-        let b = transpose64_gfni(p.add(64), l);
-        let mut k = 0usize;
-        while k != 8 {
-            _mm512_storeu_si512(d.add(k*2), _mm512_permutex2var_epi64(a[k], i0, b[k]));
-            _mm512_storeu_si512(d.add(k*2+1), _mm512_permutex2var_epi64(a[k], i1, b[k]));
-            k += 1;
-        }
-        let a = transpose64_gfni(p, h);
-        let b = transpose64_gfni(p.add(64), h);
-        k = 0;
-        while k != 8 {
-            _mm512_storeu_si512(d.add(16+k*2), _mm512_permutex2var_epi64(a[k], i0, b[k]));
-            _mm512_storeu_si512(d.add(17+k*2), _mm512_permutex2var_epi64(a[k], i1, b[k]));
-            k += 1;
-        }
-    }
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512bw",
-    target_feature = "avx512vbmi",
-    target_feature = "gfni"
-))]
-#[rustfmt::skip]
-#[inline]
-#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
-unsafe fn transpose64_gfni(p: *const F128, idx: core::arch::x86_64::__m512i) -> [core::arch::x86_64::__m512i;8] {
-    use core::arch::x86_64::*;
-    unsafe {
-        let id = _mm512_set1_epi64(0x8040201008040201u64 as i64);
-        let mut r = [_mm512_setzero_si512();8];
-        let mut g = 0usize;
-        while g != 8 {
-            let q = p.add(g*8);
-            r[g] = _mm512_gf2p8affine_epi64_epi8::<0>(id, _mm512_permutex2var_epi8(_mm512_loadu_si512(q as *const __m512i), idx, _mm512_loadu_si512(q.add(4) as *const __m512i)));
-            g += 1;
-        }
-        transpose8x64_bytes(r)
-    }
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512bw",
-    target_feature = "avx512vbmi",
-    target_feature = "gfni"
-))]
-#[rustfmt::skip]
-#[inline]
-#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
-unsafe fn transpose8x64_bytes(mut x: [core::arch::x86_64::__m512i;8]) -> [core::arch::x86_64::__m512i;8] {
-    use core::arch::x86_64::*;
-    const A:[[i64;8];3]=[[0,1,2,3,8,9,10,11],[0,1,8,9,4,5,12,13],[0,8,2,10,4,12,6,14]];
-    const B:[[i64;8];3]=[[4,5,6,7,12,13,14,15],[2,3,10,11,6,7,14,15],[1,9,3,11,5,13,7,15]];
-    const I:[u8;64]=[0,8,16,24,32,40,48,56,1,9,17,25,33,41,49,57,2,10,18,26,34,42,50,58,3,11,19,27,35,43,51,59,4,12,20,28,36,44,52,60,5,13,21,29,37,45,53,61,6,14,22,30,38,46,54,62,7,15,23,31,39,47,55,63];
-    unsafe {
-        let mut s=0usize;
-        while s!=3 {
-            let a=_mm512_loadu_si512(A[s].as_ptr() as *const __m512i);
-            let b=_mm512_loadu_si512(B[s].as_ptr() as *const __m512i);
-            let d=4>>s;
-            let mut y=[_mm512_setzero_si512();8];
-            let mut r=0usize;
-            while r!=8 {
-                if r&d==0 { y[r]=_mm512_permutex2var_epi64(x[r],a,x[r|d]); y[r|d]=_mm512_permutex2var_epi64(x[r],b,x[r|d]); }
-                r+=1;
-            }
-            x=y;s+=1;
-        }
-        let i=_mm512_loadu_si512(I.as_ptr() as *const __m512i);
-        let mut r=0usize;
-        while r!=8 { x[r]=_mm512_permutexvar_epi8(i,x[r]);r+=1; }
-        x
-    }
-}
-
-/// Straight-line definition retained only as the independent oracle for the
-/// tiled implementation above.
-#[cfg(test)]
-fn tensor_algebra_transpose_scalar(s_hat_v: &[F128]) -> Vec<F128> {
     assert_eq!(s_hat_v.len(), 1 << LOG_PACKING);
     let mut s_hat_u = vec![F128::ZERO; 1 << LOG_PACKING];
-    for (i_skip, &elem) in s_hat_v.iter().enumerate() {
+    for i_skip in 0..128 {
+        let elem = s_hat_v[i_skip];
+        // Iterate over the 128 bits b of `elem`; deposit into s_hat_u[b]'s bit i_skip.
         for b in 0..64 {
             if (elem.lo >> b) & 1 == 1 {
                 if i_skip < 64 {
@@ -1925,11 +1415,13 @@ fn tensor_algebra_transpose_scalar(s_hat_v: &[F128]) -> Vec<F128> {
                     s_hat_u[b].hi |= 1u64 << (i_skip - 64);
                 }
             }
+        }
+        for b in 0..64 {
             if (elem.hi >> b) & 1 == 1 {
                 if i_skip < 64 {
-                    s_hat_u[64 + b].lo |= 1u64 << i_skip;
+                    s_hat_u[64 | b].lo |= 1u64 << i_skip;
                 } else {
-                    s_hat_u[64 + b].hi |= 1u64 << (i_skip - 64);
+                    s_hat_u[64 | b].hi |= 1u64 << (i_skip - 64);
                 }
             }
         }
@@ -1988,11 +1480,7 @@ pub fn fold_b128_elems(suffix_tensor: &[F128], eq_r_dprime: &[F128]) -> Vec<F128
 
     // Build the 16 byte-tables. `tables[byte_idx * 256 + value]` = the F128
     // sum of `eq_r_dprime[byte_idx*8 + bit]` over set bits in `value`.
-    let mut tables = if fold_table_uninit_enabled() {
-        crate::alloc_uninit_vec::<F128>(N_BYTES * TABLE_SIZE)
-    } else {
-        vec![F128::ZERO; N_BYTES * TABLE_SIZE]
-    };
+    let mut tables = vec![F128::ZERO; N_BYTES * TABLE_SIZE];
     for byte_idx in 0..N_BYTES {
         let bit_base = byte_idx * 8;
         for value in 0..TABLE_SIZE {
@@ -2068,30 +1556,17 @@ pub fn fold_b128_elems(suffix_tensor: &[F128], eq_r_dprime: &[F128]) -> Vec<F128
 /// `fold_b128_elems(build_eq_parallel(r), eq_r_dprime)` (field multiply is
 /// exact, so `eq_lo[i_lo] * eq_hi[i_hi]` has the same bits as the
 /// materialized entry).
-/// Total entries in a fold byte-table set (16 byte positions × 256 values).
-pub(crate) const FOLD_TABLE_TOTAL: usize = 16 * 256;
-
 /// Number of bytes in an `F128` (= lookup tables for the fold).
 const FOLD_N_BYTES: usize = 16;
 /// Entries per byte-lookup table.
 const FOLD_TABLE_SIZE: usize = 256;
 
-fn fold_table_uninit_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_XP_FOLD_TABLE_UNINIT").is_none());
-    *ON
-}
-
 /// Build the 16×256 byte-lookup table the fold indexes: `table[k·256 + v]` =
 /// `Σ_{bit b set in v} eq_r_dprime[k·8 + b]`. For the ring-switch fold,
 /// `eq_r_dprime` already has γ_k baked in, so the table carries γ too.
-pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
+fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
     assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
-    let mut tables = if fold_table_uninit_enabled() {
-        crate::alloc_uninit_vec::<F128>(FOLD_N_BYTES * FOLD_TABLE_SIZE)
-    } else {
-        vec![F128::ZERO; FOLD_N_BYTES * FOLD_TABLE_SIZE]
-    };
+    let mut tables = vec![F128::ZERO; FOLD_N_BYTES * FOLD_TABLE_SIZE];
     for byte_idx in 0..FOLD_N_BYTES {
         let bit_base = byte_idx * 8;
         for value in 0..FOLD_TABLE_SIZE {
@@ -2105,288 +1580,6 @@ pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
         }
     }
     tables
-}
-
-/// Compose a fold byte-table set `base` (a [`build_fold_byte_table`] output
-/// representing the F2-linear map `M`) with multiplication by a fixed field
-/// element `e_hi`: fills `out` (length [`FOLD_TABLE_TOTAL`]) so that for
-/// every `x`,
-/// `fold_one_slot(x, out) == fold_one_slot(x * e_hi, base)` **bit-exactly**.
-///
-/// Why this is exact algebra, not an approximation: GF(2^128) multiplication
-/// is F2-bilinear, so with `e_b` the basis element having only bit `b` set,
-/// `x·e_hi = Σ_{b: bit b of x set} (e_b · e_hi)`; and `fold_one_slot(·, base)`
-/// IS the F2-linear map `M`, hence
-/// `M(x·e_hi) = Σ_b x_b · M(e_b·e_hi)`. The columns `col[b] = M(X^b·e_hi)`
-/// are produced by the exact `mul_by_x` doubling chain (bit `b` of the
-/// GHASH layout is the coefficient of `X^b`) + a fold through `base`; the
-/// 16×256 byte tables are their subset sums (`out[k·256+v] =
-/// Σ_{bit j of v} col[8k+j]`). Every step is an exact F2 operation, so the
-/// composed fold is bit-identical to multiply-then-fold.
-///
-/// Cost: 128 `mul_by_x` + 128 folds through `base` + 4096 F128 XORs — O(1)
-/// per block, amortized by the caller over ≥ 2048 fold evaluations.
-#[inline(always)]
-pub(crate) fn compose_block_cols(base: &[F128], e_hi: F128) -> [F128; 128] {
-    debug_assert_eq!(base.len(), FOLD_TABLE_TOTAL);
-    // col[b] = M(X^b · e_hi) via the shift-and-fold doubling chain.
-    let mut cols = [F128::ZERO; 128];
-    let mut w = e_hi; // X^0 · e_hi
-    for c in cols.iter_mut() {
-        *c = fold_one_slot(w, base);
-        w = crate::field::mul_by_x(w);
-    }
-    cols
-}
-/// The AVX-512 DirectFold8 consumer repeatedly composes the same fixed byte
-/// map with different `e_hi` values. Precompute the two 64-bit input halves of
-/// that map once so each block only generates `X^b · e_hi` and applies the
-/// existing two-map GFNI leaf.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-pub(crate) struct GfniDirectFoldMap {
-    low: [u64; 128],
-    high: [u64; 128],
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni",
-))]
-#[inline]
-pub(crate) fn build_gfni_direct_fold_map_from_generators(
-    generators: &[F128],
-) -> GfniDirectFoldMap {
-    assert_eq!(generators.len(), 1 << LOG_PACKING);
-    use crate::zerocheck::multilinear::kernels::x86_64::build_row_fold_mats_from_cols;
-    GfniDirectFoldMap {
-        low: build_row_fold_mats_from_cols(&generators[..64]),
-        high: build_row_fold_mats_from_cols(&generators[64..]),
-    }
-}
-
-/// Build the same fixed-map representation directly from a full byte table.
-/// Each one-hot table entry is one column of the represented F2-linear map.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni",
-))]
-#[inline]
-pub(crate) fn build_gfni_direct_fold_map_from_table(table: &[F128]) -> GfniDirectFoldMap {
-    debug_assert_eq!(table.len(), FOLD_TABLE_TOTAL);
-    let generators: [F128; 128] = core::array::from_fn(|i| {
-        table[(i / 8) * FOLD_TABLE_SIZE + (1usize << (i % 8))]
-    });
-    build_gfni_direct_fold_map_from_generators(&generators)
-}
-
-/// Compose a fixed byte-linear fold map with multiplication by `e_hi`,
-/// returning the two GFNI matrix blocks needed for the low and high halves of
-/// the input. The composition is emitted directly by the map-plane kernel:
-/// neither the 128 intermediate `F128` columns nor their second transpose is
-/// materialized.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni",
-))]
-#[inline(always)]
-pub(crate) fn compose_block_mats_gfni_into(
-    map: &GfniDirectFoldMap,
-    e_hi: F128,
-    low_mats: &mut [u64; 128],
-    high_mats: &mut [u64; 128],
-) {
-    use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_two_maps_to_mats;
-    use core::arch::x86_64::*;
-    use core::mem::MaybeUninit;
-
-    let mut low_rows = MaybeUninit::<[u64; 64]>::uninit();
-    let mut high_rows = MaybeUninit::<[u64; 64]>::uninit();
-    let low_ptr = low_rows.as_mut_ptr().cast::<__m512i>();
-    let high_ptr = high_rows.as_mut_ptr().cast::<__m512i>();
-
-    let s0 = e_hi;
-    let s1 = crate::field::mul_by_x(s0);
-    let s2 = crate::field::mul_by_x(s1);
-    let s3 = crate::field::mul_by_x(s2);
-    let s4 = crate::field::mul_by_x(s3);
-    let s5 = crate::field::mul_by_x(s4);
-    let s6 = crate::field::mul_by_x(s5);
-    let s7 = crate::field::mul_by_x(s6);
-
-    unsafe {
-        let mut lo = _mm512_set_epi64(
-            s7.lo as i64,
-            s6.lo as i64,
-            s5.lo as i64,
-            s4.lo as i64,
-            s3.lo as i64,
-            s2.lo as i64,
-            s1.lo as i64,
-            s0.lo as i64,
-        );
-        let mut hi = _mm512_set_epi64(
-            s7.hi as i64,
-            s6.hi as i64,
-            s5.hi as i64,
-            s4.hi as i64,
-            s3.hi as i64,
-            s2.hi as i64,
-            s1.hi as i64,
-            s0.hi as i64,
-        );
-        for chunk in 0..2 {
-            for g in 0..8 {
-                _mm512_storeu_si512(low_ptr.add(g), lo);
-                _mm512_storeu_si512(high_ptr.add(g), hi);
-                if chunk == 0 || g < 7 {
-                    let top = _mm512_srli_epi64::<56>(hi);
-                    let red_721 = _mm512_ternarylogic_epi64::<0x96>(
-                        _mm512_slli_epi64::<7>(top),
-                        _mm512_slli_epi64::<2>(top),
-                        _mm512_add_epi64(top, top),
-                    );
-                    let next_hi = _mm512_shldi_epi64::<8>(hi, lo);
-                    let next_lo = _mm512_ternarylogic_epi64::<0x96>(
-                        _mm512_slli_epi64::<8>(lo),
-                        red_721,
-                        top,
-                    );
-                    lo = next_lo;
-                    hi = next_hi;
-                }
-            }
-            let mats = if chunk == 0 {
-                &mut *low_mats
-            } else {
-                &mut *high_mats
-            };
-            gfni_fold64_two_maps_to_mats(
-                low_rows.as_ptr().cast::<u8>(),
-                &map.low,
-                high_rows.as_ptr().cast::<u8>(),
-                &map.high,
-                mats,
-            );
-        }
-    }
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni",
-))]
-#[inline(always)]
-pub(crate) fn compose_block_mats_gfni(
-    map: &GfniDirectFoldMap,
-    e_hi: F128,
-) -> ([u64; 128], [u64; 128]) {
-    use core::mem::MaybeUninit;
-    let mut low_mats = MaybeUninit::<[u64; 128]>::uninit();
-    let mut high_mats = MaybeUninit::<[u64; 128]>::uninit();
-    // SAFETY: compose_block_mats_gfni_into overwrites all 128 u64s of both outputs.
-    unsafe {
-        compose_block_mats_gfni_into(
-            map,
-            e_hi,
-            &mut *low_mats.as_mut_ptr(),
-            &mut *high_mats.as_mut_ptr(),
-        );
-        (low_mats.assume_init(), high_mats.assume_init())
-    }
-}
-
-#[inline(always)]
-pub(crate) fn compose_block_table(base: &[F128], e_hi: F128, out: &mut [F128]) {
-    debug_assert_eq!(out.len(), FOLD_TABLE_TOTAL);
-    let cols = compose_block_cols(base, e_hi);
-    // Expand each 8-column group into its 256-entry subset-sum table. Every
-    // slot of `out` is written before any read (`v & (v-1) < v`), so `out`
-    // may be uninitialized on entry.
-    for k in 0..FOLD_N_BYTES {
-        let col8 = &cols[k * 8..k * 8 + 8];
-        let block = &mut out[k * FOLD_TABLE_SIZE..(k + 1) * FOLD_TABLE_SIZE];
-        block[0] = F128::ZERO;
-        for v in 1..FOLD_TABLE_SIZE {
-            block[v] = block[v & (v - 1)] + col8[v.trailing_zeros() as usize];
-        }
-    }
-}
-
-/// Encode `x ↦ Σ_d fold_weight[d] · Φ(low_eq[d]·x)` as a byte table,
-/// where `base` encodes the γ-baked linear map `Φ`.
-#[inline(always)]
-pub(crate) fn build_direct_fold2_table(
-    low_eq: &[F128; 4],
-    fold_weight: &[F128; 4],
-    base: &[F128],
-) -> Vec<F128> {
-    build_direct_fold_table(low_eq, fold_weight, base)
-}
-
-/// Sixteen-bank twin of [`build_direct_fold2_table`] for the direct-fold4
-/// materializer: `x ↦ Σ_{d<16} fold_weight[d] · Φ(low_eq[d]·x)`.
-#[inline(always)]
-pub(crate) fn build_direct_fold4_table(
-    low_eq: &[F128; 16],
-    fold_weight: &[F128; 16],
-    base: &[F128],
-) -> Vec<F128> {
-    build_direct_fold_table(low_eq, fold_weight, base)
-}
-
-#[inline(always)]
-fn build_direct_fold_table<const N: usize>(
-    low_eq: &[F128; N],
-    fold_weight: &[F128; N],
-    base: &[F128],
-) -> Vec<F128> {
-    debug_assert_eq!(base.len(), FOLD_TABLE_TOTAL);
-    let mut out = if fold_table_uninit_enabled() {
-        crate::alloc_uninit_vec::<F128>(FOLD_TABLE_TOTAL)
-    } else {
-        vec![F128::ZERO; FOLD_TABLE_TOTAL]
-    };
-    // N independent mul_by_x chains (one per low_eq bank), then XOR-sum.
-    // Φ = fold_one_slot is only F2-linear on bits — do NOT pull fold_weight
-    // through Φ.
-    let mut generators = [F128::ZERO; 128];
-    for d in 0..N {
-        let mut w = low_eq[d];
-        let fw = fold_weight[d];
-        for generator in generators.iter_mut() {
-            *generator += fw * fold_one_slot(w, base);
-            w = crate::field::mul_by_x(w);
-        }
-    }
-    for byte in 0..FOLD_N_BYTES {
-        let table = &mut out[byte * FOLD_TABLE_SIZE..(byte + 1) * FOLD_TABLE_SIZE];
-        table[0] = F128::ZERO;
-        for (bit, &generator) in generators[byte * 8..byte * 8 + 8].iter().enumerate() {
-            let half = 1usize << bit;
-            for value in 0..half {
-                table[value + half] = table[value] + generator;
-            }
-        }
-    }
-    out
 }
 
 /// One folded output slot: `Σ_{k=0..16} tables[k·256 + byte_k(elem)]`, where
@@ -2440,38 +1633,6 @@ pub(crate) fn fold_one_slot(elem: F128, tables: &[F128]) -> F128 {
     let r1 = q2 + q3;
     // Level 4.
     r0 + r1
-}
-
-#[allow(dead_code)] // Scalar oracle for the generator-based table builder.
-pub(crate) fn build_direct_fold8_table(
-    low_eq: &[F128; 64],
-    fold_weight: &[F128; 64],
-    base: &[F128],
-) -> Vec<F128> {
-    build_direct_fold_table(low_eq, fold_weight, base)
-}
-
-/// Encode a byte-linear map from its 128 polynomial-basis generators. The
-/// factor-state DirectFold8 path obtains these generators after binding its
-/// six retained bank coordinates online.
-pub(crate) fn build_direct_fold8_table_from_generators(generators: &[F128]) -> Vec<F128> {
-    assert_eq!(generators.len(), 1 << LOG_PACKING);
-    let mut out = if fold_table_uninit_enabled() {
-        crate::alloc_uninit_vec::<F128>(FOLD_TABLE_TOTAL)
-    } else {
-        vec![F128::ZERO; FOLD_TABLE_TOTAL]
-    };
-    for byte in 0..FOLD_N_BYTES {
-        let table = &mut out[byte * FOLD_TABLE_SIZE..(byte + 1) * FOLD_TABLE_SIZE];
-        table[0] = F128::ZERO;
-        for (bit, &generator) in generators[byte * 8..byte * 8 + 8].iter().enumerate() {
-            let half = 1usize << bit;
-            for value in 0..half {
-                table[value + half] = table[value] + generator;
-            }
-        }
-    }
-    out
 }
 
 /// Per-output-index value of a [`RsEqInd::DeferredDense`] fold (the value the
@@ -2882,629 +2043,6 @@ pub struct RingSwitchOutput {
     pub sumcheck_claim: F128,
 }
 
-/// Dense ingredients retained for the x86 direct-fold2 path. The table and
-/// optional products already include this claim's ring-switch γ.
-#[derive(Clone, Debug)]
-pub(crate) struct DirectFold2Factors {
-    pub(crate) eq_lo: Vec<F128>,
-    pub(crate) eq_hi: Vec<F128>,
-    pub(crate) low_eq: [F128; 4],
-    pub(crate) table: Vec<F128>,
-    /// `H[e,d] = Σ_h f[4h+e] B_k[4h+d]`. Available for AB because its
-    /// four-bank witness statistic makes these products cheap; C obtains its
-    /// initial messages from a stats-only streaming pass instead.
-    pub(crate) products: Option<[F128; 16]>,
-}
-
-/// Sixteen-bank sufficient statistic for the direct-fold4 opening. All fields
-/// already include this claim's ring-switch gamma. The bank index is
-/// `e_small + 4 * q`, matching the retained-coordinate producers
-/// (`s_hat_v_fold4_from_z_vec`, the zerocheck 32-bank C capture) and the
-/// little-endian order of `build_eq(suffix[..4])`.
-#[derive(Clone, Debug)]
-pub(crate) struct DirectFold4Factors {
-    pub(crate) eq_lo: Vec<F128>,
-    pub(crate) eq_hi: Vec<F128>,
-    pub(crate) low_eq: [F128; 16],
-    pub(crate) table: Vec<F128>,
-    /// `H[e,d] = Σ_h f[16h+e] B_k[16h+d]`.
-    pub(crate) products: [F128; 256],
-}
-
-/// Factor-state sufficient statistic for the direct-fold8 opening. Rather
-/// than materializing H[64][64], retain its A/W factors bit-major and bind
-/// one bank coordinate per initial PCS challenge.
-#[derive(Clone, Debug)]
-pub(crate) struct DirectFold8Factors {
-    pub(crate) eq_lo: Vec<F128>,
-    pub(crate) eq_hi: Vec<F128>,
-    /// A[b,e] = transpose(s_hat_v_fold8[e])[b].
-    pub(crate) a_state: Vec<F128>,
-    /// W[b,d] = Phi(low_eq[d] * x^b), in the same bit-major layout.
-    pub(crate) w_state: Vec<F128>,
-    /// Cached M0 contribution while both small factor states are hot.
-    pub(crate) round0: (F128, F128),
-}
-
-fn direct_fold8_round0(witness: &[F128], basis: &[F128]) -> (F128, F128) {
-    assert_eq!(witness.len(), basis.len());
-    let mut u0 = F128::ZERO;
-    let mut u2 = F128::ZERO;
-    for i in (0..witness.len()).step_by(2) {
-        let a0 = witness[i];
-        let a1 = witness[i + 1];
-        let b0 = basis[i];
-        let b1 = basis[i + 1];
-        u0 += a0 * b0;
-        u2 += (a0 + a1) * (b0 + b1);
-    }
-    (u0, u2)
-}
-
-/// Ranked default runs the per-claim direct-factor tail of
-/// [`prove_batched_padded_with_precomputed`] full-width: the two ranked
-/// claims in parallel, each claim's 64 independent bank chains / stripe
-/// transposes on the pool, the round-0 statistic through the wide AVX-512
-/// message kernel, and the fold8 collapse through the vectorized
-/// `add_scaled` leaf. This tail sits alone on the Fiat–Shamir chain (γs are
-/// already sampled; nothing overlaps it), so on the 16-core ranked runner
-/// the incumbent sequential scalar form leaves 15 cores idle for its whole
-/// duration. Width cannot change wire bytes: every per-entry value is a pure
-/// function of its own inputs, every reduction is an XOR sum, and the wide
-/// kernels defer the F2-linear reduction (`reduce(Σ) = Σ reduce`), so all
-/// results are bit-identical to the scalar order. Read once per process.
-/// `FLOCK_NO_RS_TAIL_PAR=1` restores the exact incumbent sequential tail.
-/// Elide `rs_eq_ind` basis factors the consumer has proved it never reads.
-/// `FLOCK_NO_RS_ELIDE_DEAD_BASIS=1` restores the full `build_eq_split`.
-#[inline]
-fn rs_elide_dead_basis_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RS_ELIDE_DEAD_BASIS").is_none());
-    *ON
-}
-
-#[inline]
-fn rs_reuse_fold8_a_state_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RS_REUSE_FOLD8_A").is_none());
-    *ON
-}
-
-fn rs_tail_par_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RS_TAIL_PAR").is_none());
-    *ON
-}
-
-/// Round-0 `(u_0, u_2)` over the factor states with the deferred-reduce
-/// AVX-512 message kernel when the build carries it. Bit-identical to
-/// [`direct_fold8_round0`]: the kernel accumulates the same canonical
-/// products, GF(2^128) addition is XOR, and the final reduction is F2-linear,
-/// so deferring it commutes with the sum.
-fn direct_fold8_round0_wide(witness: &[F128], basis: &[F128]) -> (F128, F128) {
-    assert_eq!(witness.len(), basis.len());
-    assert!(witness.len().is_multiple_of(2));
-    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-    {
-        // SAFETY: the cfg gate guarantees the target features; equal lengths
-        // (asserted above) are the kernel's only slice contract.
-        return unsafe { super::ligerito::msg_reduce_avx512(witness, basis) };
-    }
-    #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
-    direct_fold8_round0(witness, basis)
-}
-
-/// Build one claim's [`DirectFold8Factors`] from its sixty-four-bank
-/// statistic and γ-baked byte table. `par` selects the full-width tail (see
-/// [`rs_tail_par_enabled`]); `false` is the incumbent sequential scalar
-/// form, kept verbatim as the kill-switch path and the byte-identity oracle.
-#[cfg(test)]
-fn build_direct_fold8_factors(
-    fold8: &[F128],
-    suffix: &[F128],
-    table: &[F128],
-    par: bool,
-) -> DirectFold8Factors {
-    build_direct_fold8_factors_reusing_a_state(fold8.to_vec(), suffix, table, par)
-}
-
-fn build_direct_fold8_factors_reusing_a_state(
-    fold8: Vec<F128>,
-    suffix: &[F128],
-    table: &[F128],
-    par: bool,
-) -> DirectFold8Factors {
-    let low_eq: [F128; 64] = build_eq(&suffix[..6])
-        .try_into()
-        .expect("six-coordinate eq has sixty-four entries");
-    // Keep H[e,d] = <A_e,W_d> factored. Bit-major storage makes every
-    // retained-coordinate pair contiguous, so the six challenges bind these
-    // 512 KiB states online.
-    let (a_state, w_state, round0) = if par {
-        direct_fold8_states_par(fold8, &low_eq, table)
-    } else {
-        direct_fold8_states_seq(&fold8, &low_eq, table)
-    };
-    let tail = &suffix[6..];
-    let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
-    DirectFold8Factors {
-        eq_lo,
-        eq_hi,
-        a_state,
-        w_state,
-        round0,
-    }
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-fn build_direct_fold8_factors_reusing_a_state_from_generators(
-    fold8: Vec<F128>,
-    suffix: &[F128],
-    generators: &[F128],
-) -> DirectFold8Factors {
-    let low_eq: [F128; 64] = crate::lincheck::build_eq_table(&suffix[..6])
-        .try_into()
-        .expect("six-coordinate eq has sixty-four entries");
-    let n_packed = 1usize << LOG_PACKING;
-    let state_len = 64 * n_packed;
-    assert_eq!(fold8.len(), state_len);
-    let mut a_state = crate::alloc_uninit_vec::<F128>(state_len);
-    crate::rstrace::ev("rs:al", 0);
-    let mut w_state;
-    if rs_reuse_fold8_a_state_enabled() {
-        direct_fold8_a_state_into(&fold8, &mut a_state);
-        crate::rstrace::ev("rs:a", 0);
-        w_state = fold8;
-        unsafe { direct_fold8_w_state_gfni_from_generators(&low_eq, generators, &mut w_state) };
-    } else {
-        w_state = crate::alloc_uninit_vec::<F128>(state_len);
-        rayon::join(
-            || unsafe {
-                direct_fold8_w_state_gfni_from_generators(&low_eq, generators, &mut w_state)
-            },
-            || direct_fold8_a_state_into(&fold8, &mut a_state),
-        );
-    }
-    crate::rstrace::ev("rs:aw", 0);
-    let round0 = direct_fold8_round0_wide(&a_state, &w_state);
-    crate::rstrace::ev("rs:r0", 0);
-    let tail = &suffix[6..];
-    let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
-    crate::rstrace::ev("rs:eq", 0);
-    DirectFold8Factors {
-        eq_lo,
-        eq_hi,
-        a_state,
-        w_state,
-        round0,
-    }
-}
-
-/// Lane sl2 (`FLOCK_NO_SL2_F8LATE`): [`build_direct_fold8_factors_reusing_a_state_from_generators`]
-/// reading the borrowed bank tensor directly (no 128 KiB copy), with the A
-/// and W states built side by side and the tail split beside round 0. Each
-/// output is the same pure function of the same inputs.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-fn build_direct_fold8_factors_from_slice(
-    fold8: &[F128],
-    suffix: &[F128],
-    generators: &[F128],
-    pre: Option<PreParts>,
-) -> DirectFold8Factors {
-    let low_eq: [F128; 64] = crate::lincheck::build_eq_table(&suffix[..6])
-        .try_into()
-        .expect("six-coordinate eq has sixty-four entries");
-    let n_packed = 1usize << LOG_PACKING;
-    let state_len = 64 * n_packed;
-    assert_eq!(fold8.len(), state_len);
-    let mut w_state = crate::alloc_uninit_vec::<F128>(state_len);
-    crate::rstrace::ev("rs:al", 0);
-    let (pre_a, pre_eq) = match pre {
-        Some(p) => (Some(p.a), Some(p.eq)),
-        None => (None, None),
-    };
-    let a_state = if let Some(a) = pre_a.filter(|a| a.len() == state_len) {
-        crate::rstrace::ev("rs:W0", 0);
-        unsafe { direct_fold8_w_state_gfni_from_generators(&low_eq, generators, &mut w_state) };
-        crate::rstrace::ev("rs:W1", 0);
-        a
-    } else {
-        let mut a_state = crate::alloc_uninit_vec::<F128>(state_len);
-        rayon::join(
-            || { crate::rstrace::ev("rs:A0", 0); direct_fold8_a_state_lines(fold8, &mut a_state); crate::rstrace::ev("rs:A1", 0); },
-            || { crate::rstrace::ev("rs:W0", 0); unsafe { direct_fold8_w_state_gfni_from_generators(&low_eq, generators, &mut w_state) }; crate::rstrace::ev("rs:W1", 0); },
-        );
-        a_state
-    };
-    crate::rstrace::ev("rs:aw", 0);
-    let tail = &suffix[6..];
-    if let Some((eq_lo, eq_hi)) = pre_eq {
-        let round0 = direct_fold8_round0_chunked(&a_state, &w_state);
-        crate::rstrace::ev("rs:eq", 0);
-        return DirectFold8Factors { eq_lo, eq_hi, a_state, w_state, round0 };
-    }
-    let (round0, (eq_lo, eq_hi)) = rayon::join(
-        || direct_fold8_round0_chunked(&a_state, &w_state),
-        || build_eq_split(tail, deferred_split_n_lo(tail.len())),
-    );
-    crate::rstrace::ev("rs:eq", 0);
-    DirectFold8Factors {
-        eq_lo,
-        eq_hi,
-        a_state,
-        w_state,
-        round0,
-    }
-}
-
-/// XOR sums of canonical values: any even-aligned chunking of the pair sum
-/// gives the same (u0, u2) as [`direct_fold8_round0_wide`] on the whole.
-fn direct_fold8_round0_chunked(a_state: &[F128], w_state: &[F128]) -> (F128, F128) {
-    use rayon::prelude::*;
-    const CH: usize = 8;
-    let len = a_state.len() / CH;
-    (0..CH)
-        .into_par_iter()
-        .map(|k| direct_fold8_round0_wide(&a_state[k * len..(k + 1) * len], &w_state[k * len..(k + 1) * len]))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .fold((F128::ZERO, F128::ZERO), |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2))
-}
-
-fn direct_fold8_states_seq(
-    fold8: &[F128],
-    low_eq: &[F128; 64],
-    table: &[F128],
-) -> (Vec<F128>, Vec<F128>, (F128, F128)) {
-    let n_packed = 1usize << LOG_PACKING;
-    let mut w_state = vec![F128::ZERO; 64 * n_packed];
-    for d_low in 0..64 {
-        let mut basis_product = low_eq[d_low];
-        w_state[d_low] = fold_one_slot(basis_product, table);
-        for bit in 1..n_packed {
-            basis_product = crate::field::mul_by_x(basis_product);
-            w_state[bit * 64 + d_low] = fold_one_slot(basis_product, table);
-        }
-    }
-    let mut a_state = vec![F128::ZERO; 64 * n_packed];
-    for e in 0..64 {
-        let bank = &fold8[e * n_packed..(e + 1) * n_packed];
-        for (bit, value) in tensor_algebra_transpose(bank).into_iter().enumerate() {
-            a_state[bit * 64 + e] = value;
-        }
-    }
-    let round0 = direct_fold8_round0(&a_state, &w_state);
-    (a_state, w_state, round0)
-}
-
-/// `FLOCK_NO_DF8_STATE_DIRECT=1` restores the collect-then-gather state build.
-#[inline]
-fn df8_state_direct_disabled() -> bool {
-    static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_DF8_STATE_DIRECT").is_some()
-    });
-    *OFF
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-#[inline(never)]
-#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,vpclmulqdq,gfni")]
-unsafe fn direct_fold8_w_state_gfni_from_generators(
-    low_eq: &[F128; 64],
-    generators: &[F128],
-    w_state: &mut [F128],
-) {
-    let n_packed = 1usize << LOG_PACKING;
-    assert_eq!(w_state.len(), 64 * n_packed);
-    let map = build_gfni_direct_fold_map_from_generators(generators);
-    crate::rstrace::ev("rs:map", 0);
-    // Lane sl2 (`FLOCK_NO_SL2_WPAR`): the 128 bit rows are independent
-    // given their starting basis products, and the start of chunk k is the
-    // same `bit_lo` repeated mul-by-x steps the serial loop applies, so each
-    // chunk writes the same words as the serial loop.
-    if sl2_wpar_enabled() && rayon::current_num_threads() >= 8 {
-        use rayon::prelude::*;
-        const CH: usize = 8;
-        let w_addr = w_state.as_mut_ptr() as usize;
-        let map = &map;
-        (0..CH).into_par_iter().for_each(|k| unsafe {
-            direct_fold8_w_rows(low_eq, map, w_addr as *mut F128, k * n_packed / CH, (k + 1) * n_packed / CH);
-        });
-        return;
-    }
-    unsafe { direct_fold8_w_rows(low_eq, &map, w_state.as_mut_ptr(), 0, n_packed) }
-}
-
-fn sl2_wpar_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_WPAR").is_none());
-    *ON
-}
-
-/// Rows `bit_lo..bit_hi` of the W state (row `bit` = 64 F128 at `bit * 64`).
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-#[inline(never)]
-#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,vpclmulqdq,gfni")]
-unsafe fn direct_fold8_w_rows(
-    low_eq: &[F128; 64],
-    map: &GfniDirectFoldMap,
-    w_state: *mut F128,
-    bit_lo: usize,
-    bit_hi: usize,
-) {
-    use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_two_maps;
-    use core::arch::x86_64::*;
-
-    let n_packed = 1usize << LOG_PACKING;
-    let mut low_rows = core::mem::MaybeUninit::<[u64; 64]>::uninit();
-    let mut high_rows = core::mem::MaybeUninit::<[u64; 64]>::uninit();
-    let low_ptr = low_rows.as_mut_ptr().cast::<u64>();
-    let high_ptr = high_rows.as_mut_ptr().cast::<u64>();
-    for lane in 0..64 {
-        unsafe {
-            low_ptr.add(lane).write(low_eq[lane].lo);
-            high_ptr.add(lane).write(low_eq[lane].hi);
-        }
-    }
-    let poly = _mm512_set1_epi64(0x87);
-    let zero = _mm512_setzero_si512();
-    for bit in 0..bit_hi {
-        // SAFETY: both input rows hold 64 initialized words, the destination
-        // row covers 64 F128s, and the enclosing cfg supplies every feature.
-        unsafe {
-            if bit >= bit_lo {
-                gfni_fold64_two_maps::<false>(
-                    low_ptr.cast::<u8>(),
-                    &map.low,
-                    high_ptr.cast::<u8>(),
-                    &map.high,
-                    w_state.add(bit * 64),
-                    core::ptr::null(),
-                );
-            }
-            if bit + 1 < n_packed && bit + 1 < bit_hi {
-                let lo_ptr = core::hint::black_box(low_ptr.cast::<__m512i>());
-                let hi_ptr = core::hint::black_box(high_ptr.cast::<__m512i>());
-                for g in 0..8 {
-                    let lo = _mm512_loadu_si512(lo_ptr.add(g));
-                    let hi = _mm512_loadu_si512(hi_ptr.add(g));
-                    let new_hi = _mm512_shldi_epi64::<1>(hi, lo);
-                    let lo_shl = _mm512_add_epi64(lo, lo);
-                    let mask = _mm512_cmpgt_epi64_mask(zero, hi);
-                    let new_lo = _mm512_mask_xor_epi64(lo_shl, mask, lo_shl, poly);
-                    _mm512_storeu_si512(lo_ptr.add(g), new_lo);
-                    _mm512_storeu_si512(hi_ptr.add(g), new_hi);
-                }
-            }
-        }
-    }
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-#[inline(always)]
-unsafe fn direct_fold8_w_state_gfni(
-    low_eq: &[F128; 64],
-    table: &[F128],
-    w_state: &mut [F128],
-) {
-    debug_assert_eq!(table.len(), FOLD_TABLE_TOTAL);
-    let generators: [F128; 128] =
-        core::array::from_fn(|i| table[(i / 8) * FOLD_TABLE_SIZE + (1usize << (i % 8))]);
-    unsafe { direct_fold8_w_state_gfni_from_generators(low_eq, &generators, w_state) }
-}
-
-fn direct_fold8_w_state_into(low_eq: &[F128; 64], table: &[F128], w_state: &mut [F128]) {
-    let n_packed = 1usize << LOG_PACKING;
-    assert_eq!(w_state.len(), 64 * n_packed);
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))]
-    {
-        unsafe { direct_fold8_w_state_gfni(low_eq, table, w_state); }
-        return;
-    }
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    )))]
-    {
-        use rayon::prelude::*;
-        let w_addr = w_state.as_mut_ptr() as usize;
-        (0..64usize).into_par_iter().for_each(|d_low| {
-            let w = w_addr as *mut F128;
-            let mut basis_product = low_eq[d_low];
-            // SAFETY: each d_low owns one disjoint lane in every output row.
-            unsafe {
-                *w.add(d_low) = fold_one_slot(basis_product, table);
-                for bit in 1..n_packed {
-                    basis_product = crate::field::mul_by_x(basis_product);
-                    *w.add(bit * 64 + d_low) = fold_one_slot(basis_product, table);
-                }
-            }
-        });
-    }
-}
-
-fn direct_fold8_a_state_into(fold8: &[F128], a_state: &mut [F128]) {
-    use rayon::prelude::*;
-    let n_packed = 1usize << LOG_PACKING;
-    assert_eq!(fold8.len(), 64 * n_packed);
-    assert_eq!(a_state.len(), 64 * n_packed);
-    let a_addr = a_state.as_mut_ptr() as usize;
-    (0..64usize).into_par_iter().for_each(|e| {
-        let mut transposed = core::mem::MaybeUninit::<[F128; 128]>::uninit();
-        // SAFETY: `tensor_algebra_transpose_into` initializes all 128 elements.
-        let transposed_ref = unsafe {
-            let ptr = transposed.as_mut_ptr();
-            tensor_algebra_transpose_into(&fold8[e * n_packed..(e + 1) * n_packed], &mut *ptr);
-            &*ptr
-        };
-        let a = a_addr as *mut F128;
-        // SAFETY: each e owns one disjoint lane in every output row.
-        unsafe {
-            for (bit, &value) in transposed_ref.iter().enumerate() {
-                *a.add(bit * 64 + e) = value;
-            }
-        }
-    });
-}
-
-/// Lane sl2: [`direct_fold8_a_state_into`] with each task owning four
-/// adjacent banks, i.e. whole 64-byte lines of every output row (the
-/// one-bank tasks share each line four ways across threads). Same values.
-fn direct_fold8_a_state_lines(fold8: &[F128], a_state: &mut [F128]) {
-    direct_fold8_a_state_lines_impl(fold8, a_state, true)
-}
-
-fn direct_fold8_a_state_lines_impl(fold8: &[F128], a_state: &mut [F128], par: bool) {
-    use rayon::prelude::*;
-    let n_packed = 1usize << LOG_PACKING;
-    assert_eq!(fold8.len(), 64 * n_packed);
-    assert_eq!(a_state.len(), 64 * n_packed);
-    let a_addr = a_state.as_mut_ptr() as usize;
-    let body = |g: usize| {
-        crate::rstrace::evd("a:g", g as u32);
-        let mut transposed = core::mem::MaybeUninit::<[[F128; 128]; 4]>::uninit();
-        // SAFETY: `tensor_algebra_transpose_into` initializes all 4 x 128 elements.
-        let t = unsafe {
-            let ptr = transposed.as_mut_ptr().cast::<[F128; 128]>();
-            for j in 0..4 {
-                let e = 4 * g + j;
-                tensor_algebra_transpose_into(&fold8[e * n_packed..(e + 1) * n_packed], &mut *ptr.add(j));
-            }
-            &*transposed.as_ptr()
-        };
-        let a = a_addr as *mut F128;
-        // SAFETY: banks 4g..4g+4 own lanes 4g..4g+4 of every output row.
-        unsafe {
-            for bit in 0..n_packed {
-                for j in 0..4 {
-                    *a.add(bit * 64 + 4 * g + j) = t[j][bit];
-                }
-            }
-        }
-    };
-    if par {
-        (0..16usize).into_par_iter().for_each(body);
-    } else {
-        (0..16usize).for_each(body);
-    }
-}
-
-/// Value-identical full-width form of [`direct_fold8_states_seq`]. Default
-/// producers write both bit-major states directly, avoiding the two
-/// chain-major `Vec<Vec<F128>>` values and their gather. When allocation reuse
-/// is enabled, A is completed first and the no-longer-read `fold8` allocation
-/// is then fully overwritten as W; this ordering prevents scatter stores from
-/// clobbering another producer's input bank.
-fn direct_fold8_states_par(
-    fold8: Vec<F128>,
-    low_eq: &[F128; 64],
-    table: &[F128],
-) -> (Vec<F128>, Vec<F128>, (F128, F128)) {
-    use rayon::prelude::*;
-    let n_packed = 1usize << LOG_PACKING;
-    let state_len = 64 * n_packed;
-    assert_eq!(fold8.len(), state_len);
-
-    if df8_state_direct_disabled() {
-        let (w_rows, a_rows): (Vec<Vec<F128>>, Vec<Vec<F128>>) = rayon::join(
-            || {
-                (0..64usize)
-                    .into_par_iter()
-                    .map(|d_low| {
-                        let mut row = Vec::with_capacity(n_packed);
-                        let mut basis_product = low_eq[d_low];
-                        row.push(fold_one_slot(basis_product, table));
-                        for _ in 1..n_packed {
-                            basis_product = crate::field::mul_by_x(basis_product);
-                            row.push(fold_one_slot(basis_product, table));
-                        }
-                        row
-                    })
-                    .collect()
-            },
-            || {
-                (0..64usize)
-                    .into_par_iter()
-                    .map(|e| tensor_algebra_transpose(&fold8[e * n_packed..(e + 1) * n_packed]))
-                    .collect()
-            },
-        );
-        let mut w_state = vec![F128::ZERO; state_len];
-        let mut a_state = if rs_reuse_fold8_a_state_enabled() {
-            fold8
-        } else {
-            vec![F128::ZERO; state_len]
-        };
-        w_state
-            .par_chunks_mut(64)
-            .zip(a_state.par_chunks_mut(64))
-            .enumerate()
-            .for_each(|(bit, (w_row, a_row))| {
-                for lane in 0..64 {
-                    w_row[lane] = w_rows[lane][bit];
-                    a_row[lane] = a_rows[lane][bit];
-                }
-            });
-        let round0 = direct_fold8_round0_wide(&a_state, &w_state);
-        return (a_state, w_state, round0);
-    }
-
-    let mut a_state = crate::alloc_uninit_vec::<F128>(state_len);
-    let mut w_state;
-    if rs_reuse_fold8_a_state_enabled() {
-        direct_fold8_a_state_into(&fold8, &mut a_state);
-        w_state = fold8;
-        direct_fold8_w_state_into(low_eq, table, &mut w_state);
-    } else {
-        w_state = crate::alloc_uninit_vec::<F128>(state_len);
-        rayon::join(
-            || direct_fold8_w_state_into(low_eq, table, &mut w_state),
-            || direct_fold8_a_state_into(&fold8, &mut a_state),
-        );
-    }
-    let round0 = direct_fold8_round0_wide(&a_state, &w_state);
-    (a_state, w_state, round0)
-}
-
 /// Per-claim output of [`prove_batched`]. Mirrors [`RingSwitchOutput`] but lets
 /// the prover skip the dense `2^(m-7)` `rs_eq_ind` allocation for claims whose
 /// suffix tensor is sparse (e.g. the hash-chain claim). Verifier-side
@@ -3518,13 +2056,6 @@ pub struct RingSwitchBatchOutput {
     /// claims `γ_k · entries` are baked similarly.
     pub rs_eq_ind: RsEqInd,
     pub sumcheck_claim: F128,
-    pub(crate) direct_fold2: Option<DirectFold2Factors>,
-    /// Direct-fold4 consumer seam. Populated only when intake supplies an
-    /// honest sixteen-bank precompute (and pcs's fold4 gate is on).
-    pub(crate) direct_fold4: Option<DirectFold4Factors>,
-    /// Direct-fold8 consumer seam. Populated only when intake supplies an
-    /// honest sixty-four-bank precompute.
-    pub(crate) direct_fold8: Option<DirectFold8Factors>,
 }
 
 /// Sparse-or-dense representation of `rs_eq_ind`. All variants here have γ_k
@@ -3535,14 +2066,13 @@ pub enum RsEqInd {
     /// Deferred dense: the `γ_k·B_k` buffer is **not** materialized. Instead the
     /// fold ingredients (`build_eq_split` factors + the γ-baked byte table) are
     /// carried so pcs's combine can fold each slot on the fly and accumulate it
-    /// straight into `b_combined`. When the ranked all-direct route proves the
-    /// factors dead, both vectors may be empty and `logical_len` preserves the
-    /// shape that downstream length checks still require.
+    /// straight into `b_combined` — avoiding a 2^(m-7) materialize + readback
+    /// per claim. `value(j) = deferred_dense_value(eq_lo, eq_hi, table, log2(B), j)`,
+    /// `B = eq_lo.len()`; byte-identical to `Dense(fold_b128_elems_split(..))`.
     DeferredDense {
         eq_lo: Vec<F128>,
         eq_hi: Vec<F128>,
         table: Vec<F128>,
-        logical_len: usize,
     },
     Sparse {
         len: usize,
@@ -3555,7 +2085,7 @@ impl RsEqInd {
     pub fn len(&self) -> usize {
         match self {
             Self::Dense(v) => v.len(),
-            Self::DeferredDense { logical_len, .. } => *logical_len,
+            Self::DeferredDense { eq_lo, eq_hi, .. } => eq_lo.len() * eq_hi.len(),
             Self::Sparse { len, .. } => *len,
         }
     }
@@ -3578,7 +2108,6 @@ impl RsEqInd {
                 eq_lo,
                 eq_hi,
                 table,
-                ..
             } => {
                 let log_b = eq_lo.len().trailing_zeros() as usize;
                 for (j, o) in out.iter_mut().enumerate() {
@@ -3601,7 +2130,6 @@ impl RsEqInd {
                 eq_lo,
                 eq_hi,
                 table,
-                ..
             } => {
                 let log_b = eq_lo.len().trailing_zeros() as usize;
                 let l = eq_lo.len() * eq_hi.len();
@@ -3665,7 +2193,7 @@ pub fn prove<Ch: Challenger>(
     // So packed_witness.len() = 2^(x_outer.len() - 1). Enforce that.
     assert_eq!(l, 1 << (x_outer.len() - 1));
 
-    let trace = crate::sl2_env_set!("PCS_TRACE");
+    let trace = std::env::var("PCS_TRACE").is_ok();
 
     challenger.observe_label(b"flock-ring-switch-v0");
 
@@ -3762,195 +2290,17 @@ pub fn prove_batched_padded<Ch: Challenger>(
 /// available — see [`s_hat_v_from_z_vec`] and `prover::open_claims`.
 ///
 /// `precomputed_s_hat_v` must be `&[]` (no precomputes) or have length equal
-/// to `x_outers.len()`. Each entry is either the ordinary `2^LOG_PACKING`
-/// statistic or four consecutive banks retaining the low two suffix bits.
+/// to `x_outers.len()`. Each precomputed slice must be length `2^LOG_PACKING`.
 ///
 /// Output is **byte-identical** to [`prove_batched_padded`] when the precomputed
 /// `s_hat_v` is honest (matches what `fold_1b_rows` would produce). Transcript
 /// observes the same bytes in the same order.
-/// `H[e,d] = Σ_h f[16h+e]·B_k[16h+d]` for a sixteen-bank precompute, computed
-/// from the banks alone: `B_k` restricted to retained coordinate `d` is the
-/// low_eq[d]-scaled Φ-image, so each product is an inner product of the
-/// transposed scaled bank with the γ-baked `eq_r''`. 256 transposes; the 16
-/// bank rows are independent, so they run in parallel.
-fn direct_fold4_products(
-    fold4: &[F128],
-    low_eq: &[F128; 16],
-    scaled_eq_r_dprime: &[F128],
-) -> [F128; 256] {
-    use rayon::prelude::*;
-    let n_packed = 1usize << LOG_PACKING;
-    debug_assert_eq!(fold4.len(), 16 * n_packed);
-    let rows: Vec<[F128; 16]> = (0..16usize)
-        .into_par_iter()
-        .map(|e| {
-            let bank = &fold4[e * n_packed..(e + 1) * n_packed];
-            let mut scaled_bank = vec![F128::ZERO; n_packed];
-            let mut row = [F128::ZERO; 16];
-            for (d_low, out) in row.iter_mut().enumerate() {
-                for packed in 0..n_packed {
-                    scaled_bank[packed] = low_eq[d_low] * bank[packed];
-                }
-                let transposed = tensor_algebra_transpose(&scaled_bank);
-                *out = inner_product(&transposed, scaled_eq_r_dprime);
-            }
-            row
-        })
-        .collect();
-    let mut products = [F128::ZERO; 256];
-    for (e, row) in rows.iter().enumerate() {
-        products[e * 16..(e + 1) * 16].copy_from_slice(row);
-    }
-    products
-}
-
 pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     packed_witness: &[F128],
     x_outers: &[&[F128]],
     precomputed_s_hat_v: &[Option<&[F128]>],
     padding: &PaddingSpec,
     challenger: &mut Ch,
-) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>) {
-    prove_batched_padded_with_precomputed_elidable(
-        packed_witness,
-        x_outers,
-        precomputed_s_hat_v,
-        padding,
-        challenger,
-        false,
-    )
-}
-
-/// As [`prove_batched_padded_with_precomputed`], plus the caller's promise
-/// about how it will consume the result.
-///
-/// `basis_elidable` must be the caller's own `direct_common` predicate: the
-/// caller asserts that **if** every claim comes back carrying a
-/// `direct_fold8` bundle **and** a `DeferredDense` `rs_eq_ind`, it will take
-/// the direct-fold8 route, in which `direct_count == n` filters every claim
-/// out of both `rs_baked` and `rs_deferred` and `b_combined` is never
-/// materialised, so **no `rs_eq_ind` basis factor is ever read**.
-///
-/// Whether that antecedent holds is decided *here*, from inputs this function
-/// already has, before any basis factor is built. When it does, the
-/// `build_eq_split` of each dense suffix (2^12 + 2^13 F128 at the ranked
-/// shape, 0.169 ms warm median measured at the `open: ring_switch done` gap
-/// seam) is skipped and length-correct zero factors are handed over in its
-/// place, so `RsEqInd::len()` -- which pcs reads to derive `l` -- is
-/// unchanged and every downstream shape check still sees what it expects.
-///
-/// `FLOCK_NO_RS_ELIDE_DEAD_BASIS=1` restores the full build. Read once into a
-/// `LazyLock`, outside every loop.
-/// Lane rs: run the two ranked claims' tails as two parallel items (measured
-/// −0.035 ms on the ring-switch step, N=16 paired). Each claim's own inner
-/// parallelism is unchanged; output order is the indexed collect's.
-/// `FLOCK_NO_RS_CLAIMS_PAR=1` restores the sequential loop. Read once.
-/// Lane sl2 (`FLOCK_NO_SL2_PRE`): one claim's challenge-free ring-switch
-/// work (the sixty-four-bank collapse and the A state), computed off the
-/// critical path as soon as its bank tensor and point are final (the C
-/// claim, at the end of zerocheck), and taken here by pointer + point match.
-mod sl2_pre {
-    use super::*;
-    use std::sync::atomic::{AtomicU8, Ordering};
-    pub(super) struct Pre {
-        pub key: (usize, usize),
-        pub suffix: Vec<F128>,
-        pub s_hat_v: Vec<F128>,
-        pub a_state: Vec<F128>,
-        pub eq: (Vec<F128>, Vec<F128>),
-    }
-    // 0 = queued, 1 = running, 2 = done, 3 = idle/cancelled.
-    pub(super) static STATE: AtomicU8 = AtomicU8::new(3);
-    pub(super) static SLOT: std::sync::Mutex<Option<Pre>> = std::sync::Mutex::new(None);
-    pub(super) fn on() -> bool {
-        static ON: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_PRE").is_none());
-        *ON
-    }
-    /// Wait for a running job / cancel a queued one; then take the slot.
-    pub(super) fn settle() -> Option<Pre> {
-        loop {
-            match STATE.load(Ordering::Acquire) {
-                0 => {
-                    if STATE.compare_exchange(0, 3, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                        return None;
-                    }
-                }
-                1 => std::hint::spin_loop(),
-                2 => {
-                    STATE.store(3, Ordering::Release);
-                    return SLOT.lock().unwrap_or_else(|e| e.into_inner()).take();
-                }
-                _ => return None,
-            }
-        }
-    }
-}
-
-/// Queue the challenge-free part of a sixty-four-bank claim's ring-switch
-/// tail (see `sl2_pre`). The caller guarantees `fold8` stays alive and
-/// unmodified until [`sl2_pre_settle`] (or the ring switch) has run.
-pub fn sl2_pre_spawn(fold8: &[F128], suffix: Vec<F128>) {
-    use std::sync::atomic::Ordering;
-    let n_packed = 1usize << LOG_PACKING;
-    if !sl2_pre::on() || fold8.len() != 64 * n_packed || suffix.len() < 6 {
-        return;
-    }
-    drop(sl2_pre::settle());
-    sl2_pre::STATE.store(0, Ordering::Release);
-    let (addr, len) = (fold8.as_ptr() as usize, fold8.len());
-    rayon::spawn(move || {
-        if sl2_pre::STATE.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
-            return;
-        }
-        crate::rstrace::ev("pre:run", 0);
-        // SAFETY: the caller's contract; the state machine makes the ring
-        // switch wait for (never race) this read.
-        let fold8 = unsafe { core::slice::from_raw_parts(addr as *const F128, len) };
-        let s_hat_v = collapse_s_hat_v_fold8(fold8, &suffix[..6]);
-        let mut a_state = crate::alloc_uninit_vec::<F128>(len);
-        // Serial: a nested split here could park behind lincheck's long
-        // fold tasks on this worker.
-        direct_fold8_a_state_lines_impl(fold8, &mut a_state, false);
-        let tail = &suffix[6..];
-        let eq = build_eq_split(tail, deferred_split_n_lo(tail.len()));
-        *sl2_pre::SLOT.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(sl2_pre::Pre { key: (addr, len), suffix, s_hat_v, a_state, eq });
-        crate::rstrace::ev("pre:done", 0);
-        sl2_pre::STATE.store(2, Ordering::Release);
-    });
-}
-
-/// Drop any queued or finished precompute (waits for a running one).
-pub fn sl2_pre_settle() {
-    drop(sl2_pre::settle());
-}
-
-fn sl2_colpar_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_COLPAR").is_none());
-    *ON
-}
-
-fn sl2_f8late_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_F8LATE").is_none());
-    *ON
-}
-
-fn rs_claims_par_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| !crate::sl2_env_set!("FLOCK_NO_RS_CLAIMS_PAR"));
-    *ON
-}
-
-pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
-    packed_witness: &[F128],
-    x_outers: &[&[F128]],
-    precomputed_s_hat_v: &[Option<&[F128]>],
-    padding: &PaddingSpec,
-    challenger: &mut Ch,
-    basis_elidable: bool,
 ) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>) {
     assert!(!x_outers.is_empty());
     let trace = std::env::var("PCS_TRACE").is_ok();
@@ -3967,14 +2317,13 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     );
     let n_packed = 1usize << LOG_PACKING;
     for p in precomputed_s_hat_v.iter().flatten() {
-        assert!(
-            p.len() == n_packed
-                || p.len() == 4 * n_packed
-                || p.len() == 16 * n_packed
-                || p.len() == 64 * n_packed,
-            "precomputed_s_hat_v entry must have length 2^LOG_PACKING, 4·2^LOG_PACKING, 16·2^LOG_PACKING, or 64·2^LOG_PACKING"
+        assert_eq!(
+            p.len(),
+            n_packed,
+            "precomputed_s_hat_v entry must have length 2^LOG_PACKING"
         );
     }
+
     // Per-orig-claim "precomputed?" predicate. Empty precomputed slice → all
     // claims need fold (matches the existing behavior bit-for-bit).
     let has_precomputed =
@@ -4020,39 +2369,8 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     //    `fold_1b_rows_split`). Tiny test sizes (len not divisible by 16) fall
     //    back to the materialized tensor + the legacy multi-fold.
     let use_split = l.is_multiple_of(16);
-    // Hoisted above the basis build: the "does this claim need fold_1b_rows?"
-    // question depends only on the classification and the caller's
-    // precomputed slots, and the elision decision below needs its answer.
-    let dense_needs_fold: Vec<usize> = (0..dense_suffixes.len())
-        .filter(|&d| !has_precomputed(dense_to_orig[d]))
-        .collect();
-    let sparse_needs_fold: Vec<usize> = (0..sparse_suffixes.len())
-        .filter(|&s| !has_precomputed(sparse_to_orig[s]))
-        .collect();
-    // Every claim will emit a direct_fold8 bundle (same predicate as the
-    // `direct_fold8` arm of `claim_output` below, evaluated up front), the
-    // basis factors are wanted by nobody else here (no claim needs
-    // fold_1b_rows), and the caller has promised it takes the direct-fold8
-    // route whenever that happens. Under those three the basis is dead.
-    let all_claims_yield_fold8 = use_split
-        && !x_outers.is_empty()
-        && kinds.iter().all(|k| matches!(k, Kind::Dense(_)))
-        && dense_suffixes.iter().all(|s| s.len() >= 6)
-        && (0..n).all(|i| {
-            precomputed_s_hat_v
-                .get(i)
-                .copied()
-                .flatten()
-                .is_some_and(|p| p.len() == 64 * n_packed)
-        });
-    let elide_basis = basis_elidable
-        && all_claims_yield_fold8
-        && dense_needs_fold.is_empty()
-        && sparse_needs_fold.is_empty()
-        && crate::pcs::ranked_direct_fold8_enabled()
-        && rs_elide_dead_basis_enabled();
     let t = std::time::Instant::now();
-    let dense_splits: Vec<(Vec<F128>, Vec<F128>)> = if use_split && !elide_basis {
+    let dense_splits: Vec<(Vec<F128>, Vec<F128>)> = if use_split {
         dense_suffixes
             .iter()
             .map(|s| build_eq_split(s, split_n_lo(s.len())))
@@ -4088,149 +2406,19 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     //    supplied by the caller. dense_s_hat_v/sparse_s_hat_v are still
     //    indexed by classify-time index `d` / `s`; we splice precomputed
     //    values in at those slots and run the kernel only on the others.
+    let dense_needs_fold: Vec<usize> = (0..dense_suffixes.len())
+        .filter(|&d| !has_precomputed(dense_to_orig[d]))
+        .collect();
+    let sparse_needs_fold: Vec<usize> = (0..sparse_suffixes.len())
+        .filter(|&s| !has_precomputed(sparse_to_orig[s]))
+        .collect();
     let t = std::time::Instant::now();
     let mut dense_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); dense_suffixes.len()];
     let mut sparse_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); sparse_suffixes.len()];
     // Fill precomputed slots first.
-    // Lane sl2 (`FLOCK_NO_SL2_COLPAR`): the two ranked sixty-four-bank
-    // collapses are independent per claim; run them side by side.
-    let sl2_colpar = sl2_colpar_enabled()
-        && dense_suffixes.len() == 2
-        && sparse_suffixes.is_empty()
-        && (0..2).all(|d| {
-            precomputed_s_hat_v
-                .get(dense_to_orig[d])
-                .copied()
-                .flatten()
-                .is_some_and(|p| p.len() == 64 * n_packed)
-        })
-        && dense_suffixes.iter().all(|s| s.len() >= 6);
-    // Lane sl2: a claim whose collapse and A state were precomputed.
-    let mut pre_a: Vec<Option<PreParts>> = (0..n).map(|_| None).collect();
-    let mut pre_done = [false; 2];
-    if sl2_colpar && let Some(pre) = sl2_pre::settle() {
-        for d in 0..2 {
-            let p = precomputed_s_hat_v[dense_to_orig[d]].unwrap();
-            if pre.key == (p.as_ptr() as usize, p.len()) && pre.suffix[..] == dense_suffixes[d][..] {
-                dense_s_hat_v[d] = pre.s_hat_v;
-                pre_a[dense_to_orig[d]] = Some(PreParts { a: pre.a_state, eq: pre.eq });
-                pre_done[d] = true;
-                break;
-            }
-        }
-    }
-    // Lane sl2 (`FLOCK_NO_SL2_AEARLY`): the remaining claims' A states
-    // depend only on their bank tensors; build them on the pool while this
-    // thread runs the collapse / observe / sample chain.
-    let early_a: Vec<Option<std::sync::Arc<EarlyA>>> = (0..n)
-        .map(|i| {
-            let p = precomputed_s_hat_v.get(i).copied().flatten()?;
-            if !(sl2_colpar && sl2_aearly_enabled() && pre_a[i].is_none() && p.len() == 64 * n_packed) {
-                return None;
-            }
-            let slot = std::sync::Arc::new(EarlyA {
-                state: std::sync::atomic::AtomicU8::new(0),
-                val: std::sync::Mutex::new(None),
-            });
-            let job = slot.clone();
-            let (addr, len) = (p.as_ptr() as usize, p.len());
-            let tail: Vec<F128> = match kinds[i] {
-                Kind::Dense(d) if dense_suffixes[d].len() >= 6 => dense_suffixes[d][6..].to_vec(),
-                _ => return None,
-            };
-            rayon::spawn(move || {
-                use std::sync::atomic::Ordering;
-                if job.state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
-                    return;
-                }
-                // SAFETY: the owner waits for state 2 before its borrow of
-                // the tensor ends (claim tail or the final settle below).
-                let fold8 = unsafe { core::slice::from_raw_parts(addr as *const F128, len) };
-                let mut a = crate::alloc_uninit_vec::<F128>(len);
-                let (_, eq) = rayon::join(
-                    || direct_fold8_a_state_lines(fold8, &mut a),
-                    || build_eq_split(&tail, deferred_split_n_lo(tail.len())),
-                );
-                *job.val.lock().unwrap_or_else(|e| e.into_inner()) = Some(PreParts { a, eq });
-                job.state.store(2, Ordering::Release);
-            });
-            Some(slot)
-        })
-        .collect();
-    if sl2_colpar && (pre_done[0] || pre_done[1]) {
-        let d = if pre_done[0] { 1 } else { 0 };
-        let p = precomputed_s_hat_v[dense_to_orig[d]].unwrap();
-        dense_s_hat_v[d] = collapse_s_hat_v_fold8(p, &dense_suffixes[d][..6]);
-    } else if sl2_colpar {
-        let p0 = precomputed_s_hat_v[dense_to_orig[0]].unwrap();
-        let p1 = precomputed_s_hat_v[dense_to_orig[1]].unwrap();
-        // Two claims x four bank quarters, XOR-combined per claim (field
-        // addition): the same products summed in a different grouping.
-        use rayon::prelude::*;
-        crate::rstrace::ev("cp:0", 0);
-        let eqs = [
-            crate::lincheck::build_eq_table(&dense_suffixes[0][..6]),
-            crate::lincheck::build_eq_table(&dense_suffixes[1][..6]),
-        ];
-        crate::rstrace::ev("cp:eq", 0);
-        let ps = [p0, p1];
-        let parts: Vec<Vec<F128>> = (0..8usize)
-            .into_par_iter()
-            .map(|t| {
-                crate::rstrace::ev("cp:s", t as u32);
-                let (c, q) = (t / 4, t % 4);
-                let (p, low_eq) = (ps[c], &eqs[c]);
-                let mut out = crate::alloc_uninit_vec::<F128>(n_packed);
-                let b0 = 16 * q;
-                crate::field::f128_slice::scale_slice(&mut out, &p[b0 * n_packed..(b0 + 1) * n_packed], low_eq[b0]);
-                for bank in b0 + 1..b0 + 16 {
-                    crate::field::f128_slice::add_scaled(
-                        &mut out,
-                        &p[bank * n_packed..(bank + 1) * n_packed],
-                        low_eq[bank],
-                    );
-                }
-                crate::rstrace::ev("cp:e", t as u32);
-                out
-            })
-            .collect();
-        crate::rstrace::ev("cp:col", 0);
-        for c in 0..2 {
-            let mut acc = parts[4 * c].clone();
-            for q in 1..4 {
-                for (x, y) in acc.iter_mut().zip(&parts[4 * c + q]) {
-                    *x += *y;
-                }
-            }
-            dense_s_hat_v[c] = acc;
-        }
-    }
     for d in 0..dense_suffixes.len() {
-        if sl2_colpar {
-            break;
-        }
         if let Some(p) = precomputed_s_hat_v.get(dense_to_orig[d]).copied().flatten() {
-            dense_s_hat_v[d] = if p.len() == 64 * n_packed {
-                assert!(
-                    dense_suffixes[d].len() >= 6,
-                    "sixty-four-bank s_hat_v requires at least six suffix coordinates"
-                );
-                collapse_s_hat_v_fold8(p, &dense_suffixes[d][..6])
-            } else if p.len() == 16 * n_packed {
-                assert!(
-                    dense_suffixes[d].len() >= 4,
-                    "sixteen-bank s_hat_v requires at least four suffix coordinates"
-                );
-                collapse_s_hat_v_fold4(p, &dense_suffixes[d][..4])
-            } else if p.len() == 4 * n_packed {
-                assert!(
-                    dense_suffixes[d].len() >= 2,
-                    "four-bank s_hat_v requires at least two suffix coordinates"
-                );
-                collapse_s_hat_v_quad(p, &dense_suffixes[d][..2])
-            } else {
-                p.to_vec()
-            };
+            dense_s_hat_v[d] = p.to_vec();
         }
     }
     for s in 0..sparse_suffixes.len() {
@@ -4239,30 +2427,9 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
             .copied()
             .flatten()
         {
-            sparse_s_hat_v[s] = if p.len() == 64 * n_packed {
-                assert!(
-                    sparse_suffixes[s].len() >= 6,
-                    "sixty-four-bank s_hat_v requires at least six suffix coordinates"
-                );
-                collapse_s_hat_v_fold8(p, &sparse_suffixes[s][..6])
-            } else if p.len() == 16 * n_packed {
-                assert!(
-                    sparse_suffixes[s].len() >= 4,
-                    "sixteen-bank s_hat_v requires at least four suffix coordinates"
-                );
-                collapse_s_hat_v_fold4(p, &sparse_suffixes[s][..4])
-            } else if p.len() == 4 * n_packed {
-                assert!(
-                    sparse_suffixes[s].len() >= 2,
-                    "four-bank s_hat_v requires at least two suffix coordinates"
-                );
-                collapse_s_hat_v_quad(p, &sparse_suffixes[s][..2])
-            } else {
-                p.to_vec()
-            };
+            sparse_s_hat_v[s] = p.to_vec();
         }
     }
-    crate::rstrace::ev("rs:col", 0);
     // Run the kernel only on claims that genuinely need fold_1b_rows.
     if use_split {
         match dense_needs_fold.len() {
@@ -4317,61 +2484,25 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
 
     struct ClaimWork {
         s_hat_v: Vec<F128>,
-        s_hat_v_quad: Option<Vec<F128>>,
-        s_hat_v_fold4: Option<Vec<F128>>,
-        s_hat_v_fold8: Option<Vec<F128>>,
         sumcheck_claim: F128,
         eq_r_dprime: Vec<F128>,
     }
     let mut work: Vec<ClaimWork> = Vec::with_capacity(n);
-    let f8late = sl2_f8late_enabled();
     for i in 0..n {
         challenger.observe_label(b"flock-ring-switch-v0");
         let s_hat_v: Vec<F128> = match kinds[i] {
-            Kind::Dense(d) => std::mem::take(&mut dense_s_hat_v[d]),
-            Kind::Sparse(s) => std::mem::take(&mut sparse_s_hat_v[s]),
+            Kind::Dense(d) => dense_s_hat_v[d].clone(),
+            Kind::Sparse(s) => sparse_s_hat_v[s].clone(),
         };
-        let s_hat_v_quad = precomputed_s_hat_v
-            .get(i)
-            .copied()
-            .flatten()
-            .filter(|precomputed| precomputed.len() == 4 * n_packed)
-            .map(<[F128]>::to_vec);
-        let s_hat_v_fold4 = precomputed_s_hat_v
-            .get(i)
-            .copied()
-            .flatten()
-            .filter(|precomputed| precomputed.len() == 16 * n_packed)
-            .map(<[F128]>::to_vec);
-        // Lane sl2 (`FLOCK_NO_SL2_F8LATE`): the 128 KiB copy is made inside
-        // the claim's own (parallel) tail instead of on this serial chain.
-        let s_hat_v_fold8 = if f8late {
-            None
-        } else {
-            precomputed_s_hat_v
-                .get(i)
-                .copied()
-                .flatten()
-                .filter(|precomputed| precomputed.len() == 64 * n_packed)
-                .map(<[F128]>::to_vec)
-        };
-        crate::rstrace::ev("rs:pre", i as u32);
         challenger.observe_f128_slice(&s_hat_v);
         let r_dprime = challenger.sample_f128_vec(LOG_PACKING);
-        crate::rstrace::ev("rs:smp", i as u32);
-        let eq_r_dprime = crate::lincheck::build_eq_table(&r_dprime);
-        crate::rstrace::ev("rs:eqt", i as u32);
+        let eq_r_dprime = build_eq(&r_dprime);
 
-        let mut s_hat_u = [F128::ZERO; 1usize << LOG_PACKING];
-        tensor_algebra_transpose_into(&s_hat_v, &mut s_hat_u);
+        let s_hat_u = tensor_algebra_transpose(&s_hat_v);
         let sumcheck_claim = inner_product(&s_hat_u, &eq_r_dprime);
-        crate::rstrace::ev("rs:ip", i as u32);
 
         work.push(ClaimWork {
             s_hat_v,
-            s_hat_v_quad,
-            s_hat_v_fold4,
-            s_hat_v_fold8,
             sumcheck_claim,
             eq_r_dprime,
         });
@@ -4381,197 +2512,13 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     // baked into eq_r_dprime[k] before building the Φ byte table, so the
     // fold output is γ_k · B_k directly. pcs combine just adds.
     let gammas_rs: Vec<F128> = (0..n).map(|_| challenger.sample_f128()).collect();
-    crate::rstrace::ev("rs:obs", 0);
 
-    // The production all-direct experiment also retains C's materialization
-    // factors. C has no four-bank witness statistic, so only AB carries the
-    // optional H-products used for the first two messages.
-    let retain_direct_c = cfg!(target_arch = "x86_64")
-        && l == (1usize << 25)
-        && n == 2
-        && work
-            .first()
-            .is_some_and(|claim| claim.s_hat_v_quad.is_some())
-        && matches!(kinds.as_slice(), [Kind::Dense(_), Kind::Dense(_)])
-        && !crate::sl2_env_set!("FLOCK_NO_OPEN_DIRECT_AB")
-        && !crate::sl2_env_set!("FLOCK_NO_OPEN_DIRECT_C");
-
-    // Per-claim tail body, shared verbatim by the sequential kill-switch
-    // route and the full-width ranked route (see `rs_tail_par_enabled`). The
-    // γs are already sampled, so this is challenger-free and pure per claim.
-    let tail_par = rs_tail_par_enabled();
-    let pre_a_cells: Vec<std::sync::Mutex<Option<PreParts>>> =
-        pre_a.into_iter().map(std::sync::Mutex::new).collect();
-    let claim_output =
-        |i: usize, mut w: ClaimWork, g: F128| -> (RingSwitchProof, RingSwitchBatchOutput) {
-            crate::rstrace::ev("rs:c0", i as u32);
-            let mut scaled_eq_r_dprime = crate::alloc_uninit_vec::<F128>(w.eq_r_dprime.len());
-            crate::field::f128_slice::scale_slice(&mut scaled_eq_r_dprime, &w.eq_r_dprime, g);
-            let wants_direct = !elide_basis
-                && (w.s_hat_v_quad.is_some() || (retain_direct_c && i == 1));
-            #[cfg(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "avx512vbmi",
-                target_feature = "vpclmulqdq",
-                target_feature = "gfni"
-            ))]
-            let skip_table =
-                elide_basis && tail_par && !df8_state_direct_disabled() && w.s_hat_v_fold4.is_none();
-            #[cfg(not(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "avx512vbmi",
-                target_feature = "vpclmulqdq",
-                target_feature = "gfni"
-            )))]
-            let skip_table = false;
-            let table = if skip_table {
-                Vec::new()
-            } else {
-                build_fold_byte_table(&scaled_eq_r_dprime)
-            };
-            let direct_fold2 = match kinds[i] {
-                Kind::Dense(d) if wants_direct && use_split && dense_suffixes[d].len() >= 2 => {
-                    let suffix = dense_suffixes[d];
-                    let low_eq: [F128; 4] = build_eq(&suffix[..2])
-                        .try_into()
-                        .expect("two-coordinate eq has four entries");
-                    let products = w.s_hat_v_quad.as_deref().map(|quad| {
-                        let mut products = [F128::ZERO; 16];
-                        let mut scaled_bank = vec![F128::ZERO; n_packed];
-                        for e in 0..4 {
-                            let bank = &quad[e * n_packed..(e + 1) * n_packed];
-                            for d_low in 0..4 {
-                                for p in 0..n_packed {
-                                    scaled_bank[p] = low_eq[d_low] * bank[p];
-                                }
-                                let transposed = tensor_algebra_transpose(&scaled_bank);
-                                products[e * 4 + d_low] =
-                                    inner_product(&transposed, &scaled_eq_r_dprime);
-                            }
-                        }
-                        products
-                    });
-                    let tail = &suffix[2..];
-                    let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
-                    Some(DirectFold2Factors {
-                        eq_lo,
-                        eq_hi,
-                        low_eq,
-                        table: table.clone(),
-                        products,
-                    })
-                }
-                _ => None,
-            };
-            let direct_fold4 = match (kinds[i], w.s_hat_v_fold4.as_deref()) {
-                (Kind::Dense(d), Some(fold4)) if use_split && dense_suffixes[d].len() >= 4 => {
-                    let suffix = dense_suffixes[d];
-                    let low_eq: [F128; 16] = build_eq(&suffix[..4])
-                        .try_into()
-                        .expect("four-coordinate eq has sixteen entries");
-                    let products = direct_fold4_products(fold4, &low_eq, &scaled_eq_r_dprime);
-                    let tail = &suffix[4..];
-                    let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
-                    Some(DirectFold4Factors {
-                        eq_lo,
-                        eq_hi,
-                        low_eq,
-                        table: table.clone(),
-                        products,
-                    })
-                }
-                _ => None,
-            };
-            let fold8_borrowed: Option<&[F128]> = if f8late {
-                precomputed_s_hat_v
-                    .get(i)
-                    .copied()
-                    .flatten()
-                    .filter(|precomputed| precomputed.len() == 64 * n_packed)
-            } else {
-                None
-            };
-            #[cfg(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "avx512vbmi",
-                target_feature = "vpclmulqdq",
-                target_feature = "gfni"
-            ))]
-            let fast8 = match (kinds[i], fold8_borrowed) {
-                (Kind::Dense(d), Some(fold8)) if use_split && dense_suffixes[d].len() >= 6 && skip_table => {
-                    Some(build_direct_fold8_factors_from_slice(
-                        fold8,
-                        dense_suffixes[d],
-                        &scaled_eq_r_dprime,
-                        pre_a_cells[i]
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .take()
-                            .or_else(|| early_a[i].as_ref().and_then(|e| e.take())),
-                    ))
-                }
-                _ => None,
-            };
-            #[cfg(not(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "avx512vbmi",
-                target_feature = "vpclmulqdq",
-                target_feature = "gfni"
-            )))]
-            let fast8: Option<DirectFold8Factors> = None;
-            let fold8_owned = if fast8.is_some() {
-                None
-            } else {
-                match fold8_borrowed {
-                    Some(p) => Some(p.to_vec()),
-                    None => w.s_hat_v_fold8.take(),
-                }
-            };
-            let direct_fold8 = if fast8.is_some() { fast8 } else { match (kinds[i], fold8_owned) {
-                (Kind::Dense(d), Some(fold8)) if use_split && dense_suffixes[d].len() >= 6 => {
-                    #[cfg(all(
-                        target_arch = "x86_64",
-                        target_feature = "avx512f",
-                        target_feature = "avx512vbmi",
-                        target_feature = "vpclmulqdq",
-                        target_feature = "gfni"
-                    ))]
-                    let factors = if skip_table {
-                        build_direct_fold8_factors_reusing_a_state_from_generators(
-                            fold8,
-                            dense_suffixes[d],
-                            &scaled_eq_r_dprime,
-                        )
-                    } else {
-                        build_direct_fold8_factors_reusing_a_state(
-                            fold8,
-                            dense_suffixes[d],
-                            &table,
-                            tail_par,
-                        )
-                    };
-                    #[cfg(not(all(
-                        target_arch = "x86_64",
-                        target_feature = "avx512f",
-                        target_feature = "avx512vbmi",
-                        target_feature = "vpclmulqdq",
-                        target_feature = "gfni"
-                    )))]
-                    let factors = build_direct_fold8_factors_reusing_a_state(
-                        fold8,
-                        dense_suffixes[d],
-                        &table,
-                        tail_par,
-                    );
-                    Some(factors)
-                }
-                _ => None,
-            } };
-            crate::rstrace::ev("rs:f8", i as u32);
+    let results: Vec<(RingSwitchProof, RingSwitchBatchOutput)> = work
+        .into_iter()
+        .zip(gammas_rs.iter())
+        .enumerate()
+        .map(|(i, (w, &g))| {
+            let scaled_eq_r_dprime: Vec<F128> = w.eq_r_dprime.iter().map(|x| g * *x).collect();
             let rs_eq_ind = match kinds[i] {
                 Kind::Dense(d) => {
                     if use_split {
@@ -4579,26 +2526,11 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                         // table so pcs's combine folds each slot directly into
                         // `b_combined` (no 2^(m-7) materialize + readback). The
                         // table build is the only work done here (16·256 adds).
-                        if elide_basis {
-                            // Dead basis: only `RsEqInd::len()` is observed.
-                            // Preserve the logical tensor shape without
-                            // allocating or zeroing factors no caller reads.
-                            let n_lo = split_n_lo(dense_suffixes[d].len());
-                            let n_hi = dense_suffixes[d].len() - n_lo;
-                            RsEqInd::DeferredDense {
-                                eq_lo: Vec::new(),
-                                eq_hi: Vec::new(),
-                                table,
-                                logical_len: (1usize << n_lo) * (1usize << n_hi),
-                            }
-                        } else {
-                            let (eq_lo, eq_hi) = &dense_splits[d];
-                            RsEqInd::DeferredDense {
-                                eq_lo: eq_lo.clone(),
-                                eq_hi: eq_hi.clone(),
-                                table,
-                                logical_len: eq_lo.len() * eq_hi.len(),
-                            }
+                        let (eq_lo, eq_hi) = &dense_splits[d];
+                        RsEqInd::DeferredDense {
+                            eq_lo: eq_lo.clone(),
+                            eq_hi: eq_hi.clone(),
+                            table: build_fold_byte_table(&scaled_eq_r_dprime),
                         }
                     } else {
                         RsEqInd::Dense(fold_b128_elems(&dense_tensors[d], &scaled_eq_r_dprime))
@@ -4614,45 +2546,10 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                 RingSwitchBatchOutput {
                     rs_eq_ind,
                     sumcheck_claim: w.sumcheck_claim,
-                    direct_fold2,
-                    direct_fold4,
-                    direct_fold8,
                 },
             )
-        };
-    // Indexed parallel collect preserves claim order, so the output vector —
-    // and with it every transcript-visible byte downstream — is identical to
-    // the sequential route.
-    // OUTER dispatch, over CLAIMS. The ranked shape carries exactly two
-    // claims against sixteen pinned workers, and `into_par_iter()` at n=2
-    // pays a pool entry, a split and two steals to hand out two items, on a
-    // tail that `rs_tail_par_enabled`'s own doc says "sits alone on the
-    // Fiat-Shamir chain". The width that actually matters is INSIDE
-    // `claim_output` (each claim's sixty-four independent bank chains and the
-    // wide message kernel), and it is still governed by `tail_par`, which this
-    // does not touch: below the threshold each claim runs on the calling
-    // thread and owns the whole pool for its own inner work in turn.
-    // Transcript-invariant: `claim_output` is pure in `(i, w, g)` and the
-    // indexed collect preserves claim order on both routes, which is the same
-    // equivalence the existing sequential kill-switch route already relies on
-    // and that `direct_fold8_factor_tail_par_matches_seq` pins.
-    const TAIL_PAR_MIN_CLAIMS: usize = 4;
-    let n_claims = work.len();
-    let results: Vec<(RingSwitchProof, RingSwitchBatchOutput)> =
-        if tail_par && (n_claims >= TAIL_PAR_MIN_CLAIMS || (n_claims >= 2 && rs_claims_par_enabled())) {
-            use rayon::prelude::*;
-            work.into_par_iter()
-                .zip(gammas_rs.par_iter())
-                .enumerate()
-                .map(|(i, (w, &g))| claim_output(i, w, g))
-                .collect()
-        } else {
-            work.into_iter()
-                .zip(gammas_rs.iter())
-                .enumerate()
-                .map(|(i, (w, &g))| claim_output(i, w, g))
-                .collect()
-        };
+        })
+        .collect();
 
     if trace {
         eprintln!(
@@ -4662,51 +2559,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
         );
     }
 
-    for e in early_a.iter().flatten() {
-        drop(e.take());
-    }
     (results, gammas_rs)
-}
-
-/// Lane sl2: an A state built beside the observe chain (claim-once).
-struct EarlyA {
-    // 0 = queued, 1 = running, 2 = done, 3 = cancelled/taken.
-    state: std::sync::atomic::AtomicU8,
-    val: std::sync::Mutex<Option<PreParts>>,
-}
-
-/// Lane sl2: a claim's challenge-free factor parts (A state, tail eq split).
-struct PreParts {
-    a: Vec<F128>,
-    eq: (Vec<F128>, Vec<F128>),
-}
-
-impl EarlyA {
-    /// Wait for a running job, cancel a queued one; take the result if any.
-    fn take(&self) -> Option<PreParts> {
-        use std::sync::atomic::Ordering;
-        loop {
-            match self.state.load(Ordering::Acquire) {
-                0 => {
-                    if self.state.compare_exchange(0, 3, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                        return None;
-                    }
-                }
-                1 => std::hint::spin_loop(),
-                2 => {
-                    self.state.store(3, Ordering::Release);
-                    return self.val.lock().unwrap_or_else(|e| e.into_inner()).take();
-                }
-                _ => return None,
-            }
-        }
-    }
-}
-
-fn sl2_aearly_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_AEARLY").is_none());
-    *ON
 }
 
 /// Verifier side of the ring-switching reduction.
@@ -4944,65 +2797,6 @@ mod tests {
     use crate::pcs::pack::pack_witness;
     use crate::zerocheck::univariate_skip::build_eq;
 
-    /// The vectorized quad collapse must be bit-identical to the scalar
-    /// bank-major accumulation it replaced (same per-element op, same order),
-    /// and the identity must have teeth: one corrupted bank entry changes
-    /// the collapse.
-    #[test]
-    fn collapse_s_hat_v_quad_matches_scalar_oracle() {
-        use crate::challenger::Challenger;
-        let mut rng = crate::challenger::RandomChallenger::new(0x_9AD_C011);
-        let n_packed = 1usize << LOG_PACKING;
-        let mut quad: Vec<F128> = (0..4 * n_packed).map(|_| rng.sample_f128()).collect();
-        let low_point: Vec<F128> = (0..2).map(|_| rng.sample_f128()).collect();
-
-        let low_eq = build_eq(&low_point);
-        let mut want = vec![F128::ZERO; n_packed];
-        for q in 0..4 {
-            for b in 0..n_packed {
-                want[b] += low_eq[q] * quad[q * n_packed + b];
-            }
-        }
-
-        let got = collapse_s_hat_v_quad(&quad, &low_point);
-        assert_eq!(got, want, "quad collapse vs scalar oracle");
-
-        // Negative control: one corrupted bank entry must not still match.
-        quad[n_packed + 3] += F128::ONE;
-        let bad = collapse_s_hat_v_quad(&quad, &low_point);
-        assert_ne!(bad, want, "corrupted bank entry went undetected");
-    }
-
-    /// Deferred-reduction IP is bit-identical to the historical per-product
-    /// reduce (`acc += x * y`), including the AVX-512 wide path on this cfg.
-    #[test]
-    fn inner_product_deferred_matches_naive() {
-        use crate::challenger::Challenger;
-        let mut rng = crate::challenger::RandomChallenger::new(0x_1B_D07);
-        for &n in &[0usize, 1, 3, 4, 5, 7, 8, 16, 128, 243] {
-            let a: Vec<F128> = (0..n).map(|_| rng.sample_f128()).collect();
-            let b: Vec<F128> = (0..n).map(|_| rng.sample_f128()).collect();
-            let mut naive = F128::ZERO;
-            for (&x, &y) in a.iter().zip(b.iter()) {
-                naive += x * y;
-            }
-            let got = inner_product(&a, &b);
-            assert_eq!(got, naive, "n={n} wide-or-unreduced ≠ per-product");
-            let portable = inner_product_unreduced(&a, &b);
-            assert_eq!(portable, naive, "n={n} portable unreduced ≠ per-product");
-            #[cfg(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            ))]
-            {
-                // SAFETY: cfg gate.
-                let wide = unsafe { inner_product_wide(&a, &b) };
-                assert_eq!(wide, naive, "n={n} WideGhashX4 ≠ per-product");
-            }
-        }
-    }
-
     /// Binary-query specialization matches the general path bit-for-bit.
     #[test]
     fn eval_rs_eq_finish_binary_q_matches_general() {
@@ -5221,31 +3015,9 @@ mod tests {
     #[test]
     fn transpose_is_involution() {
         let mut rng = Rng::new(0xDEAD);
-        for _ in 0..32 {
-            let s_hat_v: Vec<F128> = (0..128).map(|_| rng.f128()).collect();
-            let once = tensor_algebra_transpose(&s_hat_v);
-            assert_eq!(once, tensor_algebra_transpose_scalar(&s_hat_v));
-            let twice = tensor_algebra_transpose(&once);
-            assert_eq!(s_hat_v, twice);
-        }
-        for s_hat_v in [
-            vec![F128::ZERO; 128],
-            vec![F128::new(u64::MAX, u64::MAX); 128],
-            (0..128)
-                .map(|i| {
-                    if i < 64 {
-                        F128::new(1u64 << i, 0)
-                    } else {
-                        F128::new(0, 1u64 << (i - 64))
-                    }
-                })
-                .collect(),
-        ] {
-            assert_eq!(
-                tensor_algebra_transpose(&s_hat_v),
-                tensor_algebra_transpose_scalar(&s_hat_v),
-            );
-        }
+        let s_hat_v: Vec<F128> = (0..128).map(|_| rng.f128()).collect();
+        let twice = tensor_algebra_transpose(&tensor_algebra_transpose(&s_hat_v));
+        assert_eq!(s_hat_v, twice);
     }
 
     #[test]
@@ -5564,310 +3336,9 @@ mod tests {
             let eq_x_outer = build_eq(&x_outer);
             let z_vec = partial_fold_packed_z(&z_packed_lincheck, m, k_log, &eq_x_outer);
             let got = s_hat_v_from_z_vec(&z_vec, &x_inner_rest[1..]);
-            let quad = s_hat_v_quad_from_z_vec(&z_vec, &x_inner_rest[1..]);
-            let collapsed = collapse_s_hat_v_quad(&quad, &x_inner_rest[1..3]);
 
             assert_eq!(got, want, "s_hat_v mismatch at m={m}, k_log={k_log}");
-            assert_eq!(
-                collapsed, got,
-                "four-bank sufficient statistic mismatch at m={m}, k_log={k_log}"
-            );
         }
-    }
-
-    #[test]
-    fn direct_fold8_factor_tail_par_matches_seq() {
-        let mut rng = Rng::new(0x7A11_9A85_EEDF_08D8);
-        let n_packed = 1usize << LOG_PACKING;
-        // Cover the ranked tail length (13), the intake-test length (5), and
-        // the minimal legal split (4 — `split_n_lo` clamps at 4).
-        for &tail_len in &[4usize, 5, 13] {
-            let suffix: Vec<F128> = (0..(6 + tail_len)).map(|_| rng.f128()).collect();
-            let generators: Vec<F128> = (0..n_packed).map(|_| rng.f128()).collect();
-            let table = build_fold_byte_table(&generators);
-            let fold8: Vec<F128> = (0..64 * n_packed).map(|_| rng.f128()).collect();
-            let seq = build_direct_fold8_factors(&fold8, &suffix, &table, false);
-            let par = build_direct_fold8_factors(&fold8, &suffix, &table, true);
-            assert_eq!(par.a_state, seq.a_state, "a_state tail_len={tail_len}");
-            assert_eq!(par.w_state, seq.w_state, "w_state tail_len={tail_len}");
-            assert_eq!(par.round0, seq.round0, "round0 tail_len={tail_len}");
-            assert_eq!(par.eq_lo, seq.eq_lo, "eq_lo tail_len={tail_len}");
-            assert_eq!(par.eq_hi, seq.eq_hi, "eq_hi tail_len={tail_len}");
-            // Negative control: one corrupted statistic entry must reach both
-            // the transposed state and the cached round-0 message.
-            let mut bad = fold8.clone();
-            bad[1] += F128::ONE;
-            let bad_par = build_direct_fold8_factors(&bad, &suffix, &table, true);
-            assert_ne!(
-                bad_par.a_state, seq.a_state,
-                "corrupted statistic went undetected in a_state tail_len={tail_len}"
-            );
-            assert_ne!(
-                bad_par.round0, seq.round0,
-                "corrupted statistic went undetected in round0 tail_len={tail_len}"
-            );
-        }
-    }
-
-    /// The gated `add_scaled` collapse must match the scalar accumulation
-    /// bit-for-bit, and a corrupted bank must be caught.
-    #[test]
-    fn collapse_s_hat_v_fold8_wide_matches_scalar_oracle() {
-        let mut rng = Rng::new(0xC011_A95E_F08D_5EED);
-        let n_packed = 1usize << LOG_PACKING;
-        let low_point: Vec<F128> = (0..6).map(|_| rng.f128()).collect();
-        let fold8: Vec<F128> = (0..64 * n_packed).map(|_| rng.f128()).collect();
-        let low_eq = build_eq(&low_point);
-        // Independent scalar oracle (the incumbent loop, restated).
-        let mut want = vec![F128::ZERO; n_packed];
-        for bank in 0..64 {
-            for packed in 0..n_packed {
-                want[packed] += low_eq[bank] * fold8[bank * n_packed + packed];
-            }
-        }
-        let got = collapse_s_hat_v_fold8(&fold8, &low_point);
-        assert_eq!(got, want, "gated collapse diverged from the scalar oracle");
-        let mut bad = fold8.clone();
-        bad[n_packed + 3] += F128::ONE;
-        assert_ne!(
-            collapse_s_hat_v_fold8(&bad, &low_point),
-            want,
-            "corrupted bank went undetected"
-        );
-    }
-
-    #[test]
-    fn sixtyfour_bank_fold8_intake_matches_ring_wire_and_product_oracle() {
-        use crate::challenger::FsChallenger;
-        use crate::lincheck::{pack_z_lincheck, partial_fold_packed_z};
-
-        const M: usize = 18;
-        const K_LOG: usize = 14;
-        const K_SKIP: usize = 6;
-        let mut rng = Rng::new(0xD1CE_F088);
-        let z = rng.bits(1 << M);
-        let packed = pack_witness(&z, M);
-        let z_packed_lincheck = pack_z_lincheck(&z, M, K_LOG);
-        let inner_rest: Vec<F128> = (0..(K_LOG - K_SKIP)).map(|_| rng.f128()).collect();
-        let outer: Vec<F128> = (0..(M - K_LOG)).map(|_| rng.f128()).collect();
-        let mut point = inner_rest.clone();
-        point.extend_from_slice(&outer);
-        let z_vec = partial_fold_packed_z(&z_packed_lincheck, M, K_LOG, &build_eq(&outer));
-        let fold8 = s_hat_v_fold8_from_z_vec(&z_vec, &inner_rest[1..]);
-        assert_eq!(fold8.len(), 64 * (1usize << LOG_PACKING));
-
-        let ordinary = s_hat_v_from_z_vec(&z_vec, &inner_rest[1..]);
-        assert_eq!(
-            collapse_s_hat_v_fold8(&fold8, &inner_rest[1..7]),
-            ordinary,
-            "suffix[..6] collapse must recover the transcript-visible statistic"
-        );
-        // The wider statistic must refine the fold4 one: folding retained
-        // coordinates 4 and 5 reproduces the 16-bank tensor bitwise.
-        let fold4 = s_hat_v_fold4_from_z_vec(&z_vec, &inner_rest[1..]);
-        let hi_eq = build_eq(&inner_rest[5..7]);
-        let n_packed = 1usize << LOG_PACKING;
-        for e in 0..16 {
-            for packed in 0..n_packed {
-                let reduced = (0..4).fold(F128::ZERO, |acc, qq| {
-                    acc + hi_eq[qq] * fold8[(e + 16 * qq) * n_packed + packed]
-                });
-                assert_eq!(
-                    fold4[e * n_packed + packed],
-                    reduced,
-                    "fold8 → fold4 reduction mismatch at e={e} packed={packed}"
-                );
-            }
-        }
-
-        let padding = PaddingSpec::dense(M);
-        let mut baseline_challenger = FsChallenger::new(b"direct-fold8-intake-wire");
-        let (baseline, baseline_gammas) = prove_batched_padded_with_precomputed(
-            &packed,
-            &[&point],
-            &[],
-            &padding,
-            &mut baseline_challenger,
-        );
-        let mut direct_challenger = FsChallenger::new(b"direct-fold8-intake-wire");
-        let (direct, direct_gammas) = prove_batched_padded_with_precomputed(
-            &packed,
-            &[&point],
-            &[Some(fold8.as_slice())],
-            &padding,
-            &mut direct_challenger,
-        );
-        assert_eq!(direct_gammas, baseline_gammas);
-        assert_eq!(direct[0].0, baseline[0].0);
-        assert_eq!(direct[0].1.sumcheck_claim, baseline[0].1.sumcheck_claim);
-        assert_eq!(
-            direct[0].1.rs_eq_ind.to_dense(),
-            baseline[0].1.rs_eq_ind.to_dense()
-        );
-        assert!(direct[0].1.direct_fold2.is_none());
-        assert!(direct[0].1.direct_fold4.is_none());
-        let factors = direct[0]
-            .1
-            .direct_fold8
-            .as_ref()
-            .expect("sixty-four-bank intake must expose DirectFold8Factors");
-        assert_eq!(factors.a_state.len(), 64 * (1usize << LOG_PACKING));
-        assert_eq!(factors.w_state.len(), 64 * (1usize << LOG_PACKING));
-        let basis = baseline[0].1.rs_eq_ind.to_dense();
-        let mut u0 = F128::ZERO;
-        let mut u2 = F128::ZERO;
-        for i in (0..packed.len()).step_by(2) {
-            let f0 = packed[i];
-            let f1 = packed[i + 1];
-            let b0 = basis[i];
-            let b1 = basis[i + 1];
-            u0 += f0 * b0;
-            u2 += (f0 + f1) * (b0 + b1);
-        }
-        assert_eq!(factors.round0, (u0, u2));
-    }
-
-    #[test]
-    fn quad_precompute_products_match_dense_ring_basis() {
-        use crate::challenger::FsChallenger;
-        use crate::lincheck::{pack_z_lincheck, partial_fold_packed_z};
-
-        const M: usize = 17;
-        const K_LOG: usize = 13;
-        const K_SKIP: usize = 6;
-        let mut rng = Rng::new(0xD1CE_AB0C);
-        let z = rng.bits(1 << M);
-        let packed = pack_witness(&z, M);
-        let z_packed_lincheck = pack_z_lincheck(&z, M, K_LOG);
-        let inner_rest: Vec<F128> = (0..(K_LOG - K_SKIP)).map(|_| rng.f128()).collect();
-        let outer: Vec<F128> = (0..(M - K_LOG)).map(|_| rng.f128()).collect();
-        let mut ab_point = inner_rest.clone();
-        ab_point.extend_from_slice(&outer);
-        let z_vec = partial_fold_packed_z(&z_packed_lincheck, M, K_LOG, &build_eq(&outer));
-        let quad = s_hat_v_quad_from_z_vec(&z_vec, &inner_rest[1..]);
-        let padding = PaddingSpec::dense(M);
-
-        let mut baseline_challenger = FsChallenger::new(b"direct-ab-ring-oracle");
-        let (baseline, baseline_gammas) = prove_batched_padded_with_precomputed(
-            &packed,
-            &[&ab_point],
-            &[],
-            &padding,
-            &mut baseline_challenger,
-        );
-        let mut direct_challenger = FsChallenger::new(b"direct-ab-ring-oracle");
-        let (direct, direct_gammas) = prove_batched_padded_with_precomputed(
-            &packed,
-            &[&ab_point],
-            &[Some(quad.as_slice())],
-            &padding,
-            &mut direct_challenger,
-        );
-
-        assert_eq!(direct_gammas, baseline_gammas);
-        assert_eq!(direct[0].0, baseline[0].0);
-        assert_eq!(direct[0].1.sumcheck_claim, baseline[0].1.sumcheck_claim);
-        assert_eq!(
-            direct[0].1.rs_eq_ind.to_dense(),
-            baseline[0].1.rs_eq_ind.to_dense()
-        );
-        let ab_basis = baseline[0].1.rs_eq_ind.to_dense();
-        let mut product_oracle = [F128::ZERO; 16];
-        for high in 0..(packed.len() / 4) {
-            for e in 0..4 {
-                for d in 0..4 {
-                    product_oracle[4 * e + d] += packed[4 * high + e] * ab_basis[4 * high + d];
-                }
-            }
-        }
-        assert_eq!(
-            direct[0].1.direct_fold2.as_ref().unwrap().products,
-            Some(product_oracle)
-        );
-    }
-
-    #[test]
-    fn sixteen_bank_fold4_intake_matches_ring_wire_and_product_oracle() {
-        use crate::challenger::FsChallenger;
-        use crate::lincheck::{pack_z_lincheck, partial_fold_packed_z};
-
-        const M: usize = 17;
-        const K_LOG: usize = 13;
-        const K_SKIP: usize = 6;
-        let mut rng = Rng::new(0xD1CE_F016);
-        let z = rng.bits(1 << M);
-        let packed = pack_witness(&z, M);
-        let z_packed_lincheck = pack_z_lincheck(&z, M, K_LOG);
-        let inner_rest: Vec<F128> = (0..(K_LOG - K_SKIP)).map(|_| rng.f128()).collect();
-        let outer: Vec<F128> = (0..(M - K_LOG)).map(|_| rng.f128()).collect();
-        let mut point = inner_rest.clone();
-        point.extend_from_slice(&outer);
-        let z_vec = partial_fold_packed_z(&z_packed_lincheck, M, K_LOG, &build_eq(&outer));
-        let fold4 = s_hat_v_fold4_from_z_vec(&z_vec, &inner_rest[1..]);
-        assert_eq!(fold4.len(), 16 * (1usize << LOG_PACKING));
-
-        let ordinary = s_hat_v_from_z_vec(&z_vec, &inner_rest[1..]);
-        assert_eq!(
-            collapse_s_hat_v_fold4(&fold4, &inner_rest[1..5]),
-            ordinary,
-            "suffix[..4] collapse must recover the transcript-visible statistic"
-        );
-        // The sixteen banks collapse under suffix[2..4] to the four-bank quad.
-        let quad = s_hat_v_quad_from_z_vec(&z_vec, &inner_rest[1..]);
-        let low_q = build_eq(&inner_rest[3..5]);
-        let n_packed = 1usize << LOG_PACKING;
-        for e in 0..4 {
-            for p in 0..n_packed {
-                let mut acc = F128::ZERO;
-                for q in 0..4 {
-                    acc += low_q[q] * fold4[(e + 4 * q) * n_packed + p];
-                }
-                assert_eq!(acc, quad[e * n_packed + p]);
-            }
-        }
-
-        let padding = PaddingSpec::dense(M);
-        let mut baseline_challenger = FsChallenger::new(b"direct-fold4-intake-wire");
-        let (baseline, baseline_gammas) = prove_batched_padded_with_precomputed(
-            &packed,
-            &[&point],
-            &[],
-            &padding,
-            &mut baseline_challenger,
-        );
-        let mut direct_challenger = FsChallenger::new(b"direct-fold4-intake-wire");
-        let (direct, direct_gammas) = prove_batched_padded_with_precomputed(
-            &packed,
-            &[&point],
-            &[Some(fold4.as_slice())],
-            &padding,
-            &mut direct_challenger,
-        );
-
-        assert_eq!(direct_gammas, baseline_gammas);
-        assert_eq!(direct[0].0, baseline[0].0);
-        assert_eq!(direct[0].1.sumcheck_claim, baseline[0].1.sumcheck_claim);
-        assert_eq!(
-            direct[0].1.rs_eq_ind.to_dense(),
-            baseline[0].1.rs_eq_ind.to_dense()
-        );
-        assert!(direct[0].1.direct_fold2.is_none());
-        let factors = direct[0]
-            .1
-            .direct_fold4
-            .as_ref()
-            .expect("sixteen-bank intake must expose DirectFold4Factors");
-        let basis = baseline[0].1.rs_eq_ind.to_dense();
-        let mut product_oracle = [F128::ZERO; 256];
-        for high in 0..packed.len() / 16 {
-            for e in 0..16 {
-                for d in 0..16 {
-                    product_oracle[16 * e + d] += packed[16 * high + e] * basis[16 * high + d];
-                }
-            }
-        }
-        assert_eq!(factors.products, product_oracle);
-        assert_eq!(factors.low_eq.to_vec(), build_eq(&inner_rest[1..5]));
     }
 
     /// `prove_batched_padded_with_precomputed` is byte-identical to the
@@ -6269,144 +3740,4 @@ mod tests {
             }
         }
     }
-
-    /// Current 512-GHASH bit-loop (pre-mul_by_x rewrite). Oracle only.
-    fn build_direct_fold2_table_ghash_oracle(
-        low_eq: &[F128; 4],
-        fold_weight: &[F128; 4],
-        base: &[F128],
-    ) -> Vec<F128> {
-        let mut out = vec![F128::ZERO; FOLD_TABLE_TOTAL];
-        let mut generators = [F128::ZERO; 128];
-        for (bit, generator) in generators.iter_mut().enumerate() {
-            let basis = if bit < 64 {
-                F128::new(1u64 << bit, 0)
-            } else {
-                F128::new(0, 1u64 << (bit - 64))
-            };
-            for d in 0..4 {
-                *generator += fold_weight[d] * fold_one_slot(basis * low_eq[d], base);
-            }
-        }
-        for byte in 0..FOLD_N_BYTES {
-            let table = &mut out[byte * FOLD_TABLE_SIZE..(byte + 1) * FOLD_TABLE_SIZE];
-            table[0] = F128::ZERO;
-            for (bit, &generator) in generators[byte * 8..byte * 8 + 8].iter().enumerate() {
-                let half = 1usize << bit;
-                for value in 0..half {
-                    table[value + half] = table[value] + generator;
-                }
-            }
-        }
-        out
-    }
-
-    /// `build_direct_fold2_table` mul_by_x chains == the 512-GHASH bit-loop.
-    #[test]
-    fn build_direct_fold2_table_matches_ghash_bit_loop() {
-        let mut rng = Rng::new(0xF01D2_C47);
-        for trial in 0..4 {
-            let eq_r_dprime: Vec<F128> = (0..128).map(|_| rng.f128()).collect();
-            let base = build_fold_byte_table(&eq_r_dprime);
-            let low_eq = [rng.f128(), rng.f128(), rng.f128(), rng.f128()];
-            let fold_weight = [rng.f128(), rng.f128(), rng.f128(), rng.f128()];
-            let got = build_direct_fold2_table(&low_eq, &fold_weight, &base);
-            let expect = build_direct_fold2_table_ghash_oracle(&low_eq, &fold_weight, &base);
-            assert_eq!(got, expect, "trial {trial}");
-            // Same Φ columns: folding a random x through the table equals
-            // Σ_d fold_weight[d] * Φ(low_eq[d] * x).
-            for _ in 0..32 {
-                let x = rng.f128();
-                let mut acc = F128::ZERO;
-                for d in 0..4 {
-                    acc += fold_weight[d] * fold_one_slot(low_eq[d] * x, &base);
-                }
-                assert_eq!(fold_one_slot(x, &got), acc, "trial {trial} slot");
-            }
-        }
-    }
-
-    /// The GFNI materializer consumes the composed map's 128 columns
-    /// directly; expanding them remains an exact oracle for that shortcut.
-    #[test]
-    fn compose_block_cols_match_expanded_table() {
-        let mut rng = Rng::new(0xC011_5F01_D8);
-        for trial in 0..4 {
-            let generators: Vec<F128> = (0..128).map(|_| rng.f128()).collect();
-            let base = build_direct_fold8_table_from_generators(&generators);
-            let e_hi = rng.f128();
-            let cols = compose_block_cols(&base, e_hi);
-            let mut expanded = vec![F128::ZERO; FOLD_TABLE_TOTAL];
-            compose_block_table(&base, e_hi, &mut expanded);
-            for (bit, &col) in cols.iter().enumerate() {
-                assert_eq!(expanded[(bit / 8) * 256 + (1 << (bit % 8))], col);
-            }
-            for _ in 0..32 {
-                let x = rng.f128();
-                assert_eq!(
-                    fold_one_slot(x, &expanded),
-                    fold_one_slot(x * e_hi, &base),
-                    "trial {trial}"
-                );
-            }
-        }
-    }
-
-    /// The open-phase materializers hand `compose_block_table` a RECYCLED
-    /// buffer (see `crate::scratch::LocalBuf`), so its documented
-    /// write-before-read contract has to hold against arbitrary stale bytes,
-    /// not just against zeros. Composing into a dirty buffer must reproduce
-    /// the allocating form's output exactly.
-    #[test]
-    fn compose_block_table_ignores_stale_contents() {
-        let mut rng = Rng::new(0x5C_2A_7C_40_1D);
-        for trial in 0..4 {
-            let generators: Vec<F128> = (0..128).map(|_| rng.f128()).collect();
-            let base = build_direct_fold8_table_from_generators(&generators);
-            let e_hi = rng.f128();
-            // The allocating form: a freshly zeroed buffer.
-            let mut zeroed = vec![F128::ZERO; FOLD_TABLE_TOTAL];
-            compose_block_table(&base, e_hi, &mut zeroed);
-            // The pooled form: whatever an earlier job left behind.
-            let mut dirty: Vec<F128> = (0..FOLD_TABLE_TOTAL).map(|_| rng.f128()).collect();
-            compose_block_table(&base, e_hi, &mut dirty);
-            assert_eq!(dirty, zeroed, "trial {trial}");
-        }
-    }
-
-    /// Parallel one-mul doubling is bit-identical to the two-GHASH formula.
-    #[test]
-    fn build_eq_parallel_matches_two_mul() {
-        fn two_mul(r: &[F128]) -> Vec<F128> {
-            let n = r.len();
-            let mut t = vec![F128::ZERO; 1usize << n];
-            t[0] = F128::ONE;
-            for i in 0..n {
-                let r_i = r[i];
-                let one_plus_r = F128::ONE + r_i;
-                let half = 1usize << i;
-                for x in 0..half {
-                    let v = t[x];
-                    t[x + half] = v * r_i;
-                    t[x] = v * one_plus_r;
-                }
-            }
-            t
-        }
-        let mut rng = Rng::new(0xB01D_E0);
-        // Include a width past PAR_THRESHOLD (2^12) so the rayon arm runs.
-        for &n in &[0usize, 1, 4, 8, 12, 13] {
-            let r: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
-            assert_eq!(build_eq_parallel(&r), two_mul(&r), "n={n}");
-            assert_eq!(build_eq_parallel(&r), build_eq(&r), "vs sequential n={n}");
-        }
-    }
-}
-
-/// Bank-major collapses (`FLOCK_NO_RS_BANK_MAJOR` restores the per-bank
-/// scale/accumulate leaves).
-fn rs_bank_major_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RS_BANK_MAJOR").is_none());
-    *ON
 }

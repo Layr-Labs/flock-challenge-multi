@@ -36,11 +36,10 @@ pub(super) unsafe fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: 
         t += 2;
     }
 
-    // Char-2 one-mul tail (NEON body already uses even + r*(even+odd)).
+    let one_plus_r = F128::ONE + r;
     while t < dst.len() {
         let s = 2 * (base + t);
-        let even = src[s];
-        dst[t] = even + r * (even + src[s + 1]);
+        dst[t] = src[s] * one_plus_r + src[s + 1] * r;
         t += 1;
     }
 }

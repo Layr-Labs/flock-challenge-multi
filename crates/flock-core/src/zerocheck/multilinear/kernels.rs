@@ -6,4 +6,4 @@ pub(super) mod aarch64;
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
-pub(crate) mod x86_64;
+pub(super) mod x86_64;
