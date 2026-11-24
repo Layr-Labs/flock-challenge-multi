@@ -4848,6 +4848,17 @@ impl Blake3Setup {
         blocks: &[Compression],
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
+        let probe_start = std::time::Instant::now();
+        let r = self.prove_fast_dispatch(blocks, challenger);
+        crate::profile_pad::maybe_pad(probe_start);
+        r
+    }
+
+    fn prove_fast_dispatch<Ch: Challenger>(
+        &self,
+        blocks: &[Compression],
+        challenger: &mut Ch,
+    ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         // Counts *outer* entries only (the extra warm-up proves below go
@@ -4995,7 +5006,7 @@ impl Blake3Setup {
         if !crate::seed_pipe::is_timed_speculative_prove() {
             flock_core::rstrace::reset();
         }
-        flock_core::gaptime::abs("inner begin");
+        flock_core::gaptime::begin_attempt(crate::seed_pipe::is_timed_speculative_prove());
         flock_core::gaptime::begin("blake3 prove_fast");
         match self.r1cs.layout {
             flock_core::r1cs::WitnessLayout::RowMajor => {
