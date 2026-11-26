@@ -769,7 +769,7 @@ static TREE_COLLAPSED: Mutex<Vec<(usize, u8, bool)>> = Mutex::new(Vec::new());
 
 fn tree_recollapse_every_park() -> bool {
     static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_TREE_RECOLLAPSE").is_some());
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_TREE_RECOLLAPSE").is_none());
     *ON
 }
 

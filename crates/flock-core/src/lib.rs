@@ -1872,7 +1872,7 @@ thread_local! {
 
 fn always_advise() -> bool {
     static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ALWAYS_ADVISE").is_some());
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ALWAYS_ADVISE").is_none());
     *ON
 }
 

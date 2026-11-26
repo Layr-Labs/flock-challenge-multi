@@ -5691,7 +5691,7 @@ fn c4_join_swap_enabled() -> bool {
 
 fn open_nt_min_half_x86() -> usize {
     static MIN: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        if std::env::var_os("FLOCK_OPEN_NT_17").is_some() {
+        if std::env::var_os("FLOCK_NO_OPEN_NT_17").is_none() {
             1usize << 17
         } else {
             1usize << 21

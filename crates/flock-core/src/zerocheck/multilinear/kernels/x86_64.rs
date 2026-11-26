@@ -2526,7 +2526,7 @@ pub(crate) fn zc_lm_handoff_enabled() -> bool {
 
 pub(crate) fn zc_defer_split_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ZC_DEFER_SPLIT").is_some());
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_DEFER_SPLIT").is_none());
     *ON
 }
 

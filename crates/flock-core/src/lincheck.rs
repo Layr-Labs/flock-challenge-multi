@@ -350,7 +350,7 @@ impl CompactSched {
 /// output is bit-identical.
 fn sl1_rc_warm_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_SL1_RC_WARM").is_some());
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL1_RC_WARM").is_none());
     *ON
 }
 
