@@ -3451,6 +3451,7 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool,
     target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512dq,gfni")
 )]
 pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
+    slice_preps: Option<&RankedClosedWindowPreps>,
     inputs: OctaInputs<'_>,
     z: *mut u32,
     a: *mut u32,
@@ -3462,6 +3463,14 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         // Only the all-elide provenance state selects the ranked static
         // windows. Partial/cold states still read both rings in every window.
         let ranked_static = elide == [true; 3] && proj.plan.offsets_eligible(2);
+        // The specialized drain was validated for this compression metadata.
+        // Preserve the generic route for every other public API input.
+        let slice_preps = slice_preps.filter(|_| match &inputs {
+            OctaInputs::Blocks(group) => group.iter().all(|block| {
+                block.2 <= u32::MAX as u64 && block.3 == 64 && block.4 == 11
+            }),
+            OctaInputs::Closed { .. } => false,
+        });
         let prepared = match inputs {
             OctaInputs::Blocks(inputs) => {
                 let ptrs = [
@@ -3544,6 +3553,30 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             }
             OctaInputs::Closed { init, base } => prepare_closed_inputs(init, base),
         };
+        if let Some(preps) = slice_preps {
+            debug_assert!(ranked_static && proj.one_rows_elided && proj.w30_elided);
+            debug_assert!(!proj.cross_quarter);
+            build_octa_witness_ab_stream_prepared_elide::<true, 0>(
+                &prepared,
+                z,
+                a,
+                b,
+                proj,
+                elide,
+                ranked_static,
+                Some(preps),
+                #[cfg(all(
+                    target_feature = "avx512f",
+                    target_feature = "avx512bw",
+                    target_feature = "avx512vbmi",
+                    target_feature = "gfni",
+                    target_feature = "vpclmulqdq"
+                ))]
+                None,
+                false,
+            );
+            return;
+        }
         build_octa_witness_ab_stream_prepared_elide::<false,0>(
             &prepared,
             z,
@@ -4414,6 +4447,7 @@ mod tests {
         let mut ab_seed = Box::new(AlignedAbFull([0u8; 8 * 32 * 64]));
         unsafe {
             build_octa_witness_ab_stream_elide(
+                None,
                 OctaInputs::Closed { init, base: 0 },
                 z_seed.0.as_mut_ptr(),
                 a_seed.0.as_mut_ptr(),
@@ -4434,7 +4468,15 @@ mod tests {
             );
         }
 
-        for base in [0usize, 8, 240, 131_064] {
+        for (base, borrowed) in [
+            (0usize, false),
+            (8, false),
+            (240, false),
+            (131_064, false),
+            (262_136, true),
+        ] {
+            let blocks: [Compression; 8] =
+                std::array::from_fn(|lane| crate::seed_pipe::gen_block(init, base + lane));
             let mut z_ref = z_seed.clone();
             let mut a_ref = a_seed.clone();
             let mut b_ref = b_seed.clone();
@@ -4466,7 +4508,12 @@ mod tests {
 
             unsafe {
                 build_octa_witness_ab_stream_elide(
-                    OctaInputs::Closed { init, base },
+                    (borrowed && compact).then_some(&preps),
+                    if borrowed {
+                        OctaInputs::Blocks(blocks.each_ref())
+                    } else {
+                        OctaInputs::Closed { init, base }
+                    },
                     z_ref.0.as_mut_ptr(),
                     a_ref.0.as_mut_ptr(),
                     b_ref.0.as_mut_ptr(),
@@ -4611,6 +4658,7 @@ mod cached_z_seed_pair_dispatch_tests {
         let mut ab_seed = Box::new(AlignedAbFull([0u8; 8 * 32 * 64]));
         unsafe {
             build_octa_witness_ab_stream_elide(
+                None,
                 OctaInputs::Closed { init, base: 0 },
                 z_seed.0.as_mut_ptr(),
                 a_seed.0.as_mut_ptr(),
@@ -4711,6 +4759,7 @@ mod cached_z_seed_pair_dispatch_tests {
 
             unsafe {
                 build_octa_witness_ab_stream_elide(
+                    None,
                     OctaInputs::Closed { init, base },
                     z_ref.0.as_mut_ptr(),
                     a_ref.0.as_mut_ptr(),
@@ -4904,6 +4953,7 @@ mod cross_quarter_witness_tests {
                                     for blocks in [&old_blocks, &scalar_blocks] {
                                         let old = core::ptr::eq(blocks, &old_blocks);
                                         build_octa_witness_ab_stream_elide(
+                                            None,
                                             OctaInputs::Blocks(core::array::from_fn(|lane| &blocks[lane])),
                                             zr.0.as_mut_ptr(), ar.0.as_mut_ptr(), br.0.as_mut_ptr(),
                                             StreamProj { compact_z_tile_words: 0, seed_window: None, stage: reference_stage.0.as_mut_ptr(), out: abr.0.as_mut_ptr(), out_stride: if old { 32*64 } else { stride }, cross_quarter: false, compact_z: core::ptr::null_mut(), elide_z: false, out_bias: if old { 0 } else { 2*64 }, ab_pend: core::ptr::null_mut(), inv_table, plan, one_rows_elided: !old, w30_elided: !old },

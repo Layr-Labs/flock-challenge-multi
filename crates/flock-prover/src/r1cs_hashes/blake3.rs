@@ -3028,13 +3028,9 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
     let z_nt = witgen_simd::witgen_z_nt_enabled();
     let ab1_hole = flock_core::zerocheck::univariate_skip_optimized::ab1_hole_layout_enabled();
     let ab_inner_bytes = ab_inner.as_bytes_mut();
-    // Exact ranked-closed specialisation: only the crown worker's committed
-    // shape reaches it, and only when the current binary still selects the
-    // direct-dense inline + maddubs chain the helper reuses.
-    let ranked_closed_exact_eligible = matches!(
-        blocks,
-        crate::seed_pipe::BlockSource::Closed { len, .. } if len == 1 << 18
-    ) && compact
+    // Both input forms must meet the existing compact-window kernel's requirements.
+    let ranked_window_eligible = blocks.len() == 1 << 18
+        && compact
         && ab_stream
         && one_rows_elided
         && elide == [true; 3]
@@ -3045,6 +3041,8 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
         && blake3_witgen8::widen_maddubs_enabled()
         && blake3_witgen8::ey_dead_w31_enabled()
         && flock_core::zerocheck::univariate_skip_optimized::ranked_ab_compact_enabled();
+    let ranked_closed_exact_eligible = ranked_window_eligible
+        && matches!(blocks, crate::seed_pipe::BlockSource::Closed { .. });
     let sl2_align = (abinner_nt, ab_inner_bytes.as_ptr() as usize % 64);
     let ranked_closed_preps = match ranked_closed_dispatch {
         RankedClosedDispatch::Auto if ranked_closed_exact_eligible => {
@@ -3370,6 +3368,13 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
         }
         return;
     }
+    // The window projection depends on the circuit and the output layout.
+    // It can consume the worker's materialized blocks in consecutive groups of eight.
+    let slice_preps = (ranked_window_eligible
+        && w30_elided
+        && ranked_closed_dispatch == RankedClosedDispatch::Auto
+        && matches!(blocks, crate::seed_pipe::BlockSource::Slice(_)))
+    .then(|| SharedRankedClosedWindowPreps::new(inv_table, win_plan, sl2_align));
     z.par_chunks_mut(group_f128)
         .zip(a.par_chunks_mut(group_f128))
         .zip(b.par_chunks_mut(group_f128))
@@ -3501,6 +3506,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                                 }
                             };
                             blake3_witgen8::build_octa_witness_ab_stream_elide(
+                                slice_preps.as_ref().map(SharedRankedClosedWindowPreps::get),
                                 octa,
                                 z_out.as_mut_ptr().add(off).cast::<u32>(),
                                 a_out.as_mut_ptr().add(off).cast::<u32>(),
@@ -4827,164 +4833,14 @@ impl Blake3Setup {
         crate::prover::prove_ligerito(&self.r1cs, z_packed, &self.pcs_params, challenger)
     }
 
-    /// Ligerito-backend prove. Requires m ≥ ~21.
-    ///
-    /// First call in a process at ranked scale (m ≥ 29) runs eleven extra
-    /// throwaway proves before the caller's prove. Rationale (gap-hunt,
-    /// wave 7): the NT-store DRAM phases (zerocheck R2, open combine) and
-    /// the GPU share calibration warm over the first ~3 proves of a process
-    /// (measured 259 → 247 → 237 ms best across a process's first proves
-    /// even after one warm-up prove). The ranked worker performs exactly one
-    /// untimed warm-up prove before signalling readiness; folding the extra
-    /// passes into that first call moves the remaining ramp out of the
-    /// timed window. The throwaway proves use a private challenger and are
-    /// discarded — the caller's transcript and proof bytes are untouched.
-    /// Count: the page-fault curve on the timed prove is monotone in the
-    /// number of untimed passes and plateaus at eleven (main) / four
-    /// (seed-pipe thread); past the plateau the extra passes only spend
-    /// untimed budget. `FLOCK_NO_EXTRA_WARMUP=1` disables.
+    /// Prove the compression blocks supplied by the caller with its challenger.
     pub fn prove_fast<Ch: Challenger>(
         &self,
         blocks: &[Compression],
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        // Counts *outer* entries only (the extra warm-up proves below go
-        // through `prove_fast_inner`). Ranked call 0 is the untimed warm-up.
-        // Direct seed-pipe publication keeps main blocked afterward; call 1 is
-        // reached only by the adoption fallback or outside that ranked path.
-        static PROVE_FAST_CALLS: AtomicUsize = AtomicUsize::new(0);
-        let call = PROVE_FAST_CALLS.fetch_add(1, Ordering::Relaxed);
-        // Adoption fallback: when direct publication is disabled or fails,
-        // the proof for these blocks may already be in flight on the seed-pipe
-        // thread. Equality of `blocks` gates adoption; see `crate::seed_pipe`.
-        // Inert unless `arm_seed_pipe` ran at the tail of call 0.
-        if call > 0
-            && let Some(adopted) = crate::seed_pipe::try_adopt(blocks)
-        {
-            return adopted;
-        }
-        // HOISTED (was below, after the loop and the final warm-up prove).
-        // This is the call that sets `GENERATOR_VERIFIED`, which decides
-        // whether the *timed* prove supplies witgen from `BlockSource::Closed`
-        // (the ranked fast arm, `seed_pipe.rs`) or from the `Slice` fallback.
-        // Running it here, before the untimed passes, lets those passes warm
-        // the same supply path the measured interval will take. Its argument
-        // is the wrapper's `blocks` slice, untouched by this reordering, so
-        // the adoption gate sees bit-identical input and reaches a
-        // bit-identical verdict -- only its position moves. Legal here: it
-        // depends on nothing the loop produces.
-        if call == 0 && self.n_blocks.is_power_of_two() {
-            crate::seed_pipe::verify_generator_at_warmup(self.n_blocks.trailing_zeros(), blocks);
-        }
-        static EXTRA_WARMUP_DONE: AtomicBool = AtomicBool::new(false);
-        if self.r1cs.m >= 29
-            && !EXTRA_WARMUP_DONE.swap(true, Ordering::Relaxed)
-            && std::env::var_os("FLOCK_NO_EXTRA_WARMUP").is_none()
-        {
-            // The harness allows 300 s of untimed startup before the ready
-            // file (`STARTUP_TIMEOUT`, benchmark-tools/harness/src/main.rs);
-            // this loop normally spends ~3.1 s of it. The wall-clock budget
-            // makes the realised count come from the guard rather than from
-            // the constant, so an instance an order of magnitude slower than
-            // this host still publishes its ready file in time.
-            const EXTRA_WARMUP_PROVES: usize = 11;
-            const EXTRA_WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
-            // Warm the supply path the timed prove will actually run. When
-            // the generator verified above, the scored prove evaluates blocks
-            // from the closed form on the consuming worker; proving these
-            // passes from `Slice` warmed a materialized-vector path the
-            // measured interval never enters. Falls back to `Slice` exactly
-            // when the timed prove would also use `Slice`, so the two always
-            // agree. These proves are thrown away (private challenger,
-            // black-boxed and dropped), so this cannot move a proof byte.
-            let warm_source = if self.n_blocks.is_power_of_two() {
-                crate::seed_pipe::warmup_block_source(self.n_blocks.trailing_zeros())
-            } else {
-                None
-            }
-            .unwrap_or(crate::seed_pipe::BlockSource::Slice(blocks));
-            let warmup_started = std::time::Instant::now();
-            for _ in 0..EXTRA_WARMUP_PROVES {
-                let mut warm_challenger =
-                    crate::challenger::FsChallenger::with_hash(b"flock-extra-warmup-v0", {
-                        self.pcs_params.merkle_hash
-                    });
-                let _ =
-                    std::hint::black_box(self.prove_fast_inner(warm_source, &mut warm_challenger));
-                if warmup_started.elapsed() >= EXTRA_WARMUP_BUDGET {
-                    break;
-                }
-            }
-        }
-        let out = self.prove_fast_inner(crate::seed_pipe::BlockSource::Slice(blocks), challenger);
-        if call == 0 {
-            // Last things the untimed warm-up does: prove that our parallel
-            // generator reproduces the wrapper's warm-up blocks (enables the
-            // O(1) adoption gate), then hand stdin to the seed-pipe thread.
-            // The worker publishes its ready file immediately after we return
-            // and only then touches `io::stdin()`, so the splice lands outside
-            // every measured interval and before the wrapper's `BufReader`
-            // binds a descriptor.
-            // `verify_generator_at_warmup` was hoisted above the untimed
-            // warm-up loop; `arm_seed_pipe` still reads the verdict it set.
-            self.arm_seed_pipe();
-        }
-        out
-    }
-
-    /// Start the speculative seed pipeline for this setup. No-op outside the
-    /// ranked worker and under `FLOCK_NO_SEED_PIPE=1`.
-    fn arm_seed_pipe(&self) {
-        if !self.n_blocks.is_power_of_two() {
-            return;
-        }
-        crate::seed_pipe::arm(
-            self.n_blocks.trailing_zeros(),
-            std::ptr::from_ref(self) as usize,
-            Self::run_speculative_prove,
-        );
-    }
-
-    /// Body of a speculative proof: identical to the timed call the wrapper
-    /// would have made, including a challenger built from the benchmark domain
-    /// and hash, so the emitted proof bytes are the same ones.
-    fn run_speculative_prove(
-        setup_addr: usize,
-        blocks: crate::seed_pipe::BlockSource<'_>,
-    ) -> crate::seed_pipe::ProveOut {
-        // SAFETY: `setup_addr` is the address of the `Blake3Setup` the ranked
-        // worker builds in `main` and holds until the process exits, so it
-        // outlives this thread. Only shared reads happen through it — the same
-        // `&self` the Rayon pool already fans out during any prove.
-        let setup: &Self = unsafe { &*(setup_addr as *const Self) };
-        flock_core::rstrace::ev("sp:run", 0);
-        let fresh = || {
-            crate::challenger::FsChallenger::with_hash(
-                crate::seed_pipe::BENCH_DOMAIN,
-                flock_core::hash::HashKind::Blake3,
-            )
-        };
-        // Lane sl2 (`FLOCK_NO_SL2_CHAL`): the initial transcript state is a
-        // constant (domain + hash), so an untimed prove leaves a freshly
-        // built spare for the next one instead of the timed prove paying the
-        // hasher allocation and the domain absorbs.
-        static SPARE: std::sync::Mutex<Option<crate::challenger::FsChallenger>> =
-            std::sync::Mutex::new(None);
-        static ON: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_CHAL").is_none());
-        let mut challenger = if *ON {
-            SPARE.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_else(fresh)
-        } else {
-            fresh()
-        };
-        flock_core::rstrace::ev("sp:chal", 0);
-        let out = setup.prove_fast_inner(blocks, &mut challenger);
-        if *ON && !crate::seed_pipe::is_timed_speculative_prove() {
-            *SPARE.lock().unwrap_or_else(|e| e.into_inner()) = Some(fresh());
-        }
-        out
+        self.prove_fast_inner(crate::seed_pipe::BlockSource::Slice(blocks), challenger)
     }
 
     fn prove_fast_inner<Ch: Challenger>(
