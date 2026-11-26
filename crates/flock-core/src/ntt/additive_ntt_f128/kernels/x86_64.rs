@@ -2413,118 +2413,45 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             ".elseif {hint} == 2",
             "prefetcht1 [rcx+rax+{stride}*15]",
             ".endif",
-            "vbroadcasti32x4 zmm26, [rsi+256]",
-            "vbroadcasti32x4 zmm27, [rsi+272]",
-            "vpclmulqdq zmm28, zmm3, zmm26, 0",
-            "vpclmulqdq zmm29, zmm3, zmm27, 1",
-            "vpternlogd zmm2, zmm28, zmm29, 0x96",
-            "vpclmulqdq zmm26, zmm3, zmm26, 16",
-            "vpclmulqdq zmm27, zmm3, zmm27, 17",
-            "vpternlogd zmm26, zmm27, zmm22, 0x96",
-            "vbroadcasti32x4 zmm27, [rsi+224]",
-            "vbroadcasti32x4 zmm28, [rsi+240]",
-            "vpslldq zmm29, zmm26, 8",
-            "vpclmulqdq zmm26, zmm26, zmm30, 1",
-            "vpclmulqdq zmm31, zmm1, zmm27, 0",
-            "vpternlogd zmm2, zmm26, zmm29, 0x96",
-            "vpxorq zmm3, zmm3, zmm2",
-            "vmovdqu64 [rdi+rax+{stride}*2], zmm2",
-            "vmovdqu64 [rdi+rax+{stride}*3], zmm3",
-            "vpclmulqdq zmm26, zmm1, zmm28, 1",
-            "vpternlogd zmm0, zmm31, zmm26, 0x96",
-            "vpclmulqdq zmm26, zmm1, zmm27, 16",
-            "vpclmulqdq zmm27, zmm1, zmm28, 17",
-            "vpternlogd zmm26, zmm27, zmm22, 0x96",
-            "vpslldq zmm22, zmm26, 8",
-            "vpclmulqdq zmm26, zmm26, zmm30, 1",
-            "vpternlogd zmm0, zmm26, zmm22, 0x96",
-            "vpxorq zmm1, zmm1, zmm0",
-            "vmovdqu64 [rdi+rax+{stride}*0], zmm0",
-            "vmovdqu64 [rdi+rax+{stride}*1], zmm1",
-            "vbroadcasti32x4 zmm22, [rsi+320]",
-            "vbroadcasti32x4 zmm26, [rsi+336]",
-            "vpclmulqdq zmm27, zmm7, zmm22, 0",
-            "vpclmulqdq zmm28, zmm7, zmm26, 1",
-            "vpternlogd zmm6, zmm27, zmm28, 0x96",
-            "vpclmulqdq zmm22, zmm7, zmm22, 16",
-            "vpclmulqdq zmm26, zmm7, zmm26, 17",
-            "vpternlogd zmm22, zmm26, zmm25, 0x96",
-            "vbroadcasti32x4 zmm26, [rsi+288]",
-            "vbroadcasti32x4 zmm27, [rsi+304]",
-            "vpslldq zmm28, zmm22, 8",
-            "vpclmulqdq zmm22, zmm22, zmm30, 1",
-            "vpclmulqdq zmm29, zmm5, zmm26, 0",
-            "vpternlogd zmm6, zmm22, zmm28, 0x96",
-            "vpxorq zmm7, zmm7, zmm6",
-            "vmovdqu64 [rdi+rax+{stride}*6], zmm6",
-            "vmovdqu64 [rdi+rax+{stride}*7], zmm7",
-            "vpclmulqdq zmm22, zmm5, zmm27, 1",
-            "vpternlogd zmm4, zmm29, zmm22, 0x96",
-            "vpclmulqdq zmm22, zmm5, zmm26, 16",
-            "vpclmulqdq zmm26, zmm5, zmm27, 17",
-            "vpternlogd zmm22, zmm26, zmm25, 0x96",
-            "vpslldq zmm25, zmm22, 8",
-            "vpclmulqdq zmm22, zmm22, zmm30, 1",
-            "vpternlogd zmm4, zmm22, zmm25, 0x96",
-            "vpxorq zmm5, zmm5, zmm4",
-            "vmovdqu64 [rdi+rax+{stride}*4], zmm4",
-            "vmovdqu64 [rdi+rax+{stride}*5], zmm5",
-            "vbroadcasti32x4 zmm22, [rsi+384]",
-            "vbroadcasti32x4 zmm25, [rsi+400]",
-            "vpclmulqdq zmm26, zmm11, zmm22, 0",
-            "vpclmulqdq zmm27, zmm11, zmm25, 1",
-            "vpternlogd zmm10, zmm26, zmm27, 0x96",
-            "vpclmulqdq zmm22, zmm11, zmm22, 16",
-            "vpclmulqdq zmm25, zmm11, zmm25, 17",
-            "vpternlogd zmm22, zmm25, zmm24, 0x96",
-            "vbroadcasti32x4 zmm25, [rsi+352]",
-            "vbroadcasti32x4 zmm26, [rsi+368]",
-            "vpslldq zmm27, zmm22, 8",
-            "vpclmulqdq zmm22, zmm22, zmm30, 1",
-            "vpclmulqdq zmm28, zmm9, zmm25, 0",
-            "vpternlogd zmm10, zmm22, zmm27, 0x96",
-            "vpxorq zmm11, zmm11, zmm10",
-            "vmovdqu64 [rdi+rax+{stride}*10], zmm10",
-            "vmovdqu64 [rdi+rax+{stride}*11], zmm11",
-            "vpclmulqdq zmm22, zmm9, zmm26, 1",
-            "vpternlogd zmm8, zmm28, zmm22, 0x96",
-            "vpclmulqdq zmm22, zmm9, zmm25, 16",
-            "vpclmulqdq zmm25, zmm9, zmm26, 17",
-            "vpternlogd zmm22, zmm25, zmm24, 0x96",
-            "vpslldq zmm24, zmm22, 8",
-            "vpclmulqdq zmm22, zmm22, zmm30, 1",
-            "vpternlogd zmm8, zmm22, zmm24, 0x96",
-            "vpxorq zmm9, zmm9, zmm8",
-            "vmovdqu64 [rdi+rax+{stride}*8], zmm8",
-            "vmovdqu64 [rdi+rax+{stride}*9], zmm9",
-            "vbroadcasti32x4 zmm22, [rsi+448]",
-            "vbroadcasti32x4 zmm24, [rsi+464]",
-            "vpclmulqdq zmm25, zmm15, zmm22, 0",
-            "vpclmulqdq zmm26, zmm15, zmm24, 1",
-            "vpternlogd zmm14, zmm25, zmm26, 0x96",
-            "vpclmulqdq zmm22, zmm15, zmm22, 16",
-            "vpclmulqdq zmm24, zmm15, zmm24, 17",
-            "vpternlogd zmm22, zmm24, zmm23, 0x96",
-            "vbroadcasti32x4 zmm24, [rsi+416]",
-            "vbroadcasti32x4 zmm25, [rsi+432]",
-            "vpslldq zmm26, zmm22, 8",
-            "vpclmulqdq zmm22, zmm22, zmm30, 1",
-            "vpclmulqdq zmm27, zmm13, zmm24, 0",
-            "vpternlogd zmm14, zmm22, zmm26, 0x96",
-            "vpxorq zmm15, zmm15, zmm14",
-            "vmovdqu64 [rdi+rax+{stride}*14], zmm14",
-            "vmovdqu64 [rdi+rax+{stride}*15], zmm15",
-            "vpclmulqdq zmm22, zmm13, zmm25, 1",
-            "vpternlogd zmm12, zmm27, zmm22, 0x96",
-            "vpclmulqdq zmm22, zmm13, zmm24, 16",
-            "vpclmulqdq zmm24, zmm13, zmm25, 17",
-            "vpternlogd zmm22, zmm24, zmm23, 0x96",
-            "vpslldq zmm23, zmm22, 8",
-            "vpclmulqdq zmm22, zmm22, zmm30, 1",
-            "vpternlogd zmm12, zmm22, zmm23, 0x96",
-            "vpxorq zmm13, zmm13, zmm12",
-            "vmovdqu64 [rdi+rax+{stride}*12], zmm12",
-            "vmovdqu64 [rdi+rax+{stride}*13], zmm13",
+            r#"
+            .macro flock_ntt_terminal_pair a, b, c, d, pending, offset
+            vbroadcasti32x4 zmm26, [rsi+\offset+32]
+            vbroadcasti32x4 zmm27, [rsi+\offset+48]
+            vpclmulqdq zmm28, zmm\d, zmm26, 0
+            vpclmulqdq zmm29, zmm\d, zmm27, 1
+            vpclmulqdq zmm26, zmm\d, zmm26, 16
+            vpclmulqdq zmm27, zmm\d, zmm27, 17
+            vpternlogd zmm\c, zmm28, zmm29, 0x96
+            vpternlogd zmm26, zmm27, zmm\pending, 0x96
+
+            vbroadcasti32x4 zmm27, [rsi+\offset]
+            vbroadcasti32x4 zmm28, [rsi+\offset+16]
+            vpclmulqdq zmm29, zmm\b, zmm27, 0
+            vpclmulqdq zmm31, zmm\b, zmm28, 1
+            vpclmulqdq zmm27, zmm\b, zmm27, 16
+            vpclmulqdq zmm28, zmm\b, zmm28, 17
+            vpternlogd zmm\a, zmm29, zmm31, 0x96
+            vpternlogd zmm27, zmm28, zmm\pending, 0x96
+
+            vpslldq zmm29, zmm26, 8
+            vpslldq zmm31, zmm27, 8
+            vpclmulqdq zmm26, zmm26, zmm30, 1
+            vpclmulqdq zmm27, zmm27, zmm30, 1
+            vpternlogd zmm\c, zmm26, zmm29, 0x96
+            vpternlogd zmm\a, zmm27, zmm31, 0x96
+            vpxorq zmm\d, zmm\d, zmm\c
+            vpxorq zmm\b, zmm\b, zmm\a
+            vmovdqu64 [rdi+rax+{stride}*\c], zmm\c
+            vmovdqu64 [rdi+rax+{stride}*\d], zmm\d
+            vmovdqu64 [rdi+rax+{stride}*\a], zmm\a
+            vmovdqu64 [rdi+rax+{stride}*\b], zmm\b
+            .endm
+            flock_ntt_terminal_pair 0, 1, 2, 3, 22, 224
+            flock_ntt_terminal_pair 4, 5, 6, 7, 25, 288
+            flock_ntt_terminal_pair 8, 9, 10, 11, 24, 352
+            flock_ntt_terminal_pair 12, 13, 14, 15, 23, 416
+            .purgem flock_ntt_terminal_pair
+            "#,
             "add rax, 64",
             "cmp rax, rdx",
             "jb 2b",

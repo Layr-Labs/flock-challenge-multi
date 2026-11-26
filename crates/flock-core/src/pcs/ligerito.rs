@@ -4014,65 +4014,35 @@ unsafe fn transpose_butterfly_blocks_bsh2(p: *mut F128, t: F128) {
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn transpose_butterfly_blocks_bsh1_pair(
-    p: *mut F128,
-    t0: F128,
-    t1: F128,
-    t2: F128,
-    t3: F128,
+unsafe fn transpose_butterfly_blocks_bsh1_bsh2(
+    buf: &mut [F128; 8],
+    t: [F128; 4],
+    u: [F128; 2],
 ) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
+    use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
     unsafe {
-        let ta = _mm512_broadcast_i32x4(_mm_set_epi64x(t0.hi as i64, t0.lo as i64));
-        let tb = _mm512_broadcast_i32x4(_mm_set_epi64x(t1.hi as i64, t1.lo as i64));
-        let tc = _mm512_broadcast_i32x4(_mm_set_epi64x(t2.hi as i64, t2.lo as i64));
-        let td = _mm512_broadcast_i32x4(_mm_set_epi64x(t3.hi as i64, t3.lo as i64));
-        let tv = _mm512_mask_blend_epi64(0xF0, ta, tb);
-        let tw = _mm512_mask_blend_epi64(0xF0, tc, td);
-        let tv_x64 = ghash_shift64_x4(tv);
-        let tw_x64 = ghash_shift64_x4(tw);
-        let v0 = _mm512_loadu_si512(p as *const __m512i);
-        let v1 = _mm512_loadu_si512(p.add(4) as *const __m512i);
-        let s0 = _mm512_xor_si512(v0, _mm512_shuffle_i64x2::<0xB1>(v0, v0));
-        let s1 = _mm512_xor_si512(v1, _mm512_shuffle_i64x2::<0xB1>(v1, v1));
-        let m0 = ghash_mul_x4_split(s0, tv, tv_x64);
-        let m1 = ghash_mul_x4_split(s1, tw, tw_x64);
-        _mm512_storeu_si512(
-            p as *mut __m512i,
-            _mm512_mask_blend_epi64(0x33, _mm512_xor_si512(v0, m0), s0),
-        );
-        _mm512_storeu_si512(
-            p.add(4) as *mut __m512i,
-            _mm512_mask_blend_epi64(0x33, _mm512_xor_si512(v1, m1), s1),
-        );
-    }
-}
+        let p = buf.as_mut_ptr().cast::<__m512i>();
+        let a = _mm512_loadu_si512(p);
+        let b = _mm512_loadu_si512(p.add(1));
+        let top = _mm512_shuffle_i64x2::<0x88>(a, b);
+        let bot = _mm512_shuffle_i64x2::<0xDD>(a, b);
+        let s = _mm512_xor_si512(top, bot);
+        let t = _mm512_loadu_si512(t.as_ptr().cast());
+        let r = _mm512_xor_si512(bot, ghash_mul_x4(s, t));
 
-#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-#[inline]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn transpose_butterfly_blocks_bsh2_pair(p: *mut F128, t0: F128, t1: F128) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
-    use core::arch::x86_64::*;
-    unsafe {
-        let tb0 = _mm512_broadcast_i32x4(_mm_set_epi64x(t0.hi as i64, t0.lo as i64));
-        let tb1 = _mm512_broadcast_i32x4(_mm_set_epi64x(t1.hi as i64, t1.lo as i64));
-        let tb0_x64 = ghash_shift64_x4(tb0);
-        let tb1_x64 = ghash_shift64_x4(tb1);
-        let v0 = _mm512_loadu_si512(p as *const __m512i);
-        let v1 = _mm512_loadu_si512(p.add(4) as *const __m512i);
-        let s0 = _mm512_xor_si512(v0, _mm512_shuffle_i64x2::<0x4E>(v0, v0));
-        let s1 = _mm512_xor_si512(v1, _mm512_shuffle_i64x2::<0x4E>(v1, v1));
-        let m0 = ghash_mul_x4_split(s0, tb0, tb0_x64);
-        let m1 = ghash_mul_x4_split(s1, tb1, tb1_x64);
+        let top = _mm512_shuffle_i64x2::<0x88>(s, r);
+        let bot = _mm512_shuffle_i64x2::<0xDD>(s, r);
+        let d = _mm512_xor_si512(top, bot);
+        let u = _mm512_broadcast_i64x4(_mm256_loadu_si256(u.as_ptr().cast()));
+        let r = _mm512_xor_si512(bot, ghash_mul_x4(d, u));
         _mm512_storeu_si512(
-            p as *mut __m512i,
-            _mm512_mask_blend_epi64(0x0F, _mm512_xor_si512(v0, m0), s0),
+            p,
+            _mm512_permutex2var_epi64(d, _mm512_setr_epi64(0, 1, 4, 5, 8, 9, 12, 13), r),
         );
         _mm512_storeu_si512(
-            p.add(4) as *mut __m512i,
-            _mm512_mask_blend_epi64(0x0F, _mm512_xor_si512(v1, m1), s1),
+            p.add(1),
+            _mm512_permutex2var_epi64(d, _mm512_setr_epi64(2, 3, 6, 7, 10, 11, 14, 15), r),
         );
     }
 }
@@ -4086,69 +4056,34 @@ fn transpose_forward_ntt_window_dense_slice(
     buf: &mut [F128],
 ) {
     debug_assert_eq!(buf.len(), 1usize << k);
-    for s in 0..k {
+    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    let first_layer = if k >= 3 {
+        let t_base = w << (k - 1);
+        let u_base = w << (k - 2);
+        for (j, chunk) in buf.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+            let t = ntt.twiddle_batch::<4>(log_d - 1, t_base + 4 * j);
+            let u = ntt.twiddle_batch::<2>(log_d - 2, u_base + 2 * j);
+            unsafe { transpose_butterfly_blocks_bsh1_bsh2(chunk, t, u) };
+        }
+        2
+    } else if k == 2 {
+        let [t0, t1] = ntt.twiddle_batch::<2>(log_d - 1, w << 1);
+        let t2 = ntt.twiddle(log_d - 2, w);
+        unsafe {
+            transpose_butterfly_blocks_bsh1(buf.as_mut_ptr(), t0, t1);
+            transpose_butterfly_blocks_bsh2(buf.as_mut_ptr(), t2);
+        }
+        2
+    } else {
+        0
+    };
+    #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+    let first_layer = 0;
+    for s in first_layer..k {
         let layer = log_d - 1 - s;
         let bsh = 1usize << s;
         let block_size = bsh << 1;
         let nblocks = (1usize << k) / block_size;
-        #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-        {
-            let block_base = w << (k - s - 1);
-            if bsh == 1 {
-                let mut jb = 0;
-                while jb + 3 < nblocks {
-                    let t0 = ntt.twiddle(layer, block_base + jb);
-                    let t1 = ntt.twiddle(layer, block_base + jb + 1);
-                    let t2 = ntt.twiddle(layer, block_base + jb + 2);
-                    let t3 = ntt.twiddle(layer, block_base + jb + 3);
-                    unsafe {
-                        transpose_butterfly_blocks_bsh1_pair(
-                            buf.as_mut_ptr().add(jb * 2),
-                            t0,
-                            t1,
-                            t2,
-                            t3,
-                        )
-                    };
-                    jb += 4;
-                }
-                while jb + 1 < nblocks {
-                    let t0 = ntt.twiddle(layer, block_base + jb);
-                    let t1 = ntt.twiddle(layer, block_base + jb + 1);
-                    unsafe {
-                        transpose_butterfly_blocks_bsh1(buf.as_mut_ptr().add(jb * 2), t0, t1)
-                    };
-                    jb += 2;
-                }
-                if jb < nblocks {
-                    let t = ntt.twiddle(layer, block_base + jb);
-                    let base = jb * 2;
-                    let (top_h, bot) = buf[base..base + 2].split_at_mut(1);
-                    transpose_butterfly(top_h, bot, t);
-                }
-                continue;
-            }
-            if bsh == 2 {
-                let mut jb = 0;
-                while jb + 1 < nblocks {
-                    let t0 = ntt.twiddle(layer, block_base + jb);
-                    let t1 = ntt.twiddle(layer, block_base + jb + 1);
-                    unsafe {
-                        transpose_butterfly_blocks_bsh2_pair(
-                            buf.as_mut_ptr().add(jb * 4),
-                            t0,
-                            t1,
-                        )
-                    };
-                    jb += 2;
-                }
-                if jb < nblocks {
-                    let t = ntt.twiddle(layer, block_base + jb);
-                    unsafe { transpose_butterfly_blocks_bsh2(buf.as_mut_ptr().add(jb * 4), t) };
-                }
-                continue;
-            }
-        }
         for jb in 0..nblocks {
             let t = ntt.twiddle(layer, (w << (k - s - 1)) + jb);
             let base = jb * block_size;
@@ -17770,6 +17705,5 @@ mod tests {
         }
     }
 }
-
 
 

@@ -2691,6 +2691,19 @@ impl AdditiveNttF128 {
         span_get(&v[1..], block)
     }
 
+    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    #[inline]
+    pub(crate) fn twiddle_batch<const N: usize>(&self, layer: usize, block: usize) -> [F128; N] {
+        debug_assert!(layer < self.log_domain_size());
+        debug_assert!(block + N <= 1usize << layer);
+        if let Some(twiddles) = &self.precomputed_twiddles {
+            let start = (1usize << layer) - 1 + block;
+            return *twiddles[start..].first_chunk::<N>().unwrap();
+        }
+        let v = &self.evals[self.log_domain_size() - layer - 1];
+        core::array::from_fn(|j| span_get(&v[1..], block + j))
+    }
+
     /// Forward additive NTT in place. `data.len()` must be `2^log_d` for some
     /// `log_d ≤ log_domain_size()`. Layer `l ∈ [0, log_d)` is processed in
     /// order (neighbors-last: top layer first).
