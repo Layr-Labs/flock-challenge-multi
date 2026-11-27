@@ -323,9 +323,8 @@ fn roots_only_matches_production_stripes() {
                     );
                     for lane in 0..8 {
                         let reference_base = base + compression_lane_offset(lane, cross);
-                        build_octa_witness_ab_stream_ranked_closed(
-                            init,
-                            reference_base,
+                        build_octa_witness_ab_stream_ranked(
+                            OctaInputs::Closed { init, base: reference_base },
                             z.0.as_mut_ptr(),
                             a.0.as_mut_ptr(),
                             b.0.as_mut_ptr(),
