@@ -7,6 +7,22 @@ use super::{BLAKE3_IV, Hash};
 core::arch::global_asm!(include_str!("merkle_contiguous.S"));
 // `FLOCK_MAH_ASM=1` alternates (crate::MAH_ASM): Mahmoud514 a4aa6fa2's leaf kernels as `*_m`.
 core::arch::global_asm!(include_str!("merkle_contiguous_m.S"));
+// Hybrid leaf kernel: 112 leaves of a 128-leaf block on the 16-lane AVX-512
+// path, 16 on scalar general-purpose-register BLAKE3 woven into the same
+// instruction stream (integer ports p1/p6/p10 instead of the saturated 512-bit
+// ports p0/p5). Same compressions, same chaining values, same planes output.
+core::arch::global_asm!(include_str!("merkle_contiguous_hyb.S"));
+unsafe extern "C" {
+    fn flock_blake3_planes_leaf_1024_hyb(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8);
+}
+
+/// `FLOCK_NO_MERKLE_HYB` restores the all-vector 1024-byte leaf kernel.
+#[inline]
+fn merkle_hyb_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MERKLE_HYB").is_none());
+    *ON
+}
 unsafe extern "C" {
     fn flock_blake3_contiguous_64_m(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8);
     fn flock_blake3_contiguous_128_m(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8);
@@ -176,8 +192,15 @@ pub(super) fn hash_leaf_pairs<const N: usize>(data: &[u8], out: &mut [Hash]) {
     // At most 128 leaves / 64 parents. No typed initialized scratch reference
     // exists before the assembly has written every byte the parent reads.
     let mut scratch = core::mem::MaybeUninit::<[u8; 128 * 32]>::uninit();
+    let hyb = N == 1024 && !*crate::MAH_ASM_MK && merkle_hyb_enabled();
     for (parents, leaves) in out.chunks_mut(64).zip(data.chunks(128 * N)) {
         let planes = scratch.as_mut_ptr().cast::<u8>();
+        // The hybrid kernel covers exactly one full 128-leaf block.
+        let leaf: Kernel = if hyb && parents.len() == 64 {
+            flock_blake3_planes_leaf_1024_hyb
+        } else {
+            leaf
+        };
         // SAFETY: compile-time AVX-512/SysV module gate; disjoint exact-size
         // input/output slices; full 16-lane groups. Zero counters throughout.
         unsafe {
@@ -194,6 +217,44 @@ pub(super) fn hash_leaf_pairs<const N: usize>(data: &[u8], out: &mut [Hash]) {
 #[cfg(test)]
 mod plane_tests {
     use super::*;
+    #[test]
+    fn hybrid_leaf_1024_planes_match_vector_and_hazmat() {
+        use blake3::hazmat::HasherExt;
+        const SIZE: usize = 1024;
+        const COUNT: usize = 128;
+        for (flags, start, end) in [(0u8, super::super::BLAKE3_CHUNK_START, super::super::BLAKE3_CHUNK_END), (8u8, 1u8, 2u8)] {
+            for offset in [0usize, 1, 31, 63, 64] {
+                let mut seed = 0xd1b54a32d192ed03u64 ^ offset as u64 ^ ((flags as u64) << 40);
+                let mut storage = vec![0u8; offset + COUNT * SIZE];
+                for x in &mut storage {
+                    seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+                    *x = seed as u8;
+                }
+                let data = &storage[offset..];
+                let mut want = vec![0x5au8; COUNT * 32 + 128];
+                let mut got = vec![0xa5u8; COUNT * 32 + 128];
+                unsafe {
+                    flock_blake3_planes_leaf_1024(data.as_ptr(), COUNT, SIZE / 64, BLAKE3_IV.as_ptr(), 0, false,
+                        flags, start, end, want.as_mut_ptr().add(64));
+                    flock_blake3_planes_leaf_1024_hyb(data.as_ptr(), COUNT, SIZE / 64, BLAKE3_IV.as_ptr(), 0, false,
+                        flags, start, end, got.as_mut_ptr().add(64));
+                }
+                assert_eq!(&got[64..64 + COUNT * 32], &want[64..64 + COUNT * 32], "flags={flags} offset={offset}");
+                assert!(got[..64].iter().all(|&x| x == 0xa5));
+                assert!(got[COUNT * 32 + 64..].iter().all(|&x| x == 0xa5));
+                if flags == 0 {
+                    for i in 0..COUNT {
+                        let cv = blake3::Hasher::new().update(&data[i * SIZE..(i + 1) * SIZE]).finalize_non_root();
+                        for word in 0..8 {
+                            let p = 64 + (i / 16) * 512 + word * 64 + (i % 16) * 4;
+                            assert_eq!(got[p..p + 4], cv[word * 4..word * 4 + 4], "offset={offset} leaf={i} word={word}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn direct_leaf_planes_match_hazmat_words() {
         use blake3::hazmat::HasherExt;
