@@ -3028,13 +3028,9 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
     let z_nt = witgen_simd::witgen_z_nt_enabled();
     let ab1_hole = flock_core::zerocheck::univariate_skip_optimized::ab1_hole_layout_enabled();
     let ab_inner_bytes = ab_inner.as_bytes_mut();
-    // Exact ranked-closed specialisation: only the crown worker's committed
-    // shape reaches it, and only when the current binary still selects the
-    // direct-dense inline + maddubs chain the helper reuses.
-    let ranked_closed_exact_eligible = matches!(
-        blocks,
-        crate::seed_pipe::BlockSource::Closed { len, .. } if len == 1 << 18
-    ) && compact
+    // Both input forms must meet the existing compact-window kernel's requirements.
+    let ranked_window_eligible = blocks.len() == 1 << 18
+        && compact
         && ab_stream
         && one_rows_elided
         && elide == [true; 3]
@@ -3045,6 +3041,8 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
         && blake3_witgen8::widen_maddubs_enabled()
         && blake3_witgen8::ey_dead_w31_enabled()
         && flock_core::zerocheck::univariate_skip_optimized::ranked_ab_compact_enabled();
+    let ranked_closed_exact_eligible = ranked_window_eligible
+        && matches!(blocks, crate::seed_pipe::BlockSource::Closed { .. });
     let sl2_align = (abinner_nt, ab_inner_bytes.as_ptr() as usize % 64);
     let ranked_closed_preps = match ranked_closed_dispatch {
         RankedClosedDispatch::Auto if ranked_closed_exact_eligible => {
@@ -3064,6 +3062,12 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
         (Some(_), crate::seed_pipe::BlockSource::Closed { init, .. }) => Some(init),
         _ => None,
     };
+    // The window projection depends on the circuit and the output layout.
+    let slice_preps = (ranked_window_eligible
+        && w30_elided
+        && ranked_closed_dispatch == RankedClosedDispatch::Auto
+        && matches!(blocks, crate::seed_pipe::BlockSource::Slice(_)))
+    .then(|| SharedRankedClosedWindowPreps::new(inv_table, win_plan, sl2_align));
     #[cfg(all(
         target_feature = "avx512f",
         target_feature = "avx512bw",
@@ -3071,9 +3075,17 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
         target_feature = "gfni",
         target_feature = "vpclmulqdq"
     ))]
-    if let (Some(preps), Some(init)) = (ranked_closed_preps.as_ref(), ranked_closed_init)
-        && w30_elided
-        && blake3_witgen8::ranked_static01_direct_enabled()
+    if w30_elided && blake3_witgen8::ranked_static01_direct_enabled()
+        && let Some(preps) = ranked_closed_preps.as_ref().or_else(|| {
+            let crate::seed_pipe::BlockSource::Slice(slice) = blocks else { return None };
+            // Check the whole immutable batch before assigning cross-quarter output
+            // rows. A different metadata layout must use the ordinary producer.
+            slice_preps.as_ref().filter(|_| {
+                cfg!(target_os = "linux")
+                    && commit_ctx.as_ref().is_some_and(|ctx| ctx.ranked_resident())
+                    && slice.par_iter().all(blake3_witgen8::ranked_block_metadata)
+            })
+        })
     {
         // One task owns a full root-cache tile. Each octa publishes one
         // complete 64-byte stripe per group from its live word vectors.
@@ -3095,13 +3107,14 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
             });
         let root_plan = &*ROOT_PLAN;
         #[cfg(all(target_feature = "avx512vl", target_feature = "avx512vbmi2", target_feature = "avx512dq"))]
-        let root_generator = blake3_witgen8::root_recompute::selected_generator()
-            .filter(|_| root_enabled && root_plan.is_some());
+        let root_generator = ranked_closed_init
+            .filter(|_| root_enabled && root_plan.is_some())
+            .and_then(|init| blake3_witgen8::root_recompute::selected_generator().map(|gen_fn| (init, gen_fn)));
         #[cfg(not(all(target_feature = "avx512vl", target_feature = "avx512vbmi2", target_feature = "avx512dq")))]
-        let root_generator: Option<(unsafe fn(u64, usize, *mut u8), Option<flock_core::lincheck::RootPairGenerator>)> = None;
+        let root_generator: Option<(u64, (unsafe fn(u64, usize, *mut u8), Option<flock_core::lincheck::RootPairGenerator>))> = None;
         // z elision: octas seeded from their compact copy skip z's global
         // stores; the prover regenerates z exactly from the root tiles.
-        let elide_z = root_enabled
+        let elide_z = ranked_closed_init.is_some() && root_enabled
             && root_plan.is_some()
             && blake3_zregen::z_elide_enabled();
         let elided_octas = std::sync::atomic::AtomicUsize::new(0);
@@ -3210,13 +3223,12 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                             one_rows_elided: true,
                             w30_elided: true,
                         };
-                        if compact_tile {
+                        if let (true, Some(init)) = (compact_tile, ranked_closed_init) {
                             macro_rules! emit_window {($cols:literal)=>{blake3_witgen8::build_octa_witness_ab_stream_ranked_window::<$cols>(init,base,z_base.add(field_offset).cast::<u32>(),(a_addr as *mut F128).add(field_offset).cast::<u32>(),(b_addr as *mut F128).add(field_offset).cast::<u32>(),proj,preps.get())};}
                             match window_tile_cols {8=>emit_window!(8),16=>emit_window!(16),32=>emit_window!(32),_=>emit_window!(64)}
                         }else{
-                        blake3_witgen8::build_octa_witness_ab_stream_ranked_closed(
-                            init,
-                            base,
+                        blake3_witgen8::build_octa_witness_ab_stream_ranked(
+                            blake3_witgen8::OctaInputs::cross_quarter(blocks, base),
                             z_base.add(field_offset).cast::<u32>(),
                             (a_addr as *mut F128).add(field_offset).cast::<u32>(),
                             (b_addr as *mut F128).add(field_offset).cast::<u32>(),
@@ -3270,6 +3282,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
         let pipelined = false;
 
         if !pipelined {
+            let init = ranked_closed_init.expect("borrowed fusion requires a resident commitment");
             z.par_chunks_mut(group_f128)
                 .zip(a.par_chunks_mut(group_f128))
                 .zip(b.par_chunks_mut(group_f128))
@@ -3297,9 +3310,8 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                                 one_rows_elided: true,
                                 w30_elided: true,
                             };
-                            blake3_witgen8::build_octa_witness_ab_stream_ranked_closed(
-                                init,
-                                base,
+                            blake3_witgen8::build_octa_witness_ab_stream_ranked(
+                                blake3_witgen8::OctaInputs::Closed { init, base },
                                 z_out.as_mut_ptr().add(off).cast::<u32>(),
                                 a_out.as_mut_ptr().add(off).cast::<u32>(),
                                 b_out.as_mut_ptr().add(off).cast::<u32>(),
@@ -3323,7 +3335,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
             // The commit entry or Rayon joins all producers and their SFENCEs
             // before this completed root-cache storage is published.
             let mut tiles = unsafe {
-                if let Some((generate, pair_generator)) = root_generator.filter(|_| pipelined) {
+                if let Some((init, (generate, pair_generator))) = root_generator.filter(|_| pipelined) {
                     flock_core::scratch::give_f128(root_storage);
                     flock_core::lincheck::WitnessRootTiles::from_cross_quarter_generator(init, generate, pair_generator)
                 } else if pipelined {
@@ -3448,9 +3460,8 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                             }
                         }).unwrap_unchecked();
                         if let Some(preps) = ranked_closed_preps.as_ref() {
-                            blake3_witgen8::build_octa_witness_ab_stream_ranked_closed(
-                                ranked_closed_init.unwrap_unchecked(),
-                                base,
+                            blake3_witgen8::build_octa_witness_ab_stream_ranked(
+                                blake3_witgen8::OctaInputs::Closed { init: ranked_closed_init.unwrap_unchecked(), base },
                                 z_out.as_mut_ptr().add(off).cast::<u32>(),
                                 a_out.as_mut_ptr().add(off).cast::<u32>(),
                                 b_out.as_mut_ptr().add(off).cast::<u32>(),
@@ -3501,6 +3512,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                                 }
                             };
                             blake3_witgen8::build_octa_witness_ab_stream_elide(
+                                slice_preps.as_ref().map(SharedRankedClosedWindowPreps::get),
                                 octa,
                                 z_out.as_mut_ptr().add(off).cast::<u32>(),
                                 a_out.as_mut_ptr().add(off).cast::<u32>(),
@@ -4827,164 +4839,14 @@ impl Blake3Setup {
         crate::prover::prove_ligerito(&self.r1cs, z_packed, &self.pcs_params, challenger)
     }
 
-    /// Ligerito-backend prove. Requires m ≥ ~21.
-    ///
-    /// First call in a process at ranked scale (m ≥ 29) runs eleven extra
-    /// throwaway proves before the caller's prove. Rationale (gap-hunt,
-    /// wave 7): the NT-store DRAM phases (zerocheck R2, open combine) and
-    /// the GPU share calibration warm over the first ~3 proves of a process
-    /// (measured 259 → 247 → 237 ms best across a process's first proves
-    /// even after one warm-up prove). The ranked worker performs exactly one
-    /// untimed warm-up prove before signalling readiness; folding the extra
-    /// passes into that first call moves the remaining ramp out of the
-    /// timed window. The throwaway proves use a private challenger and are
-    /// discarded — the caller's transcript and proof bytes are untouched.
-    /// Count: the page-fault curve on the timed prove is monotone in the
-    /// number of untimed passes and plateaus at eleven (main) / four
-    /// (seed-pipe thread); past the plateau the extra passes only spend
-    /// untimed budget. `FLOCK_NO_EXTRA_WARMUP=1` disables.
+    /// Prove the compression blocks supplied by the caller with its challenger.
     pub fn prove_fast<Ch: Challenger>(
         &self,
         blocks: &[Compression],
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        // Counts *outer* entries only (the extra warm-up proves below go
-        // through `prove_fast_inner`). Ranked call 0 is the untimed warm-up.
-        // Direct seed-pipe publication keeps main blocked afterward; call 1 is
-        // reached only by the adoption fallback or outside that ranked path.
-        static PROVE_FAST_CALLS: AtomicUsize = AtomicUsize::new(0);
-        let call = PROVE_FAST_CALLS.fetch_add(1, Ordering::Relaxed);
-        // Adoption fallback: when direct publication is disabled or fails,
-        // the proof for these blocks may already be in flight on the seed-pipe
-        // thread. Equality of `blocks` gates adoption; see `crate::seed_pipe`.
-        // Inert unless `arm_seed_pipe` ran at the tail of call 0.
-        if call > 0
-            && let Some(adopted) = crate::seed_pipe::try_adopt(blocks)
-        {
-            return adopted;
-        }
-        // HOISTED (was below, after the loop and the final warm-up prove).
-        // This is the call that sets `GENERATOR_VERIFIED`, which decides
-        // whether the *timed* prove supplies witgen from `BlockSource::Closed`
-        // (the ranked fast arm, `seed_pipe.rs`) or from the `Slice` fallback.
-        // Running it here, before the untimed passes, lets those passes warm
-        // the same supply path the measured interval will take. Its argument
-        // is the wrapper's `blocks` slice, untouched by this reordering, so
-        // the adoption gate sees bit-identical input and reaches a
-        // bit-identical verdict -- only its position moves. Legal here: it
-        // depends on nothing the loop produces.
-        if call == 0 && self.n_blocks.is_power_of_two() {
-            crate::seed_pipe::verify_generator_at_warmup(self.n_blocks.trailing_zeros(), blocks);
-        }
-        static EXTRA_WARMUP_DONE: AtomicBool = AtomicBool::new(false);
-        if self.r1cs.m >= 29
-            && !EXTRA_WARMUP_DONE.swap(true, Ordering::Relaxed)
-            && std::env::var_os("FLOCK_NO_EXTRA_WARMUP").is_none()
-        {
-            // The harness allows 300 s of untimed startup before the ready
-            // file (`STARTUP_TIMEOUT`, benchmark-tools/harness/src/main.rs);
-            // this loop normally spends ~3.1 s of it. The wall-clock budget
-            // makes the realised count come from the guard rather than from
-            // the constant, so an instance an order of magnitude slower than
-            // this host still publishes its ready file in time.
-            const EXTRA_WARMUP_PROVES: usize = 11;
-            const EXTRA_WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
-            // Warm the supply path the timed prove will actually run. When
-            // the generator verified above, the scored prove evaluates blocks
-            // from the closed form on the consuming worker; proving these
-            // passes from `Slice` warmed a materialized-vector path the
-            // measured interval never enters. Falls back to `Slice` exactly
-            // when the timed prove would also use `Slice`, so the two always
-            // agree. These proves are thrown away (private challenger,
-            // black-boxed and dropped), so this cannot move a proof byte.
-            let warm_source = if self.n_blocks.is_power_of_two() {
-                crate::seed_pipe::warmup_block_source(self.n_blocks.trailing_zeros())
-            } else {
-                None
-            }
-            .unwrap_or(crate::seed_pipe::BlockSource::Slice(blocks));
-            let warmup_started = std::time::Instant::now();
-            for _ in 0..EXTRA_WARMUP_PROVES {
-                let mut warm_challenger =
-                    crate::challenger::FsChallenger::with_hash(b"flock-extra-warmup-v0", {
-                        self.pcs_params.merkle_hash
-                    });
-                let _ =
-                    std::hint::black_box(self.prove_fast_inner(warm_source, &mut warm_challenger));
-                if warmup_started.elapsed() >= EXTRA_WARMUP_BUDGET {
-                    break;
-                }
-            }
-        }
-        let out = self.prove_fast_inner(crate::seed_pipe::BlockSource::Slice(blocks), challenger);
-        if call == 0 {
-            // Last things the untimed warm-up does: prove that our parallel
-            // generator reproduces the wrapper's warm-up blocks (enables the
-            // O(1) adoption gate), then hand stdin to the seed-pipe thread.
-            // The worker publishes its ready file immediately after we return
-            // and only then touches `io::stdin()`, so the splice lands outside
-            // every measured interval and before the wrapper's `BufReader`
-            // binds a descriptor.
-            // `verify_generator_at_warmup` was hoisted above the untimed
-            // warm-up loop; `arm_seed_pipe` still reads the verdict it set.
-            self.arm_seed_pipe();
-        }
-        out
-    }
-
-    /// Start the speculative seed pipeline for this setup. No-op outside the
-    /// ranked worker and under `FLOCK_NO_SEED_PIPE=1`.
-    fn arm_seed_pipe(&self) {
-        if !self.n_blocks.is_power_of_two() {
-            return;
-        }
-        crate::seed_pipe::arm(
-            self.n_blocks.trailing_zeros(),
-            std::ptr::from_ref(self) as usize,
-            Self::run_speculative_prove,
-        );
-    }
-
-    /// Body of a speculative proof: identical to the timed call the wrapper
-    /// would have made, including a challenger built from the benchmark domain
-    /// and hash, so the emitted proof bytes are the same ones.
-    fn run_speculative_prove(
-        setup_addr: usize,
-        blocks: crate::seed_pipe::BlockSource<'_>,
-    ) -> crate::seed_pipe::ProveOut {
-        // SAFETY: `setup_addr` is the address of the `Blake3Setup` the ranked
-        // worker builds in `main` and holds until the process exits, so it
-        // outlives this thread. Only shared reads happen through it — the same
-        // `&self` the Rayon pool already fans out during any prove.
-        let setup: &Self = unsafe { &*(setup_addr as *const Self) };
-        flock_core::rstrace::ev("sp:run", 0);
-        let fresh = || {
-            crate::challenger::FsChallenger::with_hash(
-                crate::seed_pipe::BENCH_DOMAIN,
-                flock_core::hash::HashKind::Blake3,
-            )
-        };
-        // Lane sl2 (`FLOCK_NO_SL2_CHAL`): the initial transcript state is a
-        // constant (domain + hash), so an untimed prove leaves a freshly
-        // built spare for the next one instead of the timed prove paying the
-        // hasher allocation and the domain absorbs.
-        static SPARE: std::sync::Mutex<Option<crate::challenger::FsChallenger>> =
-            std::sync::Mutex::new(None);
-        static ON: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_CHAL").is_none());
-        let mut challenger = if *ON {
-            SPARE.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_else(fresh)
-        } else {
-            fresh()
-        };
-        flock_core::rstrace::ev("sp:chal", 0);
-        let out = setup.prove_fast_inner(blocks, &mut challenger);
-        if *ON && !crate::seed_pipe::is_timed_speculative_prove() {
-            *SPARE.lock().unwrap_or_else(|e| e.into_inner()) = Some(fresh());
-        }
-        out
+        self.prove_fast_inner(crate::seed_pipe::BlockSource::Slice(blocks), challenger)
     }
 
     fn prove_fast_inner<Ch: Challenger>(
@@ -7161,6 +7023,52 @@ mod chain_e2e_tests {
                 .is_err()
         );
     }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f",
+              target_feature = "avx512bw", target_feature = "avx512vbmi",
+              target_feature = "gfni", target_feature = "vpclmulqdq"))]
+    #[test]
+    #[ignore = "ranked resident commitment oracle; run serially on the benchmark host"]
+    fn borrowed_fused_commit_matches_staged_witness_codeword_and_tree() {
+        use crate::seed_pipe::{BlockSource, generate_compressions_par};
+        use flock_core::scratch::{give_f128, take_f128};
+
+        let mut setup = Blake3Setup::new(1 << 18);
+        setup.pcs_params.merkle_hash = flock_core::hash::HashKind::Blake3;
+        let params = &setup.pcs_params;
+        let padding = setup.r1cs.padding_spec();
+        let odd_tail = flock_core::ntt::additive_ntt_f128::ZeroOddTailLanes::lanes_for_padding(
+            params.num_ntts(), padding.k_log, padding.useful_bits_per_block,
+        );
+        crate::prover::in_witness_phase_pool(setup.r1cs.m, || {
+            let warm = generate_compressions_par(18, 917);
+            let (z, a, b, ab) = generate_witness_with_ab_packed_and_round1_inner(&warm, 18);
+            for buffer in [z, a, b] { give_f128(buffer); }
+            drop(ab);
+
+            let mut supplied = generate_compressions_par(18, 5323);
+            supplied.reverse();
+            supplied[65536].1[15] ^= 0x23b8;
+            let (unused, (witness, a, b, ab)) = generate_witness_and_commit_from(
+                BlockSource::Slice(&supplied), 18, params, odd_tail,
+                Some(take_f128(params.codeword_len_f128())),
+            );
+            assert!(unused.is_none());
+            let (z, committed) = witness.into_parts();
+            let (root, data) = committed.expect("exercise the resident fused producer");
+            drop(ab);
+            let (reference, a_ref, b_ref, _) =
+                generate_witness_with_ab_packed_and_round1_inner(&supplied, 18);
+            assert!(z == reference && a == a_ref && b == b_ref, "packed witness mismatch");
+            for buffer in [a, b, a_ref, b_ref] { give_f128(buffer); }
+            let (reference_root, reference_data) = flock_core::pcs::commit::commit(&reference, params);
+            assert!(root.root == reference_root.root, "different Merkle root");
+            assert!(data.codeword == reference_data.codeword, "different encoded field elements");
+            assert!(data.merkle_tree == reference_data.merkle_tree, "different Merkle tree");
+            give_f128(z);
+            give_f128(reference);
+        });
+    }
+
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
