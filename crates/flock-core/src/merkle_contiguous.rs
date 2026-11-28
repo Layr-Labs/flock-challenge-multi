@@ -7,6 +7,19 @@ use super::{BLAKE3_IV, Hash};
 core::arch::global_asm!(include_str!("merkle_contiguous.S"));
 // `FLOCK_MAH_ASM=1` alternates (crate::MAH_ASM): Mahmoud514 a4aa6fa2's leaf kernels as `*_m`.
 core::arch::global_asm!(include_str!("merkle_contiguous_m.S"));
+// Scalar-move transpose variant of the 1024-byte plane-leaf kernel (see the
+// header of the generated file). `FLOCK_NO_LEAF_T=1` restores the shuffle
+// transpose in the same binary; read once per process.
+core::arch::global_asm!(include_str!("merkle_contiguous_t.S"));
+unsafe extern "C" {
+    fn flock_blake3_planes_leaf_1024_t(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8);
+}
+#[inline]
+fn leaf_t_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LEAF_T").is_none());
+    *ON
+}
 unsafe extern "C" {
     fn flock_blake3_contiguous_64_m(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8);
     fn flock_blake3_contiguous_128_m(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8);
@@ -170,6 +183,8 @@ pub(super) fn hash_leaf_pairs<const N: usize>(data: &[u8], out: &mut [Hash]) {
             1024 => flock_blake3_planes_leaf_1024_m,
             _ => leaf,
         }
+    } else if N == 1024 && leaf_t_enabled() {
+        flock_blake3_planes_leaf_1024_t
     } else {
         leaf
     };
@@ -194,6 +209,86 @@ pub(super) fn hash_leaf_pairs<const N: usize>(data: &[u8], out: &mut [Hash]) {
 #[cfg(test)]
 mod plane_tests {
     use super::*;
+    /// The scalar-move transpose kernel must produce the same CV word planes
+    /// as the reference BLAKE3 chunk hash for every group count and alignment,
+    /// and must not read past the last leaf or write outside its planes.
+    #[test]
+    fn scalar_transpose_leaf_planes_match_hazmat_words() {
+        use blake3::hazmat::HasherExt;
+        let size = 1024usize;
+        let kernel: Kernel = flock_blake3_planes_leaf_1024_t;
+        for count in [16usize, 32, 48, 64, 112, 128] {
+            for offset in [0usize, 1, 31, 63] {
+                let mut seed = 0x9e3779b97f4a7c15u64 ^ ((count as u64) << 20) ^ offset as u64;
+                // Exact-size allocation: an over-read past the last leaf would
+                // be caught by the guard-page variant below; here it would
+                // at least read uninitialised heap under Miri/ASan.
+                let mut storage = vec![0u8; offset + count * size];
+                for x in &mut storage {
+                    seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+                    *x = seed as u8;
+                }
+                let data = &storage[offset..];
+                let mut plane_bytes = vec![0xa5u8; count * 32 + 128];
+                unsafe {
+                    kernel(data.as_ptr(), count, size / 64, BLAKE3_IV.as_ptr(), 0, false,
+                        0, super::super::BLAKE3_CHUNK_START, super::super::BLAKE3_CHUNK_END,
+                        plane_bytes.as_mut_ptr().add(64));
+                }
+                for i in 0..count {
+                    let cv = blake3::Hasher::new().update(&data[i * size..(i + 1) * size]).finalize_non_root();
+                    for word in 0..8 {
+                        let p = 64 + (i / 16) * 512 + word * 64 + (i % 16) * 4;
+                        assert_eq!(plane_bytes[p..p + 4], cv[word * 4..word * 4 + 4],
+                            "count={count} offset={offset} leaf={i} word={word}");
+                    }
+                }
+                assert!(plane_bytes[..64].iter().all(|&x| x == 0xa5));
+                assert!(plane_bytes[count * 32 + 64..].iter().all(|&x| x == 0xa5));
+            }
+        }
+    }
+    /// Same kernel with the input ending exactly at an unmapped page: any read
+    /// beyond the last leaf faults.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn scalar_transpose_leaf_never_reads_past_the_input() {
+        use blake3::hazmat::HasherExt;
+        unsafe extern "C" {
+            fn mmap(p: *mut core::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut core::ffi::c_void;
+            fn mprotect(p: *mut core::ffi::c_void, len: usize, prot: i32) -> i32;
+            fn munmap(p: *mut core::ffi::c_void, len: usize) -> i32;
+        }
+        let size = 1024usize;
+        let kernel: Kernel = flock_blake3_planes_leaf_1024_t;
+        for count in [16usize, 32, 128] {
+            let bytes = count * size;
+            let map = (bytes + 4095) / 4096 * 4096 + 4096;
+            unsafe {
+                let base = mmap(core::ptr::null_mut(), map, 3, 0x22, -1, 0) as *mut u8;
+                assert!(!base.is_null() && base as isize != -1);
+                assert_eq!(mprotect(base.add(map - 4096).cast(), 4096, 0), 0);
+                let data = base.add(map - 4096 - bytes);
+                let mut seed = 0x243f6a8885a308d3u64 ^ count as u64;
+                for i in 0..bytes {
+                    seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+                    *data.add(i) = seed as u8;
+                }
+                let mut planes = vec![0u8; count * 32];
+                kernel(data, count, size / 64, BLAKE3_IV.as_ptr(), 0, false,
+                    0, super::super::BLAKE3_CHUNK_START, super::super::BLAKE3_CHUNK_END, planes.as_mut_ptr());
+                let slice = core::slice::from_raw_parts(data, bytes);
+                for i in 0..count {
+                    let cv = blake3::Hasher::new().update(&slice[i * size..(i + 1) * size]).finalize_non_root();
+                    for word in 0..8 {
+                        let p = (i / 16) * 512 + word * 64 + (i % 16) * 4;
+                        assert_eq!(planes[p..p + 4], cv[word * 4..word * 4 + 4], "count={count} leaf={i} word={word}");
+                    }
+                }
+                assert_eq!(munmap(base.cast(), map), 0);
+            }
+        }
+    }
     #[test]
     fn direct_leaf_planes_match_hazmat_words() {
         use blake3::hazmat::HasherExt;
